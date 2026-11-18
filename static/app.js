@@ -11,6 +11,8 @@ const canvas = element("canvas");
 const context = canvas.getContext("2d");
 const sessionToken = document.querySelector('meta[name="labelpilot-token"]').content;
 const modelBrowser = {mode:"file",listing:null,loading:false,sequence:0};
+const imageBrowser = {mode:"folder",listing:null,selected:new Set(),loading:false,valid:false,sequence:0};
+const projectImages = {files:[]};
 const exportAugmentation = {presets:[],maxCopies:3,loaded:false};
 let searchTimer;
 let jobTimer;
@@ -70,7 +72,7 @@ async function initialize() {
   for (const failure of response.errors) toast(`${failure.name}：${failure.error}`, true);
   element("projectSelect").innerHTML = state.projects.map(project => `<option value="${escapeHtml(project.id)}">${escapeHtml(project.name)}</option>`).join("");
   if (!state.projects.length) {
-    showCanvasMessage("接入你的第一个数据集", "点击左上角 +，选择本机图片和标注目录");
+    showCanvasMessage("接入你的第一个数据集", "点击左上角“选择图片”，选择本机图片文件或文件夹");
     element("projectDialog").showModal();
     return;
   }
@@ -692,6 +694,68 @@ function chooseModelFile(path) {
   element("modelBrowserDialog").close();
   element("modelPath").focus({preventScroll:true});
 }
+function updateImageSelection() {
+  const files=projectImages.files;
+  element("newImageRoot").title=element("newImageRoot").value;
+  element("newImageSelection").textContent=files.length ? `仅导入已选 ${files.length} 张图片：${files.slice(0,3).join("、")}${files.length>3 ? " 等" : ""}。重新扫描不会加入其他图片。` : "文件夹模式：读取目录及子目录内的图片；文件模式：仅导入明确选中的图片。";
+  element("useEntireImageFolder").hidden=!files.length;
+}
+function updateImageBrowserControls() {
+  const {listing,loading,valid,selected,mode}=imageBrowser;
+  for(const id of ["imageBrowserDrive","imageBrowserPath","imageBrowserGo"])element(id).disabled=loading;
+  element("imageBrowserUp").disabled=loading || !listing?.parent;
+  element("confirmImageSelection").disabled=loading || !valid || (mode==="file" && !selected.size);
+  element("confirmImageSelection").textContent=mode==="folder" ? "选择此文件夹" : `使用所选图片（${selected.size} 张）`;
+  element("imageBrowserList").querySelectorAll("button").forEach(button=>{button.disabled=loading || !valid || (mode==="folder" && button.hasAttribute("data-image-file"));});
+  if(valid)element("imageBrowserCount").textContent=`${listing.directories.length} 个文件夹 · ${listing.files.length} 张图片${mode==="file" ? ` · 已选 ${selected.size} 张` : ""}`;
+}
+function renderImageBrowser() {
+  const listing=imageBrowser.listing;
+  element("imageBrowserPath").value=listing.path;
+  element("imageBrowserPath").title=listing.path;
+  element("imageBrowserDrive").innerHTML='<option value="">磁盘位置</option>'+listing.roots.map(path=>`<option value="${escapeHtml(path)}">${escapeHtml(path)}</option>`).join("");
+  const folders=listing.directories.map(item=>`<button type="button" class="model-file-row folder" data-image-directory="${escapeHtml(item.path)}" title="${escapeHtml(item.path)}"><b>▸</b><span>${escapeHtml(item.name)}</span><small>打开文件夹</small></button>`).join("");
+  const files=listing.files.map(item=>`<button type="button" class="model-file-row image-file-row" data-image-file="${escapeHtml(item.path)}" aria-pressed="false" title="${escapeHtml(item.path)}"><b>图片</b><span>${escapeHtml(item.name)}</span><small>${(item.size/1024/1024).toFixed(2)} MB${imageBrowser.mode==="file" ? " · 点击勾选" : ""}</small></button>`).join("");
+  element("imageBrowserList").innerHTML=folders+files || '<p class="empty-list">此处没有子文件夹或支持的图片。</p>';
+  element("imageBrowserError").textContent=listing.partial ? "当前列表可能不完整（权限或数量上限）；可进入更具体的文件夹继续选择。" : "";
+}
+async function loadImageDirectory(path) {
+  const sequence=++imageBrowser.sequence;
+  imageBrowser.loading=true;imageBrowser.valid=false;
+  element("imageBrowserError").textContent="";
+  element("imageBrowserCount").textContent="正在读取本机图片文件夹…";
+  updateImageBrowserControls();
+  try {
+    const listing=await api("/api/images/browse","POST",{path});
+    if(sequence!==imageBrowser.sequence || !element("imageBrowserDialog").open)return;
+    imageBrowser.listing=listing;imageBrowser.selected.clear();imageBrowser.valid=true;
+    renderImageBrowser();
+  } catch(error) {
+    if(sequence!==imageBrowser.sequence)return;
+    element("imageBrowserError").textContent=error.message;
+    element("imageBrowserCount").textContent="未能读取，请修改路径或返回上一级；尚未改变所选图片。";
+  } finally {if(sequence===imageBrowser.sequence){imageBrowser.loading=false;updateImageBrowserControls();}}
+}
+async function openImageBrowser(mode) {
+  if(state.busy)return;
+  imageBrowser.mode=mode;imageBrowser.listing=null;imageBrowser.selected.clear();imageBrowser.valid=false;
+  element("imageBrowserTitle").textContent=mode==="folder" ? "选择待标注图片文件夹" : "选择待标注图片（可多选）";
+  element("imageBrowserHelp").textContent=mode==="folder" ? "进入目标目录后点击“选择此文件夹”，导入其中及子目录内的图片。仅引用路径，不上传或修改源文件。" : "点击图片勾选或取消，可选择同一文件夹内的多张图片；切换文件夹会清空本次勾选。支持 JPG、JPEG、PNG、BMP、WEBP、TIF、TIFF。";
+  element("imageBrowserList").innerHTML="";
+  element("imageBrowserDrive").innerHTML='<option value="">磁盘位置</option>';
+  element("imageBrowserPath").value="";
+  element("imageBrowserDialog").showModal();
+  await loadImageDirectory(element("newImageRoot").value.trim() || state.project?.image_root || null);
+}
+function confirmImageSelection() {
+  if(imageBrowser.loading || !imageBrowser.valid || (imageBrowser.mode==="file" && !imageBrowser.selected.size))return;
+  const listing=imageBrowser.listing;
+  element("newImageRoot").value=listing.path;
+  projectImages.files=imageBrowser.mode==="file" ? listing.files.filter(item=>imageBrowser.selected.has(item.path)).map(item=>item.name) : [];
+  updateImageSelection();
+  element("imageBrowserDialog").close();
+  element("newImageRoot").focus({preventScroll:true});
+}
 function openModelDialog() {
   if(!state.project)return;
   element("modelPath").value=state.project.model_path;
@@ -858,10 +922,11 @@ async function exportDataset() {
   finally{element("createExport").dataset.exporting="false";updateExportSplit();}
 }
 async function createProject() {
-  if(state.busy)return;
+  if(state.busy || !await ensureSaved())return;
   element("createProject").disabled=true;
   try{
     const project=await api("/api/projects","POST",{name:element("newProjectName").value.trim(),image_root:element("newImageRoot").value.trim(),
+      ...(projectImages.files.length ? {image_files:projectImages.files} : {}),
       annotation_root:element("newAnnotationRoot").value.trim(),preannotation_root:element("newPreannotationRoot").value.trim(),
       classes:element("newClasses").value.split(/\r?\n/).map(name=>name.trim()).filter(Boolean),class_map_path:element("newClassMap").value.trim(),
       model_path:element("newModelPath").value.trim(),manifest_path:element("newManifest").value.trim()});
@@ -963,6 +1028,28 @@ for(const id of ["augmentationPreset","includeImages","reviewedOnly"])listen(id,
 for(const id of ["augmentationCopies","augmentationSeed"])listen(id,"input",updateExportSplit);
 listen("createExport","click",exportDataset);
 listen("newProjectButton","click",()=>element("projectDialog").showModal());listen("createProject","click",createProject);
+listen("chooseImageFiles","click",()=>openImageBrowser("file"));
+listen("chooseImageFolder","click",()=>openImageBrowser("folder"));
+listen("newImageRoot","input",()=>{projectImages.files=[];updateImageSelection();});
+listen("useEntireImageFolder","click",()=>{projectImages.files=[];updateImageSelection();});
+element("imageBrowserPathForm").addEventListener("submit",event=>{event.preventDefault();if(!imageBrowser.loading)loadImageDirectory(element("imageBrowserPath").value.trim());});
+listen("imageBrowserDrive","change",event=>{if(event.target.value)return loadImageDirectory(event.target.value);});
+listen("imageBrowserUp","click",()=>loadImageDirectory(imageBrowser.listing.parent));
+listen("imageBrowserList","click",event=>{
+  if(imageBrowser.loading || !imageBrowser.valid)return;
+  const folder=event.target.closest("[data-image-directory]");
+  if(folder)return loadImageDirectory(folder.dataset.imageDirectory);
+  const file=event.target.closest("[data-image-file]");
+  if(!file || imageBrowser.mode!=="file")return;
+  const path=file.dataset.imageFile;
+  if(imageBrowser.selected.has(path))imageBrowser.selected.delete(path);
+  else {if(imageBrowser.selected.size>=10000)throw new Error("单次最多选择 10000 张图片");imageBrowser.selected.add(path);}
+  file.setAttribute("aria-pressed",String(imageBrowser.selected.has(path)));
+  updateImageBrowserControls();
+});
+listen("confirmImageSelection","click",confirmImageSelection);
+listen("cancelImageBrowser","click",()=>element("imageBrowserDialog").close());
+element("imageBrowserDialog").addEventListener("close",()=>{if(element("imageBrowserDialog").open)return;imageBrowser.sequence++;imageBrowser.loading=false;imageBrowser.valid=false;});
 listen("historyButton","click",showHistory);listen("historyList","click",event=>{const button=event.target.closest("[data-restore]");if(button)return restoreRevision(Number(button.dataset.restore));});
 for(const id of ["helpButton","keyboardHelp"])listen(id,"click",()=>element("helpDialog").showModal());
 listen("workspaceButton","click",()=>{document.querySelectorAll("dialog[open]").forEach(dialog=>dialog.close());});

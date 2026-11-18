@@ -106,7 +106,26 @@ class Project:
         if not self.root.is_dir():
             raise Problem("图片目录不存在")
         manifest_path = self.config.get("manifest_path")
-        if manifest_path:
+        selected = self.config.get("image_files")
+        if selected is not None:
+            if manifest_path:
+                raise Problem("指定图片文件不能同时使用任务清单，请选择其中一种导入方式", 422)
+            if not isinstance(selected, list) or not 1 <= len(selected) <= 10000:
+                raise Problem("请选择 1 到 10000 个图片文件", 422)
+            for value in selected:
+                if not isinstance(value, str) or not value.strip() or "\x00" in value:
+                    raise Problem("图片文件路径必须为非空文本", 422)
+                path = Path(value).expanduser()
+                try:
+                    path = (path if path.is_absolute() else self.root / path).resolve(strict=True)
+                    if not path.is_file() or path.suffix.lower() not in IMAGE_SUFFIXES:
+                        raise Problem("请选择支持的图片文件，而不是目录或其他格式", 422)
+                except (OSError, RuntimeError, ValueError) as error:
+                    raise Problem("选中的图片文件不存在或无权访问，请重新选择", 422) from error
+                if not path.is_relative_to(self.root):
+                    raise Problem("选中的图片必须位于指定图片目录内", 422)
+                self.add_item(path, {})
+        elif manifest_path:
             for task in read_json(manifest_path).get("tasks", []):
                 if not task.get("package_image"):
                     continue
@@ -236,6 +255,9 @@ class Store:
             if config.get(field):
                 config[field] = str(Path(config[field]).resolve())
         project = Project(config)
+        if config.get("image_files") is not None:
+            config["image_files"] = [item["relative"] for item in project.items]
+            project.config["image_files"] = list(config["image_files"])
         with self.lock:
             updated = self.configs + [config]
             atomic_json(self.registry_path, updated)

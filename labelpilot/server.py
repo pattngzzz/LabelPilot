@@ -16,7 +16,7 @@ from .exporting import export_project
 from .augmentation import augmentation_presets
 from .inference import Inference, Jobs
 from . import model_files
-from .store import Problem, Store
+from .store import IMAGE_SUFFIXES, Problem, Store
 
 
 ASSETS = Path(__file__).resolve().parent.parent / "static"
@@ -85,6 +85,11 @@ def create_app(home=None):
         if not isinstance(payload.get("image_root"), str) or not payload["image_root"].strip():
             raise Problem("请填写图片目录", 422)
         return store.register(payload)
+
+    @app.post("/api/images/browse")
+    def browse_images(payload: dict):
+        path = payload.get("path")
+        return model_files.browse(str(Path.home()) if path is None else path, IMAGE_SUFFIXES)
 
     @app.post("/api/projects/{project_id}/model")
     def model(project_id: str, payload: dict):

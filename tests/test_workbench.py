@@ -671,6 +671,93 @@ def test_project_registration_and_duplicate_names(store, dataset):
         store.register({"name": "Unsafe", "image_root": str(store.home), "classes": ["object"]})
 
 
+def test_selected_image_files_persist_rescan_and_preserve_annotations(store, dataset):
+    images, native = dataset[1:3]
+    nested = images / "中文图片"
+    nested.mkdir()
+    extra = nested / "New_Target.PNG"
+    Image.new("RGB", (240, 120)).save(extra)
+    sources = {path: digest(path) for folder in dataset[1:] for path in folder.rglob("*") if path.is_file()}
+    before = store.detail("test", item(store, "human")["id"])
+    registered = store.register({"name": "Selected", "image_root": str(images),
+                                 "image_files": [str(images / "human.jpg"), "中文图片/New_Target.PNG"],
+                                 "annotation_root": str(native), "classes": ["object", "New_Target"]})
+    project_id = registered["id"]
+    assert registered["total"] == 2
+    selected = store.project(project_id)
+    assert {entry["relative"] for entry in selected.items} == {"human.jpg", "中文图片/New_Target.PNG"}
+    assert set(selected.config["image_files"]) == {"human.jpg", "中文图片/New_Target.PNG"}
+    human = next(entry for entry in selected.items if entry["photo_id"] == "human")
+    current = store.detail(project_id, human["id"])
+    assert current["status"] == "imported"
+    saved = store.save(project_id, human["id"], {**current, "expected_version": current["version"], "status": "reviewed"})
+    Image.new("RGB", (240, 120)).save(images / "not_selected.jpg")
+    assert store.rescan(project_id)["total"] == 2
+    reloaded = Store(store.home)
+    assert reloaded.project(project_id).summary()["total"] == 2
+    assert reloaded.detail(project_id, human["id"])["document"] == saved["document"]
+    assert reloaded.detail(project_id, human["id"])["status"] == "reviewed"
+    assert reloaded.detail("test", item(reloaded, "human")["id"]) == before
+    assert all(digest(path) == fingerprint for path, fingerprint in sources.items())
+
+
+@pytest.mark.parametrize("selected", [False, "human.jpg", [], ["human.jpg"] * 10001,
+    [False], [""], ["\x00"], ["missing.jpg"], ["."], ["human.jpg", "./human.jpg"]])
+def test_invalid_selected_images_do_not_register(store, dataset, selected):
+    before = store.registry_path.read_bytes()
+    with pytest.raises(Problem):
+        store.register({"name": "Invalid", "image_root": str(dataset[1]), "image_files": selected, "classes": ["object"]})
+    assert store.registry_path.read_bytes() == before
+    assert set(store.projects) == {"test"}
+
+
+def test_selected_images_reject_outside_unsupported_and_manifest_conflict(store, dataset):
+    images = dataset[1]
+    outside = images.parent / "outside.jpg"
+    Image.new("RGB", (240, 120)).save(outside)
+    unsupported = images / "notes.txt"
+    unsupported.write_text("not an image", encoding="utf8")
+    before = store.registry_path.read_bytes()
+    for files in ([str(outside)], ["../outside.jpg"], ["notes.txt"]):
+        with pytest.raises(Problem):
+            store.register({"name": "Invalid", "image_root": str(images), "image_files": files, "classes": ["object"]})
+    with pytest.raises(Problem, match="任务清单"):
+        store.register({"name": "Conflict", "image_root": str(images), "image_files": ["human.jpg"],
+                        "manifest_path": str(images / "manifest.json"), "classes": ["object"]})
+    assert store.registry_path.read_bytes() == before
+
+
+def test_image_browser_api_filters_and_preserves_source_without_existing_project(dataset):
+    home, images, native, predictions = dataset
+    folder = images / "中文目录"
+    folder.mkdir()
+    Image.new("RGB", (30, 20)).save(folder / "选择.PNG")
+    (images / "ignore.pt").write_bytes(b"do not load")
+    (images / "ignore.txt").write_text("not an image", encoding="utf8")
+    (home / "projects.json").write_text("[]", encoding="utf8")
+    app = create_app(home)
+    sources = {path: digest(path) for root in (images, native, predictions) for path in root.rglob("*") if path.is_file()}
+    with TestClient(app) as client:
+        headers = {"X-LabelPilot-Token": app.state.token}
+        assert client.post("/api/images/browse", json={"path": str(images)}).status_code == 403
+        assert client.post("/api/images/browse", json={"path": str(images)}, headers={**headers, "Origin": "https://evil.example"}).status_code == 403
+        listing = client.post("/api/images/browse", json={"path": str(images)}, headers=headers).json()
+        assert listing["path"] == str(images)
+        assert listing["parent"] == str(images.parent)
+        assert listing["directories"] == [{"name": "中文目录", "path": str(folder)}]
+        assert {entry["name"] for entry in listing["files"]} == {"human.jpg", "model.jpg", "empty.jpg", "another.jpg"}
+        assert listing["roots"] and not listing["partial"]
+        nested = client.post("/api/images/browse", json={"path": str(folder)}, headers=headers).json()
+        assert [entry["name"] for entry in nested["files"]] == ["选择.PNG"]
+        assert client.post("/api/images/browse", json={}, headers=headers).status_code == 200
+        for value in ("", "relative/path", False, [], str(images / "human.jpg"), str(images / "missing")):
+            assert client.post("/api/images/browse", json={"path": value}, headers=headers).status_code == 422
+        response = client.post("/api/projects", json={"name": "Chosen", "image_root": str(folder),
+                                                     "image_files": ["选择.PNG"], "classes": ["Raw_Label"]}, headers=headers)
+        assert response.status_code == 200 and response.json()["total"] == 1
+    assert all(digest(path) == fingerprint for path, fingerprint in sources.items())
+
+
 def test_original_label_names_not_translated(store, dataset):
     project = store.register({"name": "Raw labels", "image_root": str(dataset[1]), "classes": ["sample_container", "panel"]})
     assert [label["display"] for label in project["classes"]] == ["sample_container", "panel"]
