@@ -1,16 +1,17 @@
+import collections
 import copy
 import json
 import os
 import re
 import time
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from labelpilot.exporting import export_project
+from labelpilot.exporting import export_project, plan_splits
 from labelpilot import model_files
 from labelpilot.inference import Inference, Jobs, model_class_names
 from labelpilot.server import create_app
@@ -55,6 +56,118 @@ def item(store, name):
 def payload(store, name, status="draft"):
     current = store.detail("test", item(store, name)["id"])
     return {**current, "expected_version": current["version"], "status": status}
+
+
+@pytest.fixture
+def reviewed_store(store):
+    for row in store.project("test").items:
+        data = payload(store, row["photo_id"], "reviewed")
+        data["confirmed_empty"] = True
+        store.save("test", row["id"], data)
+    return store
+
+
+@pytest.mark.parametrize("format_name", ["yolo", "labelme", "coco"])
+@pytest.mark.parametrize("include_images", [True, False])
+def test_split_export_layout_and_preservation(reviewed_store, dataset, format_name, include_images):
+    store = reviewed_store
+    sources = {path: digest(path) for folder in dataset[1:] for path in folder.rglob("*") if path.is_file()}
+    with store.connect() as connection:
+        annotations = [tuple(row) for row in connection.execute("SELECT * FROM annotations ORDER BY item")]
+        revisions = [tuple(row) for row in connection.execute("SELECT * FROM revisions ORDER BY item, version")]
+    options = {"format": format_name, "include_images": include_images,
+               "split": {"train": 50, "val": 25, "test": 25, "seed": 42}}
+    result = export_project(store, "test", options)
+    assert result["split_counts"] == {"train": 2, "val": 1, "test": 1}
+    with zipfile.ZipFile(store.home / "exports" / result["filename"]) as archive:
+        names = set(archive.namelist())
+        manifest = json.loads(archive.read("export_manifest.json"))
+        assert len(manifest["items"]) == len({entry["id"] for entry in manifest["items"]}) == 4
+        assert manifest["split_config"] == {**options["split"], "unit": "image", "method": "seeded_shuffle"}
+        assert dict(collections.Counter(entry["split"] for entry in manifest["items"])) == result["split_counts"]
+        assert manifest["source_writes"] == 0 and manifest["include_images"] == include_images
+        assert archive.read("classes.txt") == b"object\n"
+        for entry in manifest["items"]:
+            assert entry["status"] == "reviewed"
+            image_path = PurePosixPath(entry["image"])
+            assert image_path.parts[:2] == ("images", entry["split"])
+            assert (entry["image"] in names) == include_images
+            if include_images:
+                assert archive.read(entry["image"]) == Path(store.project("test").item(entry["id"])["path"]).read_bytes()
+            if format_name == "yolo":
+                label = image_path.with_suffix(".txt").as_posix().replace("images/", "labels/", 1)
+                assert label in names
+                if entry["photo_id"] in ("empty", "another"):
+                    assert archive.read(label) == b""
+            elif format_name == "labelme":
+                annotation = image_path.with_suffix(".json").as_posix().replace("images/", "annotations/", 1)
+                document = json.loads(archive.read(annotation))
+                assert document["imagePath"] == "../../" + entry["image"]
+                assert document["imageData"] is None
+        if format_name == "yolo":
+            yaml = archive.read("dataset.yaml").decode()
+            assert all(f"{name}: images/{name}\n" in yaml for name in ("train", "val", "test"))
+        elif format_name == "coco":
+            for subset, count in result["split_counts"].items():
+                document = json.loads(archive.read(f"annotations/{subset}.json"))
+                assert len(document["images"]) == count
+                assert all(image["file_name"].startswith(f"images/{subset}/") for image in document["images"])
+                assert all(annotation["image_id"] in {image["id"] for image in document["images"]}
+                           for annotation in document["annotations"])
+                assert document["categories"] == [{"id": 1, "name": "object"}]
+    assert all(digest(path) == fingerprint for path, fingerprint in sources.items())
+    with store.connect() as connection:
+        assert annotations == [tuple(row) for row in connection.execute("SELECT * FROM annotations ORDER BY item")]
+        assert revisions == [tuple(row) for row in connection.execute("SELECT * FROM revisions ORDER BY item, version")]
+
+
+def test_split_is_reproducible_and_seeded():
+    rows = [{"id": str(index)} for index in range(100)]
+    settings = {"split": {"train": 80, "val": 10, "test": 10, "seed": 42}}
+    assignments, config, counts = plan_splits(rows, settings)
+    assert plan_splits(list(reversed(rows)), settings) == (assignments, config, counts)
+    assert counts == {"train": 80, "val": 10, "test": 10}
+    assert assignments != plan_splits(rows, {"split": {**settings["split"], "seed": 43}})[0]
+
+
+@pytest.mark.parametrize("ratios,count,expected", [
+    ((80, 10, 10), 3, (1, 1, 1)), ((99, .5, .5), 4, (2, 1, 1)),
+    ((33.4, 33.3, 33.3), 10, (4, 3, 3)), ((80, 20, 0), 4, (3, 1, 0)),
+    ((100, 0, 0), 1, (1, 0, 0)), ((80, 0, 20), 4, (3, 0, 1))])
+def test_split_rounding_and_zero_subsets(ratios, count, expected):
+    rows = [{"id": str(index)} for index in range(count)]
+    assignments, _, counts = plan_splits(rows, {"split": dict(zip(("train", "val", "test"), ratios))})
+    assert tuple(counts.values()) == expected
+    assert len(assignments) == count
+
+
+@pytest.mark.parametrize("settings", [
+    False, [], {}, {"train": 80, "val": 10}, {"train": 90, "val": 10, "test": 10},
+    {"train": 0, "val": 50, "test": 50}, {"train": -1, "val": 91, "test": 10},
+    {"train": "80", "val": 10, "test": 10}, {"train": True, "val": 89, "test": 10},
+    {"train": float("nan"), "val": 10, "test": 10}, {"train": float("inf"), "val": 10, "test": 10},
+    {"train": 10 ** 400, "val": 10, "test": 10},
+    *({"train": 80, "val": 10, "test": 10, "seed": seed} for seed in (True, -1, 1.5, "42", 4294967296)),
+    {"train": 80, "val": 10, "test": 10, "unknown": 1}])
+def test_invalid_split_rejected_before_creating_export(reviewed_store, settings):
+    with pytest.raises(Problem) as error:
+        export_project(reviewed_store, "test", {"split": settings})
+    assert error.value.status == 422
+    assert not (reviewed_store.home / "exports").exists()
+
+
+def test_split_rejects_too_few_images(store):
+    store.save("test", item(store, "human")["id"], payload(store, "human", "reviewed"))
+    with pytest.raises(Problem, match="图片数量不足"):
+        export_project(store, "test", {"split": {"train": 80, "val": 10, "test": 10}})
+    assert not (store.home / "exports").exists()
+
+
+def test_split_export_can_omit_test_set(reviewed_store):
+    result = export_project(reviewed_store, "test", {"split": {"train": 80, "val": 20, "test": 0}})
+    with zipfile.ZipFile(reviewed_store.home / "exports" / result["filename"]) as archive:
+        assert "test: null\n" in archive.read("dataset.yaml").decode()
+        assert not any("/test/" in name for name in archive.namelist())
 
 
 def test_import_is_not_independent_acceptance(store):

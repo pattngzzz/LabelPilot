@@ -18,7 +18,7 @@ async function eventually(callback) {
   throw new Error("Browser test timed out waiting for application state");
 }
 
-test("annotation workflow and local model file/folder selection", {timeout:90000}, async context => {
+test("annotation, model selection and dataset split export", {timeout:120000}, async context => {
   const root = path.resolve(__dirname, "..");
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "labelpilot-browser-test-"));
   const images = path.join(home, "images");
@@ -234,6 +234,56 @@ test("annotation workflow and local model file/folder selection", {timeout:90000
       await check('(()=>{const rect=element("modelBrowserDialog").getBoundingClientRect();return rect.left>=0 && rect.right<=innerWidth && rect.top>=0 && rect.bottom<=innerHeight;})()', `Model browser fits the viewport at width ${width}`);
     }
     await click("#cancelModelBrowser");
+    await evaluate('element("modelDialog").close();');
+    await cdp("Emulation.setDeviceMetricsOverride", {width:1600, height:1000, deviceScaleFactor:1, mobile:false});
+    const downloads = path.join(home, "downloads");
+    fs.mkdirSync(downloads);
+    await cdp("Browser.setDownloadBehavior", {behavior:"allow", downloadPath:downloads});
+    await click("#exportButton");
+    await waitFor('element("exportDialog").open');
+    await check('element("splitDataset").checked && element("splitTrain").value==="80" && element("splitVal").value==="10" && element("splitTest").value==="10" && !element("createExport").disabled', "Export defaults to an editable 80/10/10 split");
+    const setExportValue = (id, value) => evaluate(`element(${JSON.stringify(id)}).value=${JSON.stringify(String(value))};element(${JSON.stringify(id)}).dispatchEvent(new Event("input",{bubbles:true}));`);
+    await evaluate('window.exportApi=api;window.exportRequests=[];api=async(path,method,body)=>{if(path.endsWith("/export"))exportRequests.push(body);const result=await exportApi(path,method,body);if(path.endsWith("/export"))window.lastExportResult=result;return result;};');
+    await setExportValue("splitTrain", 70);
+    await check('element("createExport").disabled && element("exportSplitSummary").textContent.includes("90%")', "Invalid total disables export and shows the actual percentage");
+    await evaluate('exportDataset()');
+    await check('exportRequests.length===0', "Invalid ratios never reach the export API");
+    await setExportValue("splitTrain", "");
+    await check('element("createExport").disabled', "Empty percentage is rejected instead of silently becoming zero");
+    await setExportValue("splitTrain", 50);
+    await setExportValue("splitVal", 25);
+    await setExportValue("splitTest", 25);
+    await setExportValue("splitSeed", 1.5);
+    await check('element("createExport").disabled', "Fractional seeds are rejected");
+    await setExportValue("splitSeed", 42);
+    await click("#createExport");
+    await waitFor('element("exportResult").textContent.includes("图片数量不足") && !element("createExport").disabled');
+    assert.equal(fs.readdirSync(downloads).length, 0, "Failed export never downloads a partial ZIP");
+    await evaluate('(async()=>{for(const row of state.items){const current=await api(projectUrl("/items/"+row.id));if(current.status!=="reviewed")await api(projectUrl("/items/"+row.id),"PUT",{...current,expected_version:current.version,status:"reviewed",confirmed_empty:true});}})()');
+    const beforeExport = await evaluate('JSON.stringify(state.current)');
+    await click("#createExport");
+    await waitFor('element("exportResult").textContent.includes("训练 2 张 / 验证 1 张 / 测试 1 张") && !element("createExport").disabled');
+    await check('JSON.stringify(exportRequests.at(-1).split)===JSON.stringify({train:50,val:25,test:25,seed:42}) && lastExportResult.images===4', "Custom split and seed reach the real backend");
+    await eventually(() => fs.readdirSync(downloads).filter(name => name.endsWith(".zip")).length === 1);
+    const splitExport = path.join(downloads, fs.readdirSync(downloads).find(name => name.endsWith(".zip")));
+    const exportCheck = spawnSync(python, ["-c", "import json,sys,zipfile; archive=zipfile.ZipFile(sys.argv[1]); manifest=json.loads(archive.read('export_manifest.json')); assert manifest['split_counts']=={'train':2,'val':1,'test':1}; assert all(entry['image'] in archive.namelist() for entry in manifest['items']); assert 'val: images/val' in archive.read('dataset.yaml').decode(); print('Downloaded YOLO split ZIP verified')", splitExport], {windowsHide:true, encoding:"utf8"});
+    assert.equal(exportCheck.status, 0, exportCheck.stderr || exportCheck.error?.message);
+    for (const width of [1600,760,480]) {
+      await cdp("Emulation.setDeviceMetricsOverride", {width, height:1000, deviceScaleFactor:1, mobile:false});
+      await sleep(100);
+      await check('(()=>{const rect=element("exportDialog").getBoundingClientRect();return rect.left>=0 && rect.right<=innerWidth && rect.top>=0 && rect.bottom<=innerHeight && element("exportDialog").scrollWidth<=element("exportDialog").clientWidth;})()', `Split export dialog fits the viewport at width ${width}`);
+    }
+    const exportScreenshot = await cdp("Page.captureScreenshot", {format:"png"});
+    fs.writeFileSync(path.join(home,"split-export.png"), Buffer.from(exportScreenshot.data,"base64"));
+    await cdp("Emulation.setDeviceMetricsOverride", {width:1600, height:1000, deviceScaleFactor:1, mobile:false});
+    await click("#splitDataset");
+    await check('element("exportSplitSettings").disabled && !element("createExport").disabled', "Users can keep the original unsplit export behavior");
+    await click("#createExport");
+    await waitFor('element("exportResult").textContent.includes("未划分数据集") && !element("createExport").disabled');
+    await check(`exportRequests.at(-1).split===null && JSON.stringify(state.current)===${JSON.stringify(beforeExport)}`, "Exports never change current annotations or their review state");
+    await eventually(() => fs.readdirSync(downloads).filter(name => name.endsWith(".zip")).length === 2);
+    context.diagnostic("Custom ratios, validation, actual ZIP download and unsplit export passed");
+    await evaluate('api=exportApi;');
     assert.deepEqual(errors, [], "No browser runtime errors");
   } finally {
     if (socket?.readyState === WebSocket.OPEN && cdp) await cdp("Browser.close").catch(() => {});

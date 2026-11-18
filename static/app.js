@@ -744,19 +744,47 @@ async function restoreRevision(revision) {
   await refreshList();
   toast("历史版本已恢复为新的草稿，需要重新人工确认");
 }
+function exportSplitOptions() {
+  if(!element("splitDataset").checked)return null;
+  const ratios={train:element("splitTrain").valueAsNumber,val:element("splitVal").valueAsNumber,test:element("splitTest").valueAsNumber};
+  if(Object.values(ratios).some(value=>!Number.isFinite(value) || value<0 || value>100))throw new Error("训练 / 验证 / 测试比例必须为 0 到 100 的数字");
+  const total=ratios.train+ratios.val+ratios.test;
+  if(Math.abs(total-100)>1e-6 || ratios.train<=0)throw new Error(`三个比例之和必须为 100%，且训练集比例必须大于 0（当前合计 ${Number(total.toFixed(6))}%）`);
+  const seed=element("splitSeed").valueAsNumber;
+  if(!Number.isInteger(seed) || seed<0 || seed>4294967295)throw new Error("随机种子必须为 0 到 4294967295 的整数");
+  return {...ratios,seed};
+}
+function updateExportSplit() {
+  element("exportSplitSettings").disabled=!element("splitDataset").checked;
+  let invalid=false;
+  let message="不划分，按原目录结构导出。";
+  try{
+    const split=exportSplitOptions();
+    if(split)message=`训练 ${split.train}% / 验证 ${split.val}% / 测试 ${split.test}% · 合计 100%`;
+  }catch(error){invalid=true;message=error.message;}
+  element("exportSplitSummary").textContent=message;
+  element("exportSplitSummary").dataset.invalid=String(invalid);
+  element("createExport").disabled=invalid || element("createExport").dataset.exporting==="true";
+}
 async function exportDataset() {
   if(!state.project)return;
+  if(element("createExport").dataset.exporting==="true")return;
+  let split;
+  try{split=exportSplitOptions();}catch(error){updateExportSplit();toast(error.message);return;}
   if(!element("reviewedOnly").checked && !window.confirm("你正在导出未审核标注（可能包含模型错误）。确认仅作为待审数据使用，不直接视为真值？"))return;
+  element("createExport").dataset.exporting="true";
   element("createExport").disabled=true;
   element("exportResult").textContent="正在校验图片指纹并生成 ZIP，请稍候…";
   try{
     const result=await api(projectUrl("/export"),"POST",{format:element("exportFormat").value,batch:element("exportBatch").value,
-      reviewed_only:element("reviewedOnly").checked,include_images:element("includeImages").checked});
-    element("exportResult").innerHTML=`<p class="muted">已导出 ${result.images} 张。<a href="${escapeHtml(result.url)}" download>再次下载 ZIP</a></p>`;
+      reviewed_only:element("reviewedOnly").checked,include_images:element("includeImages").checked,split});
+    const counts=result.split_counts;
+    const summary=counts ? `训练 ${counts.train} 张 / 验证 ${counts.val} 张 / 测试 ${counts.test} 张。` : "未划分数据集。";
+    element("exportResult").innerHTML=`<p class="muted">已导出 ${result.images} 张。${summary}<a href="${escapeHtml(result.url)}" download>再次下载 ZIP</a></p>`;
     const link=document.createElement("a");link.href=result.url;link.download=result.filename;document.body.append(link);link.click();link.remove();
     toast(`已生成 ${result.images} 张数据的导出包`);
   }catch(error){element("exportResult").textContent=error.message;throw error;}
-  finally{element("createExport").disabled=false;}
+  finally{element("createExport").dataset.exporting="false";updateExportSplit();}
 }
 async function createProject() {
   if(state.busy)return;
@@ -848,7 +876,9 @@ listen("iou","input",event=>{element("iouValue").value=Number(event.target.value
 listen("discardPrediction","click",()=>{state.prediction=null;element("predictionDialog").close();});
 listen("appendPrediction","click",()=>applyPrediction(true));listen("replacePrediction","click",()=>applyPrediction(false));
 listen("jobsList","click",async event=>{const button=event.target.closest("[data-cancel-job]");if(button){await api(`/api/jobs/${button.dataset.cancelJob}/cancel`,"POST",{});toast("已请求取消；当前推理结束后停止，不会写入该张结果");}});
-for(const id of ["railExport","exportButton"])listen(id,"click",()=>{if(state.project)element("exportDialog").showModal();});
+for(const id of ["railExport","exportButton"])listen(id,"click",()=>{if(state.project){updateExportSplit();element("exportDialog").showModal();}});
+listen("splitDataset","change",updateExportSplit);
+for(const id of ["splitTrain","splitVal","splitTest","splitSeed"])listen(id,"input",updateExportSplit);
 listen("createExport","click",exportDataset);
 listen("newProjectButton","click",()=>element("projectDialog").showModal());listen("createProject","click",createProject);
 listen("historyButton","click",showHistory);listen("historyList","click",event=>{const button=event.target.closest("[data-restore]");if(button)return restoreRevision(Number(button.dataset.restore));});
