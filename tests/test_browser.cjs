@@ -18,7 +18,7 @@ async function eventually(callback) {
   throw new Error("Browser test timed out waiting for application state");
 }
 
-test("annotation, priority review, cleaning, split export and training controls", {timeout:120000}, async context => {
+test("annotation, review, export, training and model comparison controls", {timeout:120000}, async context => {
   const root = path.resolve(__dirname, "..");
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "labelpilot-browser-test-"));
   const images = path.join(home, "images");
@@ -58,7 +58,29 @@ test("annotation, priority review, cleaning, split export and training controls"
 import sys
 import uvicorn
 from fastapi.responses import HTMLResponse, Response
+from labelpilot import evaluation
+from labelpilot.blindsets import read_snapshot, verified_manifest
+from labelpilot.evaluation_worker import frozen_frames
 from labelpilot.server import create_app
+from labelpilot.store import atomic_json, read_json
+
+def comparison_fixture(run, stop, module, directory, copies):
+    snapshot = read_snapshot(directory)
+    manifest = verified_manifest(directory, snapshot)
+    setup = read_json(run / "compare.json")
+    truths = [name for _, _, labels, _ in frozen_frames(directory, snapshot, manifest) for name, _ in labels]
+    rows = []
+    for name in manifest["classes"]:
+        count = truths.count(name)
+        rows.append({"name": name,
+                     "old": {"ground_truth": count, "matched": 0, "missed": count,
+                             "false_positives": 1, "recall": 0 if count else None},
+                     "new": {"ground_truth": count, "matched": count, "missed": 0,
+                             "false_positives": 0, "recall": 1 if count else None}})
+    atomic_json(run / "report.json", {"snapshot": snapshot, "classes": rows, **setup})
+
+evaluation.has_training_dependencies = lambda: True
+evaluation.run_local_worker = comparison_fixture
 app = create_app()
 @app.middleware("http")
 async def legacy_assets(request, call_next):
@@ -557,6 +579,45 @@ with zipfile.ZipFile(sys.argv[1]) as archive:
     await click('[data-use-training="demo"]');
     await waitFor(`state.project.model_path===${JSON.stringify(secondModel)}`);
     await evaluate('element("trainingDialog").close(); api=exportApi;');
+    await click("#comparisonButton");
+    await waitFor('element("comparisonDialog").open && element("comparisonSet").options[0]?.text==="暂无盲测集" && element("comparisonModels").options.length===1');
+    await check(`element("startComparison").disabled && element("comparisonOldPath").value===${JSON.stringify(secondModel)}`, "Model comparison suggests the current weight and waits for a frozen set");
+    await click("#openBlindset");
+    await waitFor('element("blindsetDialog").open');
+    await check('element("blindsetUnit").value==="source_group"', "The blind set defaults to the same capture grouping as training");
+    await setExportValue("blindsetName", "月度盲测");
+    await setExportValue("blindsetPercent", 100);
+    await click("#freezeBlindset");
+    await waitFor('!element("blindsetDialog").open && element("comparisonSet").options[0].text.includes("月度盲测")');
+    await check('element("comparisonSetInfo").textContent.includes("3 张图") && !element("startComparison").disabled', "A real frozen snapshot is selectable and displays the cleaned image count");
+    await click("#browseComparisonOld");
+    await waitFor('modelBrowser.listing && !modelBrowser.loading');
+    await setExportValue("modelBrowserPath", modelFolder);
+    await click("#modelBrowserGo");
+    await waitFor(`!modelBrowser.loading && modelBrowser.listing.path===${JSON.stringify(modelFolder)}`);
+    await click('[data-model-file='+JSON.stringify(firstModel)+']');
+    await check(`element("comparisonOldPath").value===${JSON.stringify(firstModel)} && element("modelPath").value===${JSON.stringify(secondModel)}`, "Selecting a comparison weight leaves the saved preannotation weight intact");
+    await setExportValue("comparisonNewPath", secondModel);
+    await click("#startComparison");
+    await waitFor('!element("comparisonReport").hidden && element("comparisonClassRows").rows.length>1');
+    await check('(()=>{const rows=[...element("comparisonClassRows").rows];return rows.some(row=>row.cells[1].textContent!=="0" && row.cells[2].textContent==="0%" && row.cells[5].textContent==="100%" && row.cells[7].textContent==="0") && rows.some(row=>row.cells[1].textContent==="0" && row.cells[2].textContent==="—" && row.cells[4].textContent==="1");})()', "The table shows both models' per-class recall, misses and false positives, plus the no-ground-truth case");
+    await click("#downloadComparison");
+    const comparisonDownload = await eventually(() => fs.readdirSync(downloads).find(name => /^labelpilot-compare-.+\.json$/.test(name)));
+    const comparisonReport = JSON.parse(fs.readFileSync(path.join(downloads, comparisonDownload)));
+    assert.equal(comparisonReport.snapshot.name, "月度盲测");
+    assert.equal(comparisonReport.options.match_iou, .5);
+    const comparisonScreenshot = await cdp("Page.captureScreenshot", {format:"png"});
+    fs.writeFileSync(path.join(home,"comparison.png"), Buffer.from(comparisonScreenshot.data,"base64"));
+    for (const width of [1024, 760, 400]) {
+      await cdp("Emulation.setDeviceMetricsOverride", {width,height:850,deviceScaleFactor:1,mobile:false});
+      await sleep(100);
+      await check('(()=>{const dialog=element("comparisonDialog");const rect=dialog.getBoundingClientRect();return rect.left>=0 && rect.right<=innerWidth && rect.top>=0 && rect.bottom<=innerHeight && dialog.scrollWidth<=dialog.clientWidth && element("comparisonOldPath").clientWidth>100;})()', `Model comparison remains usable at width ${width}`);
+    }
+    await cdp("Emulation.setDeviceMetricsOverride", {width:1600,height:1000,deviceScaleFactor:1,mobile:false});
+    await evaluate('element("comparisonDialog").close();');
+    await click("#comparisonButton");
+    await waitFor('!element("comparisonReport").hidden && element("comparisonRunStatus").textContent==="对比完成"');
+    await evaluate('element("comparisonDialog").close();');
     const originalItemId = await evaluate('state.current.item.id');
     const originalStoredAnnotation = await evaluate('(async()=>JSON.stringify(await api(projectUrl("/items/"+state.current.item.id))))()');
     await click("#newProjectButton");

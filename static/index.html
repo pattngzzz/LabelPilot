@@ -32,6 +32,7 @@
         <button class="button" id="cleanButton">一键清洗</button>
         <button class="button" id="exportButton">导出数据集</button>
         <button class="button primary" id="trainingButton">一键训练</button>
+        <button class="button" id="comparisonButton">模型对比</button>
       </div>
     </header>
     <section class="overview">
@@ -213,6 +214,87 @@
     <div class="dialog-actions export-actions">
       <p id="trainingMessage" role="status"></p>
       <button class="button primary" id="startTraining" type="submit" form="trainingForm">开始训练</button>
+    </div>
+  </dialog>
+  <dialog id="comparisonDialog" class="export-dialog comparison-dialog" aria-labelledby="comparisonTitle">
+    <form method="dialog" class="dialog-heading">
+      <h2 id="comparisonTitle">模型对比</h2>
+      <button class="icon-button" aria-label="关闭">×</button>
+    </form>
+    <div class="dialog-body export-layout comparison-layout">
+      <form id="comparisonForm">
+        <div class="comparison-set-heading">
+          <strong>固定盲测集</strong>
+          <button class="button" type="button" id="openBlindset">冻结新盲测集</button>
+        </div>
+        <select id="comparisonSet" aria-label="固定盲测集" required></select>
+        <p id="comparisonSetInfo" class="muted comparison-note"></p>
+        <label for="comparisonOldPath">旧版模型</label>
+        <div class="model-path-row">
+          <input id="comparisonOldPath" list="comparisonModels" placeholder="选择训练产物或输入 .pt 路径" required>
+          <button class="button" type="button" id="browseComparisonOld">选择文件</button>
+        </div>
+        <label for="comparisonNewPath">新版模型</label>
+        <div class="model-path-row">
+          <input id="comparisonNewPath" list="comparisonModels" placeholder="选择训练产物或输入 .pt 路径" required>
+          <button class="button" type="button" id="browseComparisonNew">选择文件</button>
+        </div>
+        <datalist id="comparisonModels"></datalist>
+        <details class="training-advanced comparison-advanced">
+          <summary>共同评测参数</summary>
+          <div class="form-row">
+            <label>置信度阈值<input id="comparisonConfidence" type="number" min="0.01" max="1" step="0.01" value="0.25" required></label>
+            <label>匹配 IoU<input id="comparisonIoU" type="number" min="0.01" max="1" step="0.01" value="0.50" required></label>
+          </div>
+          <label>输入尺寸<select id="comparisonImageSize"><option>320</option><option selected>640</option><option>960</option><option>1280</option></select></label>
+        </details>
+      </form>
+      <section class="export-preview" aria-labelledby="comparisonResultsTitle">
+        <h3 id="comparisonResultsTitle">逐类结果</h3>
+        <select id="comparisonRunSelect" aria-label="对比记录" hidden></select>
+        <p id="comparisonRunStatus" class="muted" role="status"></p>
+        <progress id="comparisonProgress" aria-label="对比进度" hidden></progress>
+        <button class="button" id="stopComparison" type="button" hidden>停止对比</button>
+        <div id="comparisonReport" hidden>
+          <p id="comparisonReportMeta" class="muted"></p>
+          <div id="comparisonModelInfo"></div>
+          <div class="export-class-table comparison-table" role="region" aria-label="旧版和新版逐类指标" tabindex="0">
+            <table>
+              <thead><tr><th rowspan="2" scope="col">类别</th><th rowspan="2" scope="col">真值数</th><th colspan="3" scope="colgroup">旧版模型</th><th colspan="3" scope="colgroup">新版模型</th></tr>
+              <tr><th scope="col">召回率</th><th scope="col">漏检</th><th scope="col">误检</th><th scope="col">召回率</th><th scope="col">漏检</th><th scope="col">误检</th></tr></thead>
+              <tbody id="comparisonClassRows"></tbody>
+            </table>
+          </div>
+          <a class="button" id="downloadComparison" download>下载对比报告</a>
+        </div>
+      </section>
+    </div>
+    <div class="dialog-actions export-actions">
+      <p id="comparisonMessage" class="workflow-message" role="status"></p>
+      <button class="button primary" id="startComparison" type="submit" form="comparisonForm" disabled>一键对比</button>
+    </div>
+  </dialog>
+  <dialog id="blindsetDialog" aria-labelledby="blindsetTitle">
+    <form method="dialog" class="dialog-heading">
+      <h2 id="blindsetTitle">冻结盲测集</h2>
+      <button class="icon-button" aria-label="关闭">×</button>
+    </form>
+    <form class="dialog-body" id="blindsetForm">
+      <p class="muted">从已审核的检测框图片中抽取快照。冻结的图片、重复副本和已知同源图片会从后续本地训练中预留。</p>
+      <label>名称<input id="blindsetName" maxlength="64" placeholder="例如：11 月产线盲测" required></label>
+      <label>批次<select id="blindsetBatch"></select></label>
+      <label>划分方式<select id="blindsetUnit">
+        <option value="source_group">按任务清单来源组</option><option value="directory">按原图文件夹</option><option value="image">按图片随机</option>
+      </select></label>
+      <div class="form-row">
+        <label>冻结比例（%）<input id="blindsetPercent" type="number" min="1" max="100" step="1" value="20" required></label>
+        <label>随机种子<input id="blindsetSeed" type="number" min="0" max="4294967295" step="1" value="42" required></label>
+      </div>
+      <p class="muted">100% 冻结所选批次中的全部合格样本。按组冻结时，实际张数取决于分组大小。</p>
+    </form>
+    <div class="dialog-actions export-actions">
+      <p id="blindsetMessage" class="workflow-message" role="status"></p>
+      <button class="button primary" id="freezeBlindset" type="submit" form="blindsetForm">冻结图片和标注</button>
     </div>
   </dialog>
   <dialog id="projectDialog" class="wide-dialog">

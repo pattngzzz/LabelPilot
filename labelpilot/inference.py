@@ -32,7 +32,7 @@ class Inference:
         os.environ["YOLO_OFFLINE"] = "true"
         os.environ["YOLO_AUTOINSTALL"] = "false"
         self.lock = threading.Lock()
-        self.training = threading.Event()
+        self.exclusive = threading.Event()
         self.model = None
         self.signature = None
         self.model_digest = None
@@ -41,8 +41,8 @@ class Inference:
     @contextmanager
     def prediction_slot(self):
         while not self.lock.acquire(timeout=0.1):
-            if self.training.is_set():
-                raise Problem("本地训练正在占用模型运行环境，请等待或停止训练", 409)
+            if self.exclusive.is_set():
+                raise Problem("本地训练或模型对比正在占用运行环境", 409)
         try:
             yield
         finally:
@@ -149,6 +149,18 @@ class Jobs:
             return sorted([copy.deepcopy(record) for record in self.records.values() if record["project"] == project_id],
                           key=lambda record: record["created_at"], reverse=True)[:20]
 
+    def reserve_model_slot(self):
+        with self.lock:
+            if any(job["status"] in ("queued", "running") for job in self.records.values()):
+                raise Problem("请等待批量预标注完成或先取消任务", 409)
+            if not self.inference.lock.acquire(blocking=False):
+                raise Problem("模型运行环境正在使用，请等待当前任务结束", 409)
+            self.inference.exclusive.set()
+
+    def release_model_slot(self):
+        self.inference.exclusive.clear()
+        self.inference.lock.release()
+
     def start(self, project_id, options):
         limit = options.get("limit", 100)
         if not isinstance(limit, int) or not 1 <= limit <= 10000:
@@ -160,8 +172,8 @@ class Jobs:
             raise Problem("当前范围没有未开始图片；已有标注一律不会覆盖", 422)
         job_id = uuid.uuid4().hex
         with self.lock:
-            if self.inference.training.is_set():
-                raise Problem("本地训练正在占用模型运行环境，请等待或停止训练", 409)
+            if self.inference.exclusive.is_set():
+                raise Problem("本地训练或模型对比正在占用运行环境", 409)
             if any(record["status"] in ("running", "queued") for record in self.records.values()):
                 raise Problem("已有预标注任务运行中，请先完成或取消", 409)
             record = {"id": job_id, "project": project_id, "status": "queued", "total": len(ids),

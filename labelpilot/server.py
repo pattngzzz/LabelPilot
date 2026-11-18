@@ -14,6 +14,8 @@ from PIL import Image
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .augmentation import augmentation_presets
+from .blindsets import freeze_blindset, list_blindsets
+from .evaluation import ComparisonJobs
 from .exporting import export_project, preview_export
 from .inference import Inference, Jobs
 from . import model_files
@@ -31,12 +33,14 @@ def create_app(home=None):
     inference = Inference(store)
     jobs = Jobs(store, inference)
     training = TrainingJobs(store, inference, jobs)
+    comparisons = ComparisonJobs(store, jobs)
 
     @asynccontextmanager
     async def lifespan(app):
         try:
             yield
         finally:
+            comparisons.shutdown()
             training.shutdown()
 
     app = FastAPI(title="LabelPilot", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
@@ -44,6 +48,7 @@ def create_app(home=None):
     app.state.inference = inference
     app.state.jobs = jobs
     app.state.training = training
+    app.state.comparisons = comparisons
     app.state.token = secrets.token_urlsafe(32)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"])
 
@@ -221,6 +226,47 @@ def create_app(home=None):
                 return PlainTextResponse(stream.read(65536).decode("utf-8", errors="replace"))
         name = f"labelpilot-{run_id[:8]}-best.pt" if kind == "weights" else "export_manifest.json"
         return FileResponse(path, filename=name)
+
+    def snapshot_summary(record):
+        return {key: record[key] for key in ("id", "name", "created_at", "batch", "percent", "unit", "images",
+                                             "objects", "confirmed_empty", "cleaned_out", "manifest_sha256")}
+
+    @app.get("/api/projects/{project_id}/blindsets")
+    def blindsets(project_id: str):
+        return [snapshot_summary(record) for record in list_blindsets(store, project_id)]
+
+    @app.post("/api/projects/{project_id}/blindsets", status_code=201)
+    def create_blindset(project_id: str, payload: dict):
+        return snapshot_summary(freeze_blindset(store, project_id, payload))
+
+    @app.get("/api/projects/{project_id}/comparison-models")
+    def comparison_models(project_id: str):
+        project = store.project(project_id)
+        current = project.config.get("model_path")
+        paths = {}
+        if current and Path(current).is_file():
+            paths[current] = "当前项目模型"
+        for run in training.list(project_id):
+            if run.get("weights"):
+                paths.setdefault(run["weights"], f"本地训练 {run['id'][:8]} · {run['created_at'][:10]}")
+        return [{"path": path, "label": label} for path, label in paths.items()]
+
+    @app.get("/api/projects/{project_id}/comparisons")
+    def list_comparisons(project_id: str):
+        return comparisons.list(project_id)
+
+    @app.post("/api/projects/{project_id}/comparisons", status_code=202)
+    def start_comparison(project_id: str, payload: dict):
+        return comparisons.start(project_id, payload)
+
+    @app.post("/api/projects/{project_id}/comparisons/{run_id}/cancel")
+    def cancel_comparison(project_id: str, run_id: str):
+        return comparisons.cancel(project_id, run_id)
+
+    @app.get("/api/projects/{project_id}/comparisons/{run_id}/report")
+    def comparison_report(project_id: str, run_id: str):
+        path = comparisons.report(project_id, run_id)
+        return FileResponse(path, filename=f"labelpilot-compare-{run_id[:8]}.json")
 
     @app.post("/api/projects/{project_id}/export/preview")
     def export_preview(project_id: str, payload: dict):

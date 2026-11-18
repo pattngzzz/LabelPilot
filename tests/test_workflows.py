@@ -118,7 +118,7 @@ def test_training_api_stages_reviewed_snapshot_and_serializes_local_model_tasks(
     def worker(run, stop):
         if cancel:
             assert stop.wait(5)
-            raise training.TrainingCancelled()
+            raise training.LocalJobCancelled()
         assert release.wait(5)
         (run / training.BEST_WEIGHTS).parent.mkdir(parents=True)
         (run / training.BEST_WEIGHTS).write_bytes(b"checkpoint fixture")

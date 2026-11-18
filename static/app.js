@@ -11,7 +11,7 @@ const state = {projects:[],project:null,items:[],filtered:0,offset:0,pageSize:60
 const canvas = element("canvas");
 const context = canvas.getContext("2d");
 const sessionToken = document.querySelector('meta[name="labelpilot-token"]').content;
-const modelBrowser = {mode:"file",listing:null,loading:false,sequence:0};
+const modelBrowser = {mode:"file",target:"modelPath",listing:null,loading:false,sequence:0};
 const exportPreview = {sequence:0, timer:null, plan:null, running:false};
 const exportSplitLabels = {train:"训练", val:"验证", test:"测试"};
 const exportSplitHints = {
@@ -29,6 +29,8 @@ let trainingTimer;
 let trainingSequence = 0;
 let trainingSubmitting = false;
 let trainingRuns = [];
+const comparisonUi = {project:null, timer:null, session:0, read:0, sets:[], runs:[], selected:"",
+  report:null, loadingReport:null, submitting:false, freezing:false};
 
 function toast(message, error=false) {
   const node = document.createElement("div");
@@ -723,9 +725,10 @@ async function loadModelDirectory(path, search=false) {
     element("modelBrowserCount").textContent="未能读取，请修改路径或返回上一级。";
   } finally {if(sequence===modelBrowser.sequence)setModelBrowserLoading(false);}
 }
-async function openModelBrowser(mode) {
+async function openModelBrowser(mode, target="modelPath") {
   if(!state.project || state.busy)return;
   modelBrowser.mode=mode;
+  modelBrowser.target=target;
   modelBrowser.listing=null;
   element("modelBrowserList").innerHTML="";
   element("modelBrowserDrive").innerHTML='<option value="">磁盘位置</option>';
@@ -738,10 +741,11 @@ async function openModelBrowser(mode) {
 }
 function chooseModelFile(path) {
   if(modelBrowser.loading)return;
-  element("modelPath").value=path;
-  modelSelectionChanged();
+  const field=element(modelBrowser.target);
+  field.value=path;
+  if(modelBrowser.target==="modelPath")modelSelectionChanged();
   element("modelBrowserDialog").close();
-  element("modelPath").focus({preventScroll:true});
+  field.focus({preventScroll:true});
 }
 function updateImageSelection() {
   const files=projectImages.files;
@@ -1095,6 +1099,7 @@ function renderTrainingRuns(runs) {
     const scored = metrics.filter(([, value]) => Number.isFinite(value));
     const information = [escapeHtml(run.options.batch || "全部批次")];
     if (counts) information.push(`训练 ${counts.train} 张 · 验证 ${counts.val} 张`, `清洗排除 ${run.cleaned_out} 张`);
+    if (run.blind_out) information.push(`盲测预留 ${run.blind_out} 张`);
     if (progress.device) information.push(escapeHtml(progress.device));
     const statusLabel = trainingStatuses[run.status];
     return `<article class="training-run" data-training-id="${escapeHtml(run.id)}">
@@ -1160,6 +1165,220 @@ async function startTraining(event) {
   } finally {
     trainingSubmitting = false;
     await refreshTrainingRuns();
+  }
+}
+
+const comparisonStatuses = {preparing:"准备文件", running:"正在对比", cancelling:"正在停止", completed:"对比完成",
+  cancelled:"已停止", interrupted:"服务关闭，任务已中断", failed:"对比失败"};
+const comparisonActive = new Set(["preparing", "running", "cancelling"]);
+const recallFormat = new Intl.NumberFormat("zh-CN", {style:"percent", maximumFractionDigits:1});
+
+function comparisonMessage(id, message, error=false) {
+  const node = element(id);
+  if (node.textContent !== message) node.textContent = message;
+  node.dataset.error = String(error);
+}
+
+function syncComparisonSet() {
+  const selected = comparisonUi.sets.find(set => set.id === element("comparisonSet").value);
+  element("comparisonSetInfo").textContent = selected
+    ? `${selected.images} 张图 · ${selected.objects} 个真值框 · ${selected.confirmed_empty} 张已确认空图`
+    : "先冻结一批已审核图片，供两版模型共用。";
+  element("startComparison").disabled = !selected || comparisonUi.submitting ||
+    comparisonUi.runs.some(run => comparisonActive.has(run.status));
+}
+
+function renderBlindsets(preferred) {
+  const select = element("comparisonSet");
+  const candidate = preferred || select.value;
+  select.replaceChildren(...comparisonUi.sets.map(set =>
+    new Option(`${set.name} · ${set.batch || "全部批次"} · ${new Date(set.created_at).toLocaleDateString()}`, set.id)));
+  if (!select.options.length) select.add(new Option("暂无盲测集", ""));
+  if (comparisonUi.sets.some(set => set.id === candidate)) select.value = candidate;
+  syncComparisonSet();
+}
+
+function renderComparisonReport(run, report) {
+  const {snapshot, models, options, classes} = report;
+  element("comparisonReportMeta").textContent =
+    `${snapshot.name} · ${snapshot.images} 张图 · 置信度 ≥ ${options.confidence} · 匹配 IoU ≥ ${options.match_iou} · 输入 ${options.image_size} px`;
+  element("comparisonModelInfo").replaceChildren(...["old", "new"].map(role => {
+    const model = models[role];
+    const overlap = model.recorded_overlap;
+    const source = overlap
+      ? `该轮训练/验证重叠 ${overlap.images} 张 · ${overlap.groups} 个同源组${overlap.folders ? ` · ${overlap.folders} 个目录` : ""}`
+      : "未能核实训练数据";
+    const info = document.createElement("p");
+    info.className = "muted";
+    info.textContent = `${role === "old" ? "旧版" : "新版"} ${model.filename} · SHA-256 ${model.sha256.slice(0, 12)} · ${source}`;
+    return info;
+  }));
+  const metrics = ["recall", "missed", "false_positives"];
+  element("comparisonClassRows").innerHTML = classes.map(({name, old, new: current}) => {
+    const values = [old, current].flatMap(row => metrics.map(key => {
+      const value = row[key];
+      const change = row === current && value !== null && old[key] !== null
+        ? Math.sign(value - old[key]) * (key === "recall" ? 1 : -1) : 0;
+      const style = change > 0 ? ' class="result-better"' : change < 0 ? ' class="result-worse"' : "";
+      const text = value === null ? "—" : key === "recall" ? recallFormat.format(value) : value;
+      return `<td${style}>${text}</td>`;
+    })).join("");
+    return `<tr><th scope="row">${escapeHtml(name)}</th><td>${old.ground_truth}</td>${values}</tr>`;
+  }).join("");
+  element("downloadComparison").href = projectUrl(`/comparisons/${run.id}/report`);
+  element("comparisonReport").hidden = false;
+}
+
+async function showComparisonRun() {
+  const run = comparisonUi.runs.find(record => record.id === comparisonUi.selected);
+  const active = comparisonActive.has(run?.status);
+  const progress = element("comparisonProgress");
+  progress.hidden = !active;
+  element("stopComparison").hidden = !active || run.status === "cancelling";
+  element("comparisonReport").hidden = !run || comparisonUi.report !== run.id;
+  if (!run) {
+    comparisonMessage("comparisonRunStatus", "启动对比后可在此查看进度与结果。");
+    return;
+  }
+  const done = run.progress?.done ?? 0;
+  const total = run.progress?.total ?? 2 * run.images;
+  if (active) {
+    progress.max = total;
+    progress.value = done;
+  }
+  const message = run.error || (active ? `${comparisonStatuses[run.status]} · ${done} / ${total} 次图片推理` : comparisonStatuses[run.status]);
+  comparisonMessage("comparisonRunStatus", message, run.status === "failed");
+  if (run.status !== "completed" || [comparisonUi.report, comparisonUi.loadingReport].includes(run.id)) return;
+  comparisonUi.loadingReport = run.id;
+  const session = comparisonUi.session;
+  try {
+    const report = await api(projectUrl(`/comparisons/${run.id}/report`));
+    if (session !== comparisonUi.session || run.id !== comparisonUi.selected) return;
+    renderComparisonReport(run, report);
+    comparisonUi.report = run.id;
+  } finally {
+    if (session === comparisonUi.session && comparisonUi.loadingReport === run.id) comparisonUi.loadingReport = null;
+  }
+}
+
+async function refreshComparisons() {
+  if (!element("comparisonDialog").open) return;
+  const read = ++comparisonUi.read;
+  const runs = await api(projectUrl("/comparisons"));
+  if (read !== comparisonUi.read || !element("comparisonDialog").open) return;
+  comparisonUi.runs = runs;
+  const select = element("comparisonRunSelect");
+  select.hidden = !runs.length;
+  const options = runs.map(run => `<option value="${run.id}">${escapeHtml(run.set_name)} · ${new Date(run.created_at).toLocaleString()} · ${comparisonStatuses[run.status]}</option>`).join("");
+  if (options !== select.dataset.options) {
+    select.innerHTML = options;
+    select.dataset.options = options;
+  }
+  if (!runs.some(run => run.id === comparisonUi.selected)) comparisonUi.selected = runs[0]?.id || "";
+  select.value = comparisonUi.selected;
+  syncComparisonSet();
+  await showComparisonRun();
+}
+
+async function openComparisonDialog() {
+  if (!state.project) return;
+  const session = ++comparisonUi.session;
+  if (comparisonUi.project !== state.project.id) {
+    comparisonUi.project = state.project.id;
+    comparisonUi.sets = [];
+    comparisonUi.runs = [];
+    comparisonUi.selected = "";
+    element("comparisonOldPath").value = state.project.model_path || "";
+    element("comparisonNewPath").value = "";
+    element("comparisonSet").value = "";
+  }
+  comparisonUi.report = comparisonUi.loadingReport = null;
+  element("comparisonModels").replaceChildren();
+  element("comparisonRunSelect").hidden = true;
+  element("comparisonProgress").hidden = true;
+  element("stopComparison").hidden = true;
+  element("comparisonReport").hidden = true;
+  comparisonMessage("comparisonRunStatus", "正在读取对比记录…");
+  comparisonMessage("comparisonMessage", "");
+  renderBlindsets();
+  element("comparisonDialog").showModal();
+  const refresh = () => refreshComparisons().catch(error => {
+    if (session === comparisonUi.session) comparisonMessage("comparisonRunStatus", error.message, true);
+  });
+  comparisonUi.timer = setInterval(refresh, 1500);
+  await Promise.all([refresh(), api(projectUrl("/blindsets")).then(sets => {
+    if (session !== comparisonUi.session) return;
+    comparisonUi.sets = sets;
+    renderBlindsets();
+  }), api(projectUrl("/comparison-models")).then(models => {
+    if (session !== comparisonUi.session) return;
+    element("comparisonModels").replaceChildren(...models.map(model => {
+      const option = new Option(model.label, model.path);
+      option.label = model.label;
+      return option;
+    }));
+  })]).catch(error => {
+    if (session === comparisonUi.session) comparisonMessage("comparisonMessage", error.message, true);
+  });
+}
+
+async function startComparison(event) {
+  event.preventDefault();
+  if (element("startComparison").disabled) return;
+  const session = comparisonUi.session;
+  comparisonUi.submitting = true;
+  syncComparisonSet();
+  comparisonMessage("comparisonMessage", "正在创建对比任务…");
+  try {
+    const run = await api(projectUrl("/comparisons"), "POST", {set_id:element("comparisonSet").value,
+      old_path:element("comparisonOldPath").value.trim(), new_path:element("comparisonNewPath").value.trim(),
+      confidence:element("comparisonConfidence").valueAsNumber, match_iou:element("comparisonIoU").valueAsNumber,
+      image_size:Number(element("comparisonImageSize").value)});
+    if (session !== comparisonUi.session) return;
+    comparisonUi.selected = run.id;
+    comparisonMessage("comparisonMessage", "");
+    await refreshComparisons();
+  } catch (error) {
+    if (session === comparisonUi.session) comparisonMessage("comparisonMessage", error.message, true);
+  } finally {
+    comparisonUi.submitting = false;
+    syncComparisonSet();
+  }
+}
+
+function openBlindsetDialog() {
+  element("blindsetBatch").innerHTML = element("exportBatch").innerHTML;
+  element("blindsetBatch").value = filters().batch;
+  element("blindsetUnit").value = state.project.has_source_groups ? "source_group" : "image";
+  comparisonMessage("blindsetMessage", "");
+  element("blindsetDialog").showModal();
+  element("blindsetName").focus();
+}
+
+async function freezeBlindset(event) {
+  event.preventDefault();
+  if (comparisonUi.freezing) return;
+  const session = comparisonUi.session;
+  comparisonUi.freezing = true;
+  element("freezeBlindset").disabled = true;
+  comparisonMessage("blindsetMessage", "正在复制图片并固定标注版本…");
+  try {
+    const snapshot = await api(projectUrl("/blindsets"), "POST", {name:element("blindsetName").value.trim(),
+      batch:element("blindsetBatch").value, unit:element("blindsetUnit").value,
+      percent:element("blindsetPercent").valueAsNumber, seed:element("blindsetSeed").valueAsNumber});
+    if (session !== comparisonUi.session) return;
+    comparisonUi.sets = [snapshot, ...comparisonUi.sets.filter(set => set.id !== snapshot.id)];
+    renderBlindsets(snapshot.id);
+    element("blindsetDialog").close();
+    element("blindsetName").value = "";
+    comparisonMessage("comparisonMessage", `已冻结盲测集「${snapshot.name}」。`);
+  } catch (error) {
+    if (session === comparisonUi.session) {
+      comparisonMessage(element("blindsetDialog").open ? "blindsetMessage" : "comparisonMessage", error.message, true);
+    }
+  } finally {
+    comparisonUi.freezing = false;
+    element("freezeBlindset").disabled = false;
   }
 }
 
@@ -1362,6 +1581,32 @@ listen("trainingRuns", "click", async event => {
     element("trainingMode").value = "fine_tune";
     trainingMessage("已将该轮训练的权重设为项目预标注模型。");
   } finally { use.disabled = false; }
+});
+listen("comparisonButton", "click", openComparisonDialog);
+listen("comparisonForm", "submit", startComparison);
+listen("comparisonSet", "change", syncComparisonSet);
+listen("browseComparisonOld", "click", () => openModelBrowser("file", "comparisonOldPath"));
+listen("browseComparisonNew", "click", () => openModelBrowser("file", "comparisonNewPath"));
+listen("openBlindset", "click", openBlindsetDialog);
+listen("blindsetForm", "submit", freezeBlindset);
+listen("comparisonRunSelect", "change", event => {
+  comparisonUi.selected = event.target.value;
+  return showComparisonRun();
+});
+listen("stopComparison", "click", async () => {
+  const run = comparisonUi.selected;
+  if (!run) return;
+  element("stopComparison").disabled = true;
+  try {
+    await api(projectUrl(`/comparisons/${run}/cancel`), "POST", {});
+    await refreshComparisons();
+  } finally { element("stopComparison").disabled = false; }
+});
+element("comparisonDialog").addEventListener("close", () => {
+  if (element("comparisonDialog").open) return;
+  clearInterval(comparisonUi.timer);
+  comparisonUi.session++;
+  comparisonUi.read++;
 });
 listen("newProjectButton","click",()=>element("projectDialog").showModal());listen("createProject","click",createProject);
 listen("chooseImageFiles","click",()=>openImageBrowser("file"));

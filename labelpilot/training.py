@@ -7,9 +7,11 @@ import subprocess
 import sys
 import threading
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
-from .exporting import DatasetFolder, SPLIT_UNITS, describe_export, prepare_export, write_members
+from .blindsets import reserve_blind_images
+from .exporting import DatasetFolder, SPLIT_UNITS, describe_export, plan_splits, prepare_export, write_members
 from .store import Problem, atomic_json, digest, now, read_json
 
 
@@ -17,7 +19,7 @@ ACTIVE_TRAINING = ("preparing", "running")
 BEST_WEIGHTS = Path("run/weights/best.pt")
 
 
-class TrainingCancelled(Exception):
+class LocalJobCancelled(Exception):
     pass
 
 
@@ -103,31 +105,25 @@ class TrainingJobs:
         options = training_options(project, payload)
         if not has_training_dependencies():
             raise Problem("当前 Python 缺少 PyTorch 或 Ultralytics，请使用安装了 LabelPilot 依赖的环境", 422)
-        with self.prediction_jobs.lock:
-            if any(job["status"] in ("queued", "running") for job in self.prediction_jobs.records.values()):
-                raise Problem("请等待批量预标注完成或先取消任务", 409)
-            if not self.inference.lock.acquire(blocking=False):
-                raise Problem("模型运行环境正在使用，请等待当前任务结束", 409)
-            self.inference.training.set()
-            try:
-                weights = None
-                if options["mode"] == "fine_tune":
-                    weights = Path(self.store.project(project_id).config.get("model_path") or "")
-                    if weights.suffix.lower() != ".pt" or not weights.is_file():
-                        raise Problem("请先在模型设置里选择可信的本地 .pt 权重，或选择从零训练", 422)
-                run_id = uuid.uuid4().hex
-                record = {"id": run_id, "project": project_id, "status": "preparing", "created_at": now(), "options": options}
-                with self.lock:
-                    self.save_record(record)
-                    self.stop = threading.Event()
-                    self.active = run_id
-                    self.worker = threading.Thread(target=self.run, args=(record, weights, self.stop), daemon=True)
-                    self.worker.start()
-                    return self.view(record)
-            except Exception:
-                self.inference.training.clear()
-                self.inference.lock.release()
-                raise
+        self.prediction_jobs.reserve_model_slot()
+        try:
+            weights = None
+            if options["mode"] == "fine_tune":
+                weights = Path(self.store.project(project_id).config.get("model_path") or "")
+                if weights.suffix.lower() != ".pt" or not weights.is_file():
+                    raise Problem("请先在模型设置里选择可信的本地 .pt 权重，或选择从零训练", 422)
+            run_id = uuid.uuid4().hex
+            record = {"id": run_id, "project": project_id, "status": "preparing", "created_at": now(), "options": options}
+            with self.lock:
+                self.save_record(record)
+                self.stop = threading.Event()
+                self.active = run_id
+                self.worker = threading.Thread(target=self.run, args=(record, weights, self.stop), daemon=True)
+                self.worker.start()
+                return self.view(record)
+        except Exception:
+            self.prediction_jobs.release_model_slot()
+            raise
 
     def get_record(self, project_id, run_id):
         record = self.records.get(run_id)
@@ -167,16 +163,22 @@ class TrainingJobs:
     def run(self, record, weights, stop):
         def checkpoint():
             if stop.is_set():
-                raise TrainingCancelled()
+                raise LocalJobCancelled()
 
         run = self.directory / record["id"]
         options = record["options"]
         updates = {"status": "failed"}
         try:
             with self.store.lock:
-                data_options = {"format": "yolo", "batch": options["batch"], "clean": True,
-                                "split": {"train": 80, "val": 20, "test": 0, "unit": options["unit"], "seed": options["seed"]}}
+                data_options = {"format": "yolo", "batch": options["batch"], "clean": True}
                 plan = prepare_export(self.store, record["project"], data_options, include_documents=True, checkpoint=checkpoint)
+                rows = reserve_blind_images(self.store, record["project"], plan.rows)
+                updates["blind_out"] = len(plan.rows) - len(rows)
+                if not rows:
+                    raise Problem("这一批图片已留作盲测，请选择其他训练批次", 422)
+                split = {"train": 80, "val": 20, "test": 0, "unit": options["unit"], "seed": options["seed"]}
+                assignments, split_config, split_counts = plan_splits(rows, {"split": split})
+                plan = replace(plan, rows=rows, assignments=assignments, split_config=split_config, split_counts=split_counts)
                 preview = describe_export(self.store, plan)
                 if preview["blocking_issue"]:
                     raise Problem(preview["blocking_issue"], 422)
@@ -203,7 +205,7 @@ class TrainingJobs:
             if not (run / BEST_WEIGHTS).is_file():
                 raise Problem("训练已退出，但没有生成 best.pt")
             updates["status"] = "completed"
-        except TrainingCancelled:
+        except LocalJobCancelled:
             updates["status"] = "cancelled"
         except Exception as exc:
             updates["error"] = str(getattr(exc, "message", exc))[:500]
@@ -213,23 +215,26 @@ class TrainingJobs:
                     self.save_record({**record, **updates, "finished_at": now()})
                 finally:
                     self.active = self.stop = self.worker = None
-                    self.inference.training.clear()
-                    self.inference.lock.release()
+                    self.prediction_jobs.release_model_slot()
 
     def run_worker(self, run, stop):
-        with (run / "train.log").open("wb") as log, subprocess.Popen(
-            [sys.executable, "-X", "utf8", "-m", "labelpilot.training_worker", str(run), str(os.getpid())],
-            cwd=Path(__file__).resolve().parent.parent, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"}, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        ) as process:
-            while process.poll() is None:
-                if stop.wait(0.25):
-                    (run / "cancel.request").touch()
-                    try:
-                        process.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                    raise TrainingCancelled()
-            if process.returncode != 0:
-                result = read_state(run / "error.json")
-                raise Problem(result.get("error", f"训练进程退出（代码 {process.returncode}），请查看日志"))
+        run_local_worker(run, stop, "labelpilot.training_worker")
+
+
+def run_local_worker(run, stop, module, *arguments):
+    command = [sys.executable, "-X", "utf8", "-m", module, str(run), str(os.getpid()), *map(str, arguments)]
+    with (run / "train.log").open("wb") as log, subprocess.Popen(
+        command, cwd=Path(__file__).resolve().parent.parent, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"}, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    ) as process:
+        while process.poll() is None:
+            if stop.wait(0.25):
+                (run / "cancel.request").touch()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                raise LocalJobCancelled()
+        if process.returncode != 0:
+            result = read_state(run / "error.json")
+            raise Problem(result.get("error", f"本地模型进程退出（代码 {process.returncode}），请查看日志"))
