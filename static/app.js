@@ -11,6 +11,13 @@ const canvas = element("canvas");
 const context = canvas.getContext("2d");
 const sessionToken = document.querySelector('meta[name="labelpilot-token"]').content;
 const modelBrowser = {mode:"file",listing:null,loading:false,sequence:0};
+const exportPreview = {sequence:0, timer:null, plan:null, running:false};
+const exportSplitLabels = {train:"训练", val:"验证", test:"测试"};
+const exportSplitHints = {
+  source_group:"任务清单里同一来源组的图片会进入同一个集合。实际比例取决于各组的图片数量。",
+  directory:"同一原图文件夹的图片会进入同一个集合。若同源图分散在不同文件夹，请使用任务清单分组。",
+  image:"逐张随机分配。同一视频的相邻帧或重复图片可能跨集。"
+};
 let searchTimer;
 let jobTimer;
 
@@ -98,6 +105,7 @@ async function selectProject(projectId) {
   const options = '<option value="">全部批次</option>' + state.project.batches.map(batch => `<option value="${escapeHtml(batch)}">${escapeHtml(batch)}</option>`).join("");
   element("batchSelect").innerHTML = options;
   element("exportBatch").innerHTML = options;
+  element("exportSplitUnit").value = state.project.has_source_groups ? "source_group" : "image";
   const rememberedBatch = localStorage.getItem(`labelpilot-batch-${projectId}`);
   element("batchSelect").value = state.project.batches.includes(rememberedBatch) ? rememberedBatch : state.project.batches.includes("B001") ? "B001" : "";
   element("searchInput").value = "";
@@ -773,39 +781,136 @@ function exportSplitOptions() {
   if(Math.abs(total-100)>1e-6 || ratios.train<=0)throw new Error(`三个比例之和必须为 100%，且训练集比例必须大于 0（当前合计 ${Number(total.toFixed(6))}%）`);
   const seed=element("splitSeed").valueAsNumber;
   if(!Number.isInteger(seed) || seed<0 || seed>4294967295)throw new Error("随机种子必须为 0 到 4294967295 的整数");
-  return {...ratios,seed};
+  return {...ratios, seed, unit:element("exportSplitUnit").value};
 }
-function updateExportSplit() {
-  element("exportSplitSettings").disabled=!element("splitDataset").checked;
-  let invalid=false;
-  let message="不划分，按原目录结构导出。";
-  try{
-    const split=exportSplitOptions();
-    if(split)message=`训练 ${split.train}% / 验证 ${split.val}% / 测试 ${split.test}% · 合计 100%`;
-  }catch(error){invalid=true;message=error.message;}
-  element("exportSplitSummary").textContent=message;
-  element("exportSplitSummary").dataset.invalid=String(invalid);
-  element("createExport").disabled=invalid || element("createExport").dataset.exporting==="true";
+
+function setExportPreviewStatus(message, error=false) {
+  const status = element("exportPreviewStatus");
+  status.textContent = message;
+  status.hidden = !message;
+  status.dataset.error = String(error);
 }
-async function exportDataset() {
-  if(!state.project)return;
-  if(element("createExport").dataset.exporting==="true")return;
+
+function renderExportPreview(data, options) {
+  const counts = data.split_counts;
+  const configuredSplits = Object.keys(exportSplitLabels);
+  const activeSplits = configuredSplits.filter(name => counts?.[name] > 0);
+  const notes = [];
+  if (data.excluded) notes.push(`${data.excluded} 张未纳入`);
+  if (data.unreviewed) notes.push(`${data.unreviewed} 张待审核`);
+  if (data.group_count) notes.push(`${data.group_count} 个分组`);
+  if (state.dirty) notes.push("当前画布有未保存的修改，预检使用已保存版本");
+  setExportPreviewStatus(notes.join(" · "));
+
+  element("exportImageCount").textContent = data.images.toLocaleString();
+  element("exportObjectCount").textContent = data.annotations.toLocaleString();
+  element("exportEmptyCount").textContent = data.confirmed_empty.toLocaleString();
+  element("exportSplitDistribution").hidden = !counts;
+  if (counts) {
+    element("exportSplitBar").innerHTML = configuredSplits.map(name =>
+      `<span data-subset="${name}" style="width:${100 * counts[name] / data.images}%"></span>`).join("");
+    element("exportSplitCounts").innerHTML = configuredSplits.map(name =>
+      `<div><dt>${exportSplitLabels[name]}</dt><dd>${counts[name].toLocaleString()} 张</dd></div>`).join("");
+  }
+
+  const issues = [];
+  if (data.blocking_issue) issues.push(data.blocking_issue);
+  if (data.unreviewed_empty) issues.push(`${data.unreviewed_empty} 张待审核图没有标注对象，作为负样本使用前请先确认。`);
+  if (data.cross_split_sources) issues.push(`${data.cross_split_sources} 个已知来源组跨越多个集合。`);
+  if (activeSplits.length > 1 && data.missing_sources) {
+    issues.push(`${data.missing_sources} 张图片缺少来源组，无法检查这些图片是否同源跨集。`);
+  }
+  if (counts) {
+    const emptySplits = activeSplits.filter(name => data.class_counts.every(row => row.splits[name] === 0));
+    if (emptySplits.length) issues.push(`${emptySplits.map(name => `${exportSplitLabels[name]}集`).join("、")}没有标注对象。`);
+    const missingTrain = data.class_counts.filter(row => row.splits.train === 0).length;
+    if (missingTrain && !emptySplits.includes("train")) issues.push(`${missingTrain} 个类别在训练集中没有标注。`);
+    if (options.format === "yolo" && counts.val === 0) issues.push("YOLO 训练前需要另行配置验证数据。");
+  }
+  element("exportPreviewIssues").innerHTML = issues.map(issue => `<p>${escapeHtml(issue)}</p>`).join("");
+  element("exportPreviewIssues").hidden = !issues.length;
+
+  element("exportClassColumns").innerHTML = '<th scope="col">类别</th><th scope="col">合计</th>' + activeSplits.map(name =>
+    `<th scope="col">${exportSplitLabels[name]}</th>`).join("");
+  element("exportClassRows").innerHTML = data.class_counts.map(row => {
+    const cells = activeSplits.map(name =>
+      `<td${row.splits[name] ? "" : " data-gap"}>${row.splits[name].toLocaleString()}</td>`).join("");
+    return `<tr><th scope="row">${escapeHtml(row.name)}</th><td>${row.total.toLocaleString()}</td>${cells}</tr>`;
+  }).join("");
+  element("exportPreviewContent").hidden = false;
+}
+
+function updateExportPreview() {
+  if (exportPreview.running || !element("exportDialog").open) return;
+  clearTimeout(exportPreview.timer);
+  const sequence = ++exportPreview.sequence;
+  exportPreview.plan = null;
+  element("createExport").disabled = true;
+  element("exportPreviewContent").hidden = true;
+  const splitSettings = element("exportSplitSettings");
+  splitSettings.disabled = !element("splitDataset").checked;
+  splitSettings.hidden = splitSettings.disabled;
+  element("exportSplitHint").textContent = exportSplitHints[element("exportSplitUnit").value];
+  const summary = element("exportSplitSummary");
   let split;
-  try{split=exportSplitOptions();}catch(error){updateExportSplit();toast(error.message);return;}
-  if(!element("reviewedOnly").checked && !window.confirm("你正在导出未审核标注（可能包含模型错误）。确认仅作为待审数据使用，不直接视为真值？"))return;
-  element("createExport").dataset.exporting="true";
-  element("createExport").disabled=true;
-  element("exportResult").textContent="正在校验图片指纹并生成 ZIP，请稍候…";
-  try{
-    const result=await api(projectUrl("/export"),"POST",{format:element("exportFormat").value,batch:element("exportBatch").value,
-      reviewed_only:element("reviewedOnly").checked,include_images:element("includeImages").checked,split});
+  try {
+    split = exportSplitOptions();
+  } catch (error) {
+    summary.textContent = error.message;
+    summary.hidden = false;
+    setExportPreviewStatus("请调整划分设置后查看预检结果。");
+    return;
+  }
+  summary.textContent = "";
+  summary.hidden = true;
+
+  const options = {format:element("exportFormat").value, batch:element("exportBatch").value,
+    reviewed_only:element("reviewedOnly").checked, include_images:element("includeImages").checked, split};
+  const url = projectUrl("/export");
+  setExportPreviewStatus("正在统计本次导出的标注…");
+  exportPreview.timer = setTimeout(async () => {
+    try {
+      const data = await api(`${url}/preview`, "POST", options);
+      if (sequence !== exportPreview.sequence || !element("exportDialog").open) return;
+      renderExportPreview(data, options);
+      exportPreview.plan = {url, options, data};
+      element("createExport").disabled = Boolean(data.blocking_issue);
+    } catch (error) {
+      if (sequence === exportPreview.sequence && element("exportDialog").open) setExportPreviewStatus(error.message, true);
+    }
+  }, 150);
+}
+
+async function exportDataset() {
+  const plan = exportPreview.plan;
+  if (!element("exportDialog").open || !plan || plan.data.blocking_issue || exportPreview.running) return;
+  if (plan.data.unreviewed && !window.confirm(`这次导出包含 ${plan.data.unreviewed} 张待审核图片。确定生成此导出包？`)) return;
+  exportPreview.running = true;
+  element("exportControls").disabled = true;
+  element("refreshExportPreview").disabled = true;
+  element("createExport").disabled = true;
+  const status = element("exportResult");
+  status.dataset.error = "false";
+  status.textContent = "正在核对原图并生成 ZIP…";
+  let failed = false;
+  try {
+    const result=await api(plan.url, "POST", {...plan.options, preview_token:plan.data.preview_token});
     const counts=result.split_counts;
     const summary=counts ? `训练 ${counts.train} 张 / 验证 ${counts.val} 张 / 测试 ${counts.test} 张。` : "未划分数据集。";
-    element("exportResult").innerHTML=`<p class="muted">已导出 ${result.images} 张。${summary}<a href="${escapeHtml(result.url)}" download>再次下载 ZIP</a></p>`;
+    status.innerHTML=`<p class="muted">已导出 ${result.images} 张。${summary}<a href="${escapeHtml(result.url)}" download>再次下载 ZIP</a></p>`;
     const link=document.createElement("a");link.href=result.url;link.download=result.filename;document.body.append(link);link.click();link.remove();
     toast(`已生成 ${result.images} 张数据的导出包`);
-  }catch(error){element("exportResult").textContent=error.message;throw error;}
-  finally{element("createExport").dataset.exporting="false";updateExportSplit();}
+  } catch (error) {
+    failed = true;
+    status.dataset.error = "true";
+    status.textContent = error.message;
+  } finally {
+    exportPreview.running = false;
+    element("exportControls").disabled = false;
+    element("refreshExportPreview").disabled = false;
+    if (failed) updateExportPreview();
+    else element("createExport").disabled = !exportPreview.plan;
+  }
 }
 async function createProject() {
   if(state.busy)return;
@@ -906,9 +1011,25 @@ listen("iou","input",event=>{element("iouValue").value=Number(event.target.value
 listen("discardPrediction","click",()=>{state.prediction=null;element("predictionDialog").close();});
 listen("appendPrediction","click",()=>applyPrediction(true));listen("replacePrediction","click",()=>applyPrediction(false));
 listen("jobsList","click",async event=>{const button=event.target.closest("[data-cancel-job]");if(button){await api(`/api/jobs/${button.dataset.cancelJob}/cancel`,"POST",{});toast("已请求取消；当前推理结束后停止，不会写入该张结果");}});
-for(const id of ["railExport","exportButton"])listen(id,"click",()=>{if(state.project){updateExportSplit();element("exportDialog").showModal();}});
-listen("splitDataset","change",updateExportSplit);
-for(const id of ["splitTrain","splitVal","splitTest","splitSeed"])listen(id,"input",updateExportSplit);
+for (const id of ["railExport", "exportButton"]) listen(id, "click", () => {
+  if (!state.project) return;
+  if (exportPreview.running) return toast("正在生成上一次的导出包");
+  element("exportResult").textContent = "";
+  element("exportDialog").showModal();
+  updateExportPreview();
+});
+for (const id of ["exportFormat", "exportBatch", "reviewedOnly", "includeImages", "splitDataset",
+  "exportSplitUnit", "splitTrain", "splitVal", "splitTest", "splitSeed"]) listen(id, "input", () => {
+  element("exportResult").textContent = "";
+  updateExportPreview();
+});
+listen("refreshExportPreview", "click", updateExportPreview);
+element("exportDialog").addEventListener("close", () => {
+  if (element("exportDialog").open) return;
+  clearTimeout(exportPreview.timer);
+  exportPreview.sequence++;
+  exportPreview.plan = null;
+});
 listen("createExport","click",exportDataset);
 listen("newProjectButton","click",()=>element("projectDialog").showModal());listen("createProject","click",createProject);
 listen("historyButton","click",showHistory);listen("historyList","click",event=>{const button=event.target.closest("[data-restore]");if(button)return restoreRevision(Number(button.dataset.restore));});

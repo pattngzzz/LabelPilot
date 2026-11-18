@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from labelpilot.exporting import export_project, plan_splits
+from labelpilot.exporting import export_project, plan_splits, preview_export
 from labelpilot import model_files
 from labelpilot import server
 from labelpilot.inference import Inference, Jobs, model_class_names
@@ -131,6 +131,32 @@ def test_split_is_reproducible_and_seeded():
     assert assignments != plan_splits(rows, {"split": {**settings["split"], "seed": 43}})[0]
 
 
+@pytest.mark.parametrize("unit", ["source_group", "directory"])
+def test_grouped_split_keeps_groups_whole_and_is_reproducible(unit):
+    groups = {"day1/camera": 6, "day2/camera": 3, "day3/camera": 1}
+    rows = [{"id": f"{group}/{index}", "source_group": group, "relative": f"{group}/{index}.jpg"}
+            for group, size in groups.items() for index in range(size)]
+    options = {"split": {"train": 60, "val": 30, "test": 10, "seed": 42, "unit": unit}}
+    assignments, config, counts = plan_splits(rows, options)
+    assert plan_splits(list(reversed(rows)), options) == (assignments, config, counts)
+    assert config["unit"] == unit
+    assert counts == {"train": 6, "val": 3, "test": 1}
+    assert all(len({assignments[row["id"]] for row in rows if row["source_group"] == group}) == 1 for group in groups)
+
+
+def test_grouped_split_requires_known_and_sufficient_groups():
+    rows = [{"id": str(index), "source_group": "video-a"} for index in range(5)]
+    options = {"split": {"train": 80, "val": 20, "test": 0, "unit": "source_group"}}
+    with pytest.raises(Problem, match="只有 1 个可用分组"):
+        plan_splits(rows, options)
+    rows[0]["source_group"] = " unassigned "
+    with pytest.raises(Problem, match="1 张图片没有来源组"):
+        plan_splits(rows, options)
+    rows[0]["source_group"] = "video-b"
+    _, _, counts = plan_splits(rows, options)
+    assert counts == {"train": 4, "val": 1, "test": 0}
+
+
 @pytest.mark.parametrize("ratios,count,expected", [
     ((80, 10, 10), 3, (1, 1, 1)), ((99, .5, .5), 4, (2, 1, 1)),
     ((33.4, 33.3, 33.3), 10, (4, 3, 3)), ((80, 20, 0), 4, (3, 1, 0)),
@@ -169,6 +195,46 @@ def test_split_export_can_omit_test_set(reviewed_store):
     with zipfile.ZipFile(reviewed_store.home / "exports" / result["filename"]) as archive:
         assert "test: null\n" in archive.read("dataset.yaml").decode()
         assert not any("/test/" in name for name in archive.namelist())
+
+
+def test_export_preview_matches_manifest_and_rejects_changed_revision(reviewed_store):
+    store = reviewed_store
+    store.add_label("test", "unused")
+    options = {"split": {"train": 50, "val": 25, "test": 25}}
+    preview = preview_export(store, "test", options)
+    assert (preview["images"], preview["annotations"], preview["confirmed_empty"]) == (4, 2, 2)
+    classes = {row["name"]: row for row in preview["class_counts"]}
+    assert classes["object"]["total"] == 2 and classes["unused"]["splits"] == {"train": 0, "val": 0, "test": 0}
+    assert not (store.home / "exports").exists()
+
+    store.save("test", item(store, "human")["id"], payload(store, "human", "reviewed"))
+    with pytest.raises(Problem, match="数据已变化") as error:
+        export_project(store, "test", {**options, "preview_token": preview["preview_token"]})
+    assert error.value.status == 409
+    assert not (store.home / "exports").exists()
+
+    preview = preview_export(store, "test", options)
+    result = export_project(store, "test", {**options, "preview_token": preview["preview_token"]})
+    with zipfile.ZipFile(store.home / "exports" / result["filename"]) as archive:
+        manifest = json.loads(archive.read("export_manifest.json"))
+        assert manifest["split_counts"] == preview["split_counts"]
+        expected_counts = dict.fromkeys(manifest["split_counts"], 0)
+        for name in archive.namelist():
+            if name.startswith("labels/"):
+                expected_counts[PurePosixPath(name).parts[1]] += len(archive.read(name).splitlines())
+        assert next(row["splits"] for row in preview["class_counts"] if row["name"] == "object") == expected_counts
+
+
+def test_export_preview_distinguishes_pending_empty_and_pins_external_annotation(store, dataset):
+    store.save("test", item(store, "empty")["id"], payload(store, "empty"))
+    options = {"reviewed_only": False}
+    preview = preview_export(store, "test", options)
+    assert (preview["images"], preview["excluded"], preview["unreviewed"]) == (3, 1, 3)
+    assert (preview["confirmed_empty"], preview["unreviewed_empty"]) == (0, 1)
+    source = dataset[2] / "human.json"
+    source.write_text(source.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with pytest.raises(Problem, match="数据已变化"):
+        export_project(store, "test", {**options, "preview_token": preview["preview_token"]})
 
 
 def test_import_is_not_independent_acceptance(store):
@@ -272,26 +338,35 @@ def test_reviewed_only_export_and_numeric_roundtrip(store):
 
 @pytest.mark.parametrize("format_name", ["labelme", "coco"])
 def test_other_export_formats(store, format_name):
+    data = payload(store, "human", "reviewed")
+    points = [[110, 70], [12.5, 70], [12.5, 10], [110, 10]]
+    data["document"]["shapes"][0]["points"] = points
+    item_id = item(store, "human")["id"]
+    store.save("test", item_id, data)
     result = export_project(store, "test", {"format": format_name, "reviewed_only": False, "include_images": False})
     with zipfile.ZipFile(store.home / "exports" / result["filename"]) as archive:
         assert not any(name.startswith("images/") for name in archive.namelist())
         if format_name == "labelme":
             document = json.loads(archive.read(next(name for name in archive.namelist() if name.startswith("annotations/"))))
             assert document["shapes"][0]["group_id"] == 9
+            assert document["shapes"][0]["points"] == [[12.5, 10], [110, 70]]
             assert document["imagePath"].startswith("../images/")
         else:
             document = json.loads(archive.read("annotations.json"))
             assert len(document["images"]) == 2
             assert document["annotations"][0]["bbox"] == [12.5, 10, 97.5, 60]
+    assert store.detail("test", item_id)["document"]["shapes"][0]["points"] == points
 
 
 def test_polygon_not_silently_converted_for_yolo(store):
     data = payload(store, "human", "reviewed")
     data["document"]["shapes"][0].update(shape_type="polygon", points=[[10, 10], [100, 10], [50, 80]])
     store.save("test", item(store, "human")["id"], data)
+    assert "多边形" in preview_export(store, "test", {"format": "yolo"})["blocking_issue"]
+    assert preview_export(store, "test", {"format": "coco"})["blocking_issue"] is None
     with pytest.raises(Problem, match="多边形"):
         export_project(store, "test", {"format": "yolo"})
-    assert not list((store.home / "exports").glob("*.zip"))
+    assert not list((store.home / "exports").glob("*"))
 
 
 def test_project_registration_and_duplicate_names(store, dataset):
@@ -397,6 +472,10 @@ def test_http_local_security_and_save(dataset):
         assert client.post("/api/projects", json={}).status_code == 403
         assert client.get("/api/projects", headers={"Origin": "https://evil.example"}).status_code == 403
         assert client.get("/api/projects", headers={"Host": "evil.example"}).status_code == 400
+        preview_path = "/api/projects/test/export/preview"
+        assert client.post(preview_path, json={}).status_code == 403
+        preview = client.post(preview_path, json={"reviewed_only": False}, headers={"X-LabelPilot-Token": token})
+        assert preview.status_code == 200 and preview.json()["annotations"] == 2
         store = app.state.store
         row = item(store, "human")
         assert client.get(f"/api/projects/test/items/{row['id']}/image?thumbnail=true").headers["content-type"] == "image/jpeg"

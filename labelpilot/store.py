@@ -32,6 +32,19 @@ def read_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
 
 
+def read_annotation_snapshot(path):
+    contents = Path(path).read_bytes()
+    return json.loads(contents.decode("utf-8-sig")), hashlib.sha256(contents).hexdigest()
+
+
+def source_group(value):
+    if isinstance(value, str):
+        name = value.strip()
+        if name and name.casefold() != "unassigned":
+            return name
+    return None
+
+
 def digest(path):
     hasher = hashlib.sha256()
     with Path(path).open("rb") as stream:
@@ -158,7 +171,7 @@ class Project:
             "id": item_id, "photo_id": task.get("photo_id", path.stem), "path": str(path),
             "relative": relative, "width": task.get("width"), "height": task.get("height"),
             "image_sha256": task.get("sha256"), "batch": task.get("batch") or path.parent.name,
-            "source_group": task.get("source_group", "unassigned"),
+            "source_group": source_group(task.get("source_group")) or "unassigned",
             "source_id": task.get("source_id", ""), "note": task.get("visual_note", ""),
             "status": "unstarted", "count": 0, "source": None, "source_kind": None,
         })
@@ -174,7 +187,9 @@ class Project:
                 "classes": [{"id": index, "name": name, "display": name,
                              "color": COLORS[index % len(COLORS)]} for index, name in enumerate(self.names)],
                 "model_path": self.config.get("model_path", ""), "total": len(self.items),
-                "batches": sorted({item["batch"] for item in self.items}), "warnings": self.warnings}
+                "batches": sorted({item["batch"] for item in self.items}),
+                "has_source_groups": any(item["source_group"] != "unassigned" for item in self.items),
+                "warnings": self.warnings}
 
 
 class Store:
@@ -285,15 +300,22 @@ class Store:
             project.names = names
         return project.summary()
 
-    def overlay(self, project_id):
+    def overlay(self, project_id, include_documents=False):
+        overlays = {}
         with self.connect() as connection:
-            rows = connection.execute("SELECT item, version, status, document, updated FROM annotations WHERE project=?", (project_id,)).fetchall()
-        return {row["item"]: {"version": row["version"], "status": row["status"],
-                               "count": len(json.loads(row["document"])["shapes"]), "updated": row["updated"]} for row in rows}
+            rows = connection.execute("SELECT item, version, status, document, updated FROM annotations WHERE project=?", (project_id,))
+            for row in rows:
+                document = json.loads(row["document"])
+                item = {"version": row["version"], "status": row["status"],
+                        "count": len(document["shapes"]), "updated": row["updated"]}
+                if include_documents:
+                    item["document"] = document
+                overlays[row["item"]] = item
+        return overlays
 
-    def listing(self, project_id, query="", batch="", status="", offset=0, limit=80):
+    def listing(self, project_id, query="", batch="", status="", offset=0, limit=80, *, include_documents=False):
         project = self.project(project_id)
-        overlays = self.overlay(project_id)
+        overlays = self.overlay(project_id, include_documents=include_documents)
         counts = dict.fromkeys(STATUSES, 0)
         filtered = []
         for original in project.items:
@@ -331,17 +353,18 @@ class Store:
         if item.get("error"):
             raise Problem(item["error"], 422)
         width, height, image_digest = self.image_info(project, item)
-        source_digest = digest(item["source"]) if item["source"] else None
+        source_digest = None
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM annotations WHERE project=? AND item=?", (project_id, item_id)).fetchone()
         if row:
             document = json.loads(row["document"])
+            source_digest = digest(item["source"]) if item["source"] else None
             version, status = row["version"], row["status"]
             recorded = document.get("labelpilot", {}).get("image_sha256")
             if recorded and recorded != image_digest:
                 raise Problem("原图已在上次保存后改变；已阻止旧标注套用", 409)
         elif item["source"]:
-            document = read_json(item["source"])
+            document, source_digest = read_annotation_snapshot(item["source"])
             version, status = 0, item["status"]
         else:
             document = {"version": "LabelPilot-1", "flags": {}, "shapes": [],

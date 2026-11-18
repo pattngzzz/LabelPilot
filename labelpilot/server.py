@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .exporting import export_project
+from .exporting import export_project, preview_export
 from .inference import Inference, Jobs
 from . import model_files
 from .store import Problem, Store
@@ -176,6 +176,10 @@ def create_app(home=None):
     @app.post("/api/jobs/{job_id}/cancel")
     def cancel_job(job_id: str):
         return jobs.cancel(job_id)
+
+    @app.post("/api/projects/{project_id}/export/preview")
+    def export_preview(project_id: str, payload: dict):
+        return preview_export(store, project_id, payload)
 
     @app.post("/api/projects/{project_id}/export")
     def export(project_id: str, payload: dict):

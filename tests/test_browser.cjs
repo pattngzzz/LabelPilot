@@ -37,7 +37,12 @@ test("crosshair guides, Q/Enter shortcuts, annotation, model selection and datas
   fs.writeFileSync(path.join(modelFolder, "ignore.json"), "not a model");
   const fixture = spawnSync(python, ["-c", "from PIL import Image; import sys; from pathlib import Path; [Image.new('RGB',(640,480),'#555577').save(Path(sys.argv[1])/f'image_{index}.png') for index in range(4)]", images], {windowsHide:true, encoding:"utf8"});
   assert.equal(fixture.status, 0, fixture.stderr || fixture.error?.message);
-  fs.writeFileSync(path.join(home, "projects.json"), JSON.stringify([{id:"test", name:"Browser test", image_root:images, classes:["class_a", "class_b"], model_path:firstModel}]));
+  const manifestPath = path.join(home, "capture-manifest.json");
+  fs.writeFileSync(manifestPath, JSON.stringify({tasks:["capture-a", "capture-a", "capture-b", "capture-c"].map((group, index) => ({
+    package_image:`image_${index}.png`, source_group:group
+  }))}));
+  fs.writeFileSync(path.join(home, "projects.json"), JSON.stringify([{id:"test", name:"Browser test", image_root:images,
+    classes:["class_a", "class_b"], model_path:firstModel, manifest_path:manifestPath}]));
   const listener = net.createServer();
   await new Promise(resolve => listener.listen(0, "127.0.0.1", resolve));
   const port = listener.address().port;
@@ -370,8 +375,8 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     fs.mkdirSync(downloads);
     await cdp("Browser.setDownloadBehavior", {behavior:"allow", downloadPath:downloads});
     await click("#exportButton");
-    await waitFor('element("exportDialog").open');
-    await check('element("splitDataset").checked && element("splitTrain").value==="80" && element("splitVal").value==="10" && element("splitTest").value==="10" && !element("createExport").disabled', "Export defaults to an editable 80/10/10 split");
+    await waitFor('element("exportDialog").open && element("exportPreviewStatus").textContent.includes("可用分组")');
+    await check('element("splitDataset").checked && element("splitTrain").value==="80" && element("splitVal").value==="10" && element("splitTest").value==="10" && element("exportSplitUnit").value==="source_group"', "Projects with capture groups default to grouped 80/10/10 splitting");
     const setExportValue = (id, value) => evaluate(`element(${JSON.stringify(id)}).value=${JSON.stringify(String(value))};element(${JSON.stringify(id)}).dispatchEvent(new Event("input",{bubbles:true}));`);
     await evaluate('window.exportApi=api;window.exportRequests=[];api=async(path,method,body)=>{if(path.endsWith("/export"))exportRequests.push(body);const result=await exportApi(path,method,body);if(path.endsWith("/export"))window.lastExportResult=result;return result;};');
     await setExportValue("splitTrain", 70);
@@ -386,27 +391,45 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await setExportValue("splitSeed", 1.5);
     await check('element("createExport").disabled', "Fractional seeds are rejected");
     await setExportValue("splitSeed", 42);
-    await click("#createExport");
-    await waitFor('element("exportResult").textContent.includes("图片数量不足") && !element("createExport").disabled');
-    assert.equal(fs.readdirSync(downloads).length, 0, "Failed export never downloads a partial ZIP");
+    await waitFor('element("exportPreviewStatus").textContent.includes("可用分组") && element("createExport").disabled');
+    await check('exportRequests.length===0', "Too few capture groups block export before creating a ZIP");
     await evaluate('(async()=>{for(const row of state.items){const current=await api(projectUrl("/items/"+row.id));if(current.status!=="reviewed")await api(projectUrl("/items/"+row.id),"PUT",{...current,expected_version:current.version,status:"reviewed",confirmed_empty:true});}})()');
+    await click("#refreshExportPreview");
+    await waitFor('!element("createExport").disabled && element("exportImageCount").textContent==="4"');
+    await check('element("exportEmptyCount").textContent==="3" && element("exportObjectCount").textContent==="3" && element("exportClassRows").textContent.includes("qrade_customQ") && element("exportPreviewIssues").textContent.includes("训练集中没有标注")', "Preview reports confirmed negatives, class counts and missing training classes");
     const beforeExport = await evaluate('JSON.stringify(state.current)');
+    await evaluate('(async()=>{const route=projectUrl("/items/"+state.items.at(-1).id);const row=await api(route);await api(route,"PUT",{...row,expected_version:row.version,status:"reviewed",confirmed_empty:true});})()');
+    await click("#createExport");
+    await waitFor('element("exportResult").textContent.includes("数据已变化") && !element("createExport").disabled');
+    assert.equal(fs.readdirSync(downloads).length, 0, "A stale preview never downloads a ZIP");
     await click("#createExport");
     await waitFor('element("exportResult").textContent.includes("训练 2 张 / 验证 1 张 / 测试 1 张") && !element("createExport").disabled');
-    await check('JSON.stringify(exportRequests.at(-1).split)===JSON.stringify({train:50,val:25,test:25,seed:42}) && lastExportResult.images===4', "Custom split and seed reach the real backend");
+    await check('JSON.stringify(exportRequests.at(-1).split)===JSON.stringify({train:50,val:25,test:25,seed:42,unit:"source_group"}) && lastExportResult.images===4', "The refreshed preview supplies its exact grouped split to the export API");
     await eventually(() => fs.readdirSync(downloads).filter(name => name.endsWith(".zip")).length === 1);
     const splitExport = path.join(downloads, fs.readdirSync(downloads).find(name => name.endsWith(".zip")));
-    const exportCheck = spawnSync(python, ["-c", "import json,sys,zipfile; archive=zipfile.ZipFile(sys.argv[1]); manifest=json.loads(archive.read('export_manifest.json')); assert manifest['split_counts']=={'train':2,'val':1,'test':1}; assert all(entry['image'] in archive.namelist() for entry in manifest['items']); assert 'val: images/val' in archive.read('dataset.yaml').decode(); print('Downloaded YOLO split ZIP verified')", splitExport], {windowsHide:true, encoding:"utf8"});
+    const exportCheck = spawnSync(python, ["-c", `
+import json, sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    manifest = json.loads(archive.read('export_manifest.json'))
+    assert manifest['split_counts'] == {'train': 2, 'val': 1, 'test': 1}
+    assert manifest['split'] == 'grouped_by_source'
+    assert all(entry['image'] in archive.namelist() for entry in manifest['items'])
+    assert {entry['split'] for entry in manifest['items'] if entry['split_group'] == 'capture-a'} == {'train'}
+    assert 'val: images/val' in archive.read('dataset.yaml').decode()
+`, splitExport], {windowsHide:true, encoding:"utf8"});
     assert.equal(exportCheck.status, 0, exportCheck.stderr || exportCheck.error?.message);
-    for (const width of [1600,760,480]) {
-      await cdp("Emulation.setDeviceMetricsOverride", {width, height:1000, deviceScaleFactor:1, mobile:false});
+    for (const [width, height] of [[1600,1000], [760,800], [480,740], [360,640]]) {
+      await cdp("Emulation.setDeviceMetricsOverride", {width, height, deviceScaleFactor:1, mobile:false});
       await sleep(100);
-      await check('(()=>{const rect=element("exportDialog").getBoundingClientRect();return rect.left>=0 && rect.right<=innerWidth && rect.top>=0 && rect.bottom<=innerHeight && element("exportDialog").scrollWidth<=element("exportDialog").clientWidth;})()', `Split export dialog fits the viewport at width ${width}`);
+      await check('(()=>{const dialog=element("exportDialog"),rect=dialog.getBoundingClientRect(),button=element("createExport").getBoundingClientRect();return rect.left>=0 && rect.right<=innerWidth && rect.top>=0 && rect.bottom<=innerHeight && dialog.scrollWidth<=dialog.clientWidth && button.bottom<=rect.bottom;})()', `Split export dialog and download action fit the viewport at ${width} by ${height}`);
+      if (width === 1600 || width === 360) {
+        const screenshot = await cdp("Page.captureScreenshot", {format:"png"});
+        fs.writeFileSync(path.join(home, width === 1600 ? "split-export.png" : "split-export-mobile.png"), Buffer.from(screenshot.data, "base64"));
+      }
     }
-    const exportScreenshot = await cdp("Page.captureScreenshot", {format:"png"});
-    fs.writeFileSync(path.join(home,"split-export.png"), Buffer.from(exportScreenshot.data,"base64"));
     await cdp("Emulation.setDeviceMetricsOverride", {width:1600, height:1000, deviceScaleFactor:1, mobile:false});
     await click("#splitDataset");
+    await waitFor('!element("createExport").disabled');
     await check('element("exportSplitSettings").disabled && !element("createExport").disabled', "Users can keep the original unsplit export behavior");
     await click("#createExport");
     await waitFor('element("exportResult").textContent.includes("未划分数据集") && !element("createExport").disabled');

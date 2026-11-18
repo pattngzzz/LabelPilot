@@ -1,24 +1,70 @@
 import copy
+import hashlib
 import json
 import math
 import random
 import re
 import uuid
 import zipfile
-from pathlib import Path
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import Optional
 
-from .store import Problem, now
+from .store import Problem, Project, digest, now, read_annotation_snapshot, source_group
 
 
 SPLIT_NAMES = ("train", "val", "test")
+SPLIT_UNITS = ("image", "source_group", "directory")
+YOLO_POLYGON_ERROR = "YOLO 检测格式仅支持矩形。请选择 COCO 或 Labelme 导出多边形"
+
+
+def split_group(row, unit):
+    if unit == "source_group":
+        return source_group(row.get("source_group"))
+    if unit == "directory":
+        return PurePosixPath(row["relative"]).parent.as_posix()
+    return None
+
+
+def assign_groups(rows, unit, active, targets, rng):
+    groups = {}
+    missing = 0
+    for row in rows:
+        group = split_group(row, unit)
+        if group is None:
+            missing += 1
+        else:
+            groups.setdefault(group, []).append(row["id"])
+    if missing:
+        raise Problem(f"有 {missing} 张图片没有来源组。可补齐任务清单，或选择其他划分方式", 422)
+    if len(groups) < len(active):
+        raise Problem(f"只有 {len(groups)} 个可用分组，无法填满 {len(active)} 个集合。请扩大导出范围或将部分比例设为 0", 422)
+
+    ordered = sorted(groups)
+    rng.shuffle(ordered)
+    ordered.sort(key=lambda group: len(groups[group]), reverse=True)
+    counts = dict.fromkeys(SPLIT_NAMES, 0)
+    assignments = {}
+    for index, group in enumerate(ordered):
+        empty = [name for name in active if counts[name] == 0]
+        # Reserve a whole group for each remaining empty subset.
+        candidates = empty if len(ordered) - index == len(empty) else active
+        subset = max(candidates, key=lambda name: targets[name] - counts[name])
+        for item_id in groups[group]:
+            assignments[item_id] = subset
+        counts[subset] += len(groups[group])
+    return assignments, counts
 
 
 def plan_splits(rows, options):
     settings = options.get("split")
     if settings is None:
         return {row["id"]: "unassigned" for row in rows}, None, None
-    if not isinstance(settings, dict) or set(settings) - {*SPLIT_NAMES, "seed"}:
-        raise Problem("划分设置必须包含 train、val、test 百分比和可选随机种子", 422)
+    if not isinstance(settings, dict) or set(settings) - {*SPLIT_NAMES, "seed", "unit"}:
+        raise Problem("划分设置必须包含 train、val、test 百分比，可指定随机种子和划分方式", 422)
+    unit = settings.get("unit", "image")
+    if unit not in SPLIT_UNITS:
+        raise Problem("划分方式必须是按图片、按来源组或按原图文件夹", 422)
     ratios = {name: settings.get(name) for name in SPLIT_NAMES}
     if any(isinstance(value, bool) or not isinstance(value, (int, float)) or
            not 0 <= value <= 100 for value in ratios.values()):
@@ -29,9 +75,14 @@ def plan_splits(rows, options):
     if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= 4294967295:
         raise Problem("随机种子必须为 0 到 4294967295 的整数", 422)
     active = [name for name in SPLIT_NAMES if ratios[name] > 0]
+    targets = {name: len(rows) * ratios[name] / 100 for name in SPLIT_NAMES}
+    rng = random.Random(seed)
+    if unit != "image":
+        assignments, counts = assign_groups(rows, unit, active, targets, rng)
+        return assignments, {**ratios, "seed": seed, "unit": unit, "method": "seeded_group_balance"}, counts
+
     if len(rows) < len(active):
         raise Problem("图片数量不足以让每个非零比例的集合至少包含 1 张，请增加图片或将部分比例设为 0", 422)
-    targets = {name: len(rows) * ratios[name] / 100 for name in SPLIT_NAMES}
     counts = {name: math.floor(targets[name]) for name in SPLIT_NAMES}
     order = sorted(active, key=lambda name: targets[name] - counts[name], reverse=True)
     for name in order[:len(rows) - sum(counts.values())]:
@@ -43,7 +94,7 @@ def plan_splits(rows, options):
             counts[donor] -= 1
             counts[name] = 1
     shuffled = sorted(rows, key=lambda row: row["id"])
-    random.Random(seed).shuffle(shuffled)
+    rng.shuffle(shuffled)
     assignments = {}
     offset = 0
     for name in SPLIT_NAMES:
@@ -53,65 +104,199 @@ def plan_splits(rows, options):
     return assignments, {**ratios, "seed": seed, "unit": "image", "method": "seeded_shuffle"}, counts
 
 
-def export_project(store, project_id, options):
+@dataclass(frozen=True)
+class ExportPlan:
+    project: Project
+    format_name: str
+    batch: str
+    reviewed_only: bool
+    include_images: bool
+    rows: list
+    excluded: int
+    assignments: dict
+    split_config: Optional[dict]
+    split_counts: Optional[dict]
+
+
+def prepare_export(store, project_id, options, *, include_documents=False):
     project = store.project(project_id)
     format_name = options.get("format", "yolo")
     if format_name not in ("yolo", "labelme", "coco"):
         raise Problem("导出格式必须为 yolo、labelme 或 coco", 422)
     reviewed_only = options.get("reviewed_only", True)
-    if not isinstance(reviewed_only, bool) or not isinstance(options.get("include_images", True), bool):
+    include_images = options.get("include_images", True)
+    if not isinstance(reviewed_only, bool) or not isinstance(include_images, bool):
         raise Problem("导出开关必须为布尔值", 422)
-    listing = store.listing(project_id, batch=options.get("batch", ""), limit=1000000)
+    batch = options.get("batch")
+    if batch is None:
+        batch = ""
+    if not isinstance(batch, str):
+        raise Problem("批次必须为文本", 422)
+    listing = store.listing(project_id, batch=batch, limit=1000000, include_documents=include_documents)
     rows = [item for item in listing["items"] if item["status"] == "reviewed" or
             (not reviewed_only and item["status"] in ("imported", "predicted", "draft"))]
     if not rows:
-        raise Problem("没有符合条件的标注；默认只导出已由人工确认的图片", 422)
+        raise Problem("所选范围没有符合条件的标注。默认仅导出已人工确认的图片", 422)
     if len(rows) > 10000:
         raise Problem("请按批次导出，每次不超过 10000 张", 422)
     assignments, split_config, split_counts = plan_splits(rows, options)
+    return ExportPlan(project, format_name, batch, reviewed_only, include_images, rows,
+                      listing["filtered"] - len(rows), assignments, split_config, split_counts)
+
+
+def export_fingerprint(plan, sources):
+    item_versions = [
+        (row["id"], row["photo_id"], row.get("version", 0), row["status"], row["source_group"],
+         row["image_sha256"], plan.assignments[row["id"]], sources.get(row["id"])) for row in plan.rows
+    ]
+    snapshot = (plan.project.id, plan.project.names, plan.format_name, plan.batch, plan.reviewed_only,
+                plan.include_images, plan.excluded, plan.split_config, item_versions)
+    return hashlib.sha256(json.dumps(snapshot, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def validate_export_document(store, project, document, width, height, status):
+    metadata = document.get("labelpilot")
+    confirmed_empty = isinstance(metadata, dict) and metadata.get("negative_sample_confirmed", False)
+    store.validate(project, document, width, height, status, confirmed_empty)
+
+
+def preview_export(store, project_id, options):
+    with store.lock:
+        plan = prepare_export(store, project_id, options, include_documents=True)
+        subsets = [name for name in SPLIT_NAMES if plan.split_counts[name]] if plan.split_counts else ["unassigned"]
+        class_counts = {name: dict.fromkeys(subsets, 0) for name in plan.project.names}
+        source_splits = {}
+        fingerprints = {}
+        objects = confirmed_empty = unreviewed = unreviewed_empty = polygons = missing_sources = 0
+        for row in plan.rows:
+            item_id = row["id"]
+            subset = plan.assignments[item_id]
+            document = row.get("document")
+            if document is None:
+                try:
+                    source = plan.project.item(item_id)["source"]
+                    document, fingerprints[item_id] = read_annotation_snapshot(source)
+                except (OSError, ValueError, TypeError) as exc:
+                    raise Problem(f"{row['photo_id']} 的原标注无法读取，请重新扫描数据", 409) from exc
+            if not isinstance(document, dict):
+                raise Problem(f"{row['photo_id']} 的标注格式无效", 422)
+            width, height = document.get("imageWidth"), document.get("imageHeight")
+            if any(type(value) not in (int, float) or not 0 < value or
+                   (type(value) is float and not value.is_integer()) for value in (width, height)):
+                raise Problem(f"{row['photo_id']} 的标注缺少有效的原图尺寸", 422)
+            try:
+                validate_export_document(store, plan.project, document, width, height, row["status"])
+            except Problem as exc:
+                raise Problem(f"{row['photo_id']}：{exc.message}", exc.status) from exc
+            shapes = document["shapes"]
+            objects += len(shapes)
+            if row["status"] == "reviewed":
+                confirmed_empty += not shapes
+            else:
+                unreviewed += 1
+                unreviewed_empty += not shapes
+            polygons += any(shape["shape_type"] == "polygon" for shape in shapes)
+            for shape in shapes:
+                class_counts[shape["label"]][subset] += 1
+            group = source_group(row["source_group"])
+            if group is None:
+                missing_sources += 1
+            else:
+                source_splits.setdefault(group, set()).add(subset)
+
+        return {
+            "images": len(plan.rows), "excluded": plan.excluded, "annotations": objects,
+            "confirmed_empty": confirmed_empty, "unreviewed": unreviewed, "unreviewed_empty": unreviewed_empty,
+            "split_counts": plan.split_counts, "class_counts": [
+                {"name": name, "total": sum(counts.values()), "splits": counts} for name, counts in class_counts.items()
+            ],
+            "missing_sources": missing_sources, "cross_split_sources": sum(len(splits) > 1 for splits in source_splits.values()),
+            "group_count": len({split_group(row, plan.split_config["unit"]) for row in plan.rows})
+            if plan.split_config and plan.split_config["unit"] != "image" else None,
+            "blocking_issue": f"{polygons} 张图片包含多边形。{YOLO_POLYGON_ERROR}"
+            if plan.format_name == "yolo" and polygons else None,
+            "preview_token": export_fingerprint(plan, fingerprints),
+        }
+
+
+def export_project(store, project_id, options):
+    with store.lock:
+        plan = prepare_export(store, project_id, options)
+        fingerprints = {}
+        expected = options.get("preview_token")
+        if expected is not None:
+            for row in plan.rows:
+                if "version" not in row:
+                    try:
+                        fingerprints[row["id"]] = digest(plan.project.item(row["id"])["source"])
+                    except OSError as exc:
+                        raise Problem(f"{row['photo_id']} 的原标注无法读取，请重新扫描数据", 409) from exc
+            if expected != export_fingerprint(plan, fingerprints):
+                raise Problem("数据已变化，请查看更新后的预检结果再导出", 409)
+        return write_archive(store, plan, fingerprints)
+
+
+def write_archive(store, plan, fingerprints):
+    project, format_name, rows = plan.project, plan.format_name, plan.rows
+    split_config, split_counts = plan.split_config, plan.split_counts
+    unit = split_config["unit"] if split_config else None
+    project_id = project.id
     folder = store.home / "exports"
     folder.mkdir(parents=True, exist_ok=True)
     export_id = uuid.uuid4().hex
     path = folder / f"{project_id}_{format_name}_{export_id}.zip"
+    temporary = path.with_suffix(".zip.part")
     manifest = {"project": project_id, "format": format_name, "created_at": now(),
-                "reviewed_only": reviewed_only, "include_images": options.get("include_images", True),
-                "classes": project.names, "split": "random_by_image" if split_config else "unassigned",
+                "reviewed_only": plan.reviewed_only, "include_images": plan.include_images,
+                "classes": project.names, "split": {"image": "random_by_image", "source_group": "grouped_by_source",
+                                                     "directory": "grouped_by_directory"}.get(unit, "unassigned"),
                 "split_config": split_config, "split_counts": split_counts,
-                "source_writes": 0, "items": [], "warning": "模型预标注不等于真值；" +
-                ("按图片随机划分，同源 / 视频连续帧及重复图片可能跨集，需人工检查泄漏" if split_config else "未划分 train/val/test")}
+                "source_writes": 0, "items": [], "warning": "评估请使用人工审核的样本。" +
+                {"image": "按图片随机划分，同源 / 视频连续帧及重复图片可能跨集",
+                 "source_group": "按任务清单来源组划分，实际比例取决于各组图量",
+                 "directory": "按原图文件夹划分，分散在不同文件夹的同源图片可能跨集"}.get(unit, "未划分 train/val/test")}
     subsets = [name for name in SPLIT_NAMES if split_counts[name]] if split_config else ["unassigned"]
     coco_documents = {name: {"images": [], "annotations": [], "categories": [
         {"id": index + 1, "name": label} for index, label in enumerate(project.names)]} for name in subsets}
     try:
-        with store.lock, zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=2) as archive:
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=2) as archive:
             for image_index, row in enumerate(rows, 1):
-                current = store.detail(project_id, row["id"])
-                if reviewed_only and current["status"] != "reviewed":
-                    raise Problem("导出期间审核状态发生变化，请重试", 409)
+                item_id = row["id"]
+                current = store.detail(project_id, item_id)
+                if current["version"] != row.get("version", 0) or current["status"] != row["status"]:
+                    raise Problem("导出期间标注发生变化，请重试", 409)
+                if item_id in fingerprints and current["source_fingerprint"] != fingerprints[item_id]:
+                    raise Problem("导出期间原标注发生变化，请重试", 409)
                 document = copy.deepcopy(current["document"])
-                store.validate(project, document, current["width"], current["height"], current["status"],
-                               document.get("labelpilot", {}).get("negative_sample_confirmed", False))
+                validate_export_document(store, project, document, current["width"], current["height"], current["status"])
                 item = project.item(row["id"])
                 safe_photo_id = re.sub(r"[^\w.-]", "_", row["photo_id"])
                 filename = f"{safe_photo_id}_{row['id'][:8]}{Path(item['path']).suffix.lower()}"
-                subset = assignments[row["id"]]
+                subset = plan.assignments[item_id]
                 suffix = f"/{subset}" if split_config else ""
                 image_name = f"images{suffix}/{filename}"
                 base_name = Path(filename).stem
-                manifest["items"].append({"photo_id": row["photo_id"], "id": row["id"], "status": current["status"],
+                manifest["items"].append({"photo_id": row["photo_id"], "id": item_id, "status": current["status"],
                                            "revision": current["version"], "sha256": current["image_sha256"],
                                            "source_group": item["source_group"], "image": image_name, "split": subset})
-                if options.get("include_images", True):
+                group = split_group(row, unit)
+                if group is not None:
+                    manifest["items"][-1]["split_group"] = group
+                if plan.include_images:
                     archive.write(item["path"], image_name)
                 if format_name == "labelme":
                     document["imagePath"] = ("../../" if split_config else "../") + image_name
                     document["imageData"] = None
+                    for shape in document["shapes"]:
+                        if shape["shape_type"] == "rectangle":
+                            xs, ys = zip(*shape["points"])
+                            shape["points"] = [[min(xs), min(ys)], [max(xs), max(ys)]]
                     archive.writestr(f"annotations{suffix}/{base_name}.json", json.dumps(document, ensure_ascii=False, indent=2))
                 elif format_name == "yolo":
                     lines = []
                     for shape in document["shapes"]:
                         if shape["shape_type"] != "rectangle":
-                            raise Problem("YOLO 检测导出不支持多边形；请改选 COCO / Labelme，避免静默转换", 422)
+                            raise Problem(YOLO_POLYGON_ERROR, 422)
                         xs, ys = zip(*shape["points"])
                         left, right, top, bottom = min(xs), max(xs), min(ys), max(ys)
                         values = [(left + right) / 2 / current["width"], (top + bottom) / 2 / current["height"],
@@ -146,8 +331,9 @@ def export_project(store, project_id, options):
                 for name, document in coco_documents.items():
                     filename = f"annotations/{name}.json" if split_config else "annotations.json"
                     archive.writestr(filename, json.dumps(document, ensure_ascii=False))
+        temporary.replace(path)
         return {"id": path.stem, "filename": path.name, "images": len(rows), "split_counts": split_counts,
                 "url": f"/api/exports/{path.stem}"}
     except Exception:
-        path.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
         raise
