@@ -13,6 +13,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .exporting import export_project
 from .inference import Inference, Jobs
+from . import model_files
 from .store import Problem, Store
 
 
@@ -84,7 +85,30 @@ def create_app(home=None):
     def model(project_id: str, payload: dict):
         if not isinstance(payload.get("path"), str) or not payload["path"].strip():
             raise Problem("请填写权重路径", 422)
-        return store.update_model(project_id, payload["path"])
+        with jobs.lock:
+            active = any(job["project"] == project_id and job["status"] in ("queued", "running") for job in jobs.records.values())
+            if active or not inference.lock.acquire(blocking=False):
+                raise Problem("模型任务运行期间不能切换权重，请等待或取消任务", 409)
+            try:
+                return store.update_model(project_id, payload["path"])
+            finally:
+                inference.lock.release()
+
+    @app.post("/api/projects/{project_id}/model/browse")
+    def browse_model(project_id: str, payload: dict):
+        project = store.project(project_id)
+        path = payload.get("path")
+        if path is None:
+            configured = Path(project.config.get("model_path") or home)
+            path = str(configured.parent if configured.suffix.lower() == ".pt" else configured)
+            if not Path(path).is_dir():
+                path = str(Path.home())
+        return model_files.browse(path)
+
+    @app.post("/api/projects/{project_id}/model/search")
+    def search_models(project_id: str, payload: dict):
+        store.project(project_id)
+        return model_files.search(payload.get("path"))
 
     @app.post("/api/projects/{project_id}/labels")
     def add_label(project_id: str, payload: dict):

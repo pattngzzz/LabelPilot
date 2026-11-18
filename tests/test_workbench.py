@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from labelpilot.exporting import export_project
+from labelpilot import model_files
 from labelpilot.inference import Inference, Jobs, model_class_names
 from labelpilot.server import create_app
 from labelpilot.store import Problem, Store, digest
@@ -315,3 +316,113 @@ def test_batch_processes_only_unstarted_images(store):
     assert store.listing("test")["counts"]["imported"] == 1
     assert store.listing("test")["counts"]["reviewed"] == 0
     assert job["total"] == 2
+
+
+def test_model_browser_filters_and_searches_without_loading(dataset):
+    folder = dataset[0] / "模型目录"
+    nested = folder / "run" / "weights"
+    nested.mkdir(parents=True)
+    (folder / "best.PT").write_bytes(b"not executable weights")
+    (folder / "ignore.txt").write_text("private unrelated content")
+    (nested / "final.pt").write_bytes(b"nested model")
+    listing = model_files.browse(str(folder))
+    assert [row["name"] for row in listing["files"]] == ["best.PT"]
+    assert [row["name"] for row in listing["directories"]] == ["run"]
+    assert listing["parent"] == str(folder.parent)
+    assert listing["roots"] and not listing["partial"]
+    found = model_files.search(str(folder))
+    assert {row["path"] for row in found["files"]} == {str(folder / "best.PT"), str(nested / "final.pt")}
+    assert found["search"] and not found["partial"]
+    assert "content" not in json.dumps(found)
+
+
+@pytest.mark.parametrize("value", [None, "", "relative/path", 12, "bad\x00path"])
+def test_model_browser_rejects_invalid_paths(value):
+    with pytest.raises(Problem):
+        model_files.browse(value)
+
+
+def test_model_browser_rejects_missing_or_file_paths(dataset):
+    for path in (dataset[0] / "missing", dataset[0] / "projects.json"):
+        with pytest.raises(Problem):
+            model_files.search(str(path))
+
+
+def test_model_browser_scan_limits_are_visible(dataset, monkeypatch):
+    folder = dataset[0] / "models"
+    folder.mkdir()
+    for name in ("a.pt", "b.pt", "c.pt"):
+        (folder / name).write_bytes(b"fixture")
+    monkeypatch.setattr(model_files, "MAX_MODELS", 1)
+    found = model_files.search(str(folder))
+    assert len(found["files"]) == 1 and found["partial"]
+    monkeypatch.setattr(model_files, "MAX_ENTRIES", 1)
+    listing = model_files.browse(str(folder))
+    assert len(listing["files"]) == 1 and listing["partial"]
+
+
+def test_model_browser_skips_links(dataset):
+    folder = dataset[0] / "models"
+    folder.mkdir()
+    outside = dataset[0] / "outside"
+    outside.mkdir()
+    (outside / "external.pt").write_bytes(b"fixture")
+    try:
+        (folder / "shortcut").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("Creating symlinks requires permission on this Windows installation")
+    assert model_files.search(str(folder))["files"] == []
+    assert model_files.browse(str(folder))["directories"] == []
+
+
+def test_model_picker_http_security_and_save(dataset, monkeypatch):
+    app = create_app(dataset[0])
+    weights = dataset[0] / "models" / "weights"
+    weights.mkdir(parents=True)
+    first = weights / "best.pt"
+    second = weights / "final.pt"
+    first.write_bytes(b"fixture one; must not be loaded during browsing")
+    second.write_bytes(b"fixture two; must not be loaded during browsing")
+    store = app.state.store
+    before = store.detail("test", item(store, "human")["id"])
+    source_hash = digest(dataset[2] / "human.json")
+    original_config = store.registry_path.read_bytes()
+    with TestClient(app) as client:
+        headers = {"X-LabelPilot-Token": app.state.token}
+        for endpoint in ("browse", "search"):
+            address = f"/api/projects/test/model/{endpoint}"
+            assert client.post(address, json={"path": str(weights)}).status_code == 403
+            assert client.post(address, json={"path": str(weights)}, headers={**headers, "Origin": "https://evil.example"}).status_code == 403
+            assert client.post(address, json={"path": str(weights)}, headers=headers).status_code == 200
+        assert store.registry_path.read_bytes() == original_config
+        assert client.post("/api/projects/unknown/model/browse", json={}, headers=headers).status_code == 404
+        for path in (first, second):
+            response = client.post("/api/projects/test/model", json={"path": str(path)}, headers=headers)
+            assert response.status_code == 200 and response.json()["model_path"] == str(path)
+        default = client.post("/api/projects/test/model/browse", json={}, headers=headers).json()
+        assert default["path"] == str(weights)
+        assert client.post("/api/projects/test/model", json={"path": str(weights)}, headers=headers).status_code == 400
+        assert Store(store.home).project("test").config["model_path"] == str(second)
+        with app.state.inference.lock:
+            assert client.post("/api/projects/test/model", json={"path": str(first)}, headers=headers).status_code == 409
+        app.state.jobs.records["fixture"] = {"project": "test", "status": "queued"}
+        assert client.post("/api/projects/test/model", json={"path": str(first)}, headers=headers).status_code == 409
+    assert store.detail("test", item(store, "human")["id"]) == before
+    assert digest(dataset[2] / "human.json") == source_hash
+
+
+def test_model_picker_link_detection():
+    class Entry:
+        def __init__(self, symlink, attributes):
+            self.symlink = symlink
+            self.attributes = attributes
+
+        def is_symlink(self):
+            return self.symlink
+
+        def stat(self, follow_symlinks):
+            return type("Info", (), {"st_file_attributes": self.attributes})()
+
+    assert model_files.linked(Entry(True, 0))
+    assert model_files.linked(Entry(False, 0x400))
+    assert not model_files.linked(Entry(False, 0))

@@ -18,7 +18,7 @@ async function eventually(callback) {
   throw new Error("Browser test timed out waiting for application state");
 }
 
-test("click rectangles, label picker and E review shortcut", {timeout:90000}, async context => {
+test("annotation workflow and local model file/folder selection", {timeout:90000}, async context => {
   const root = path.resolve(__dirname, "..");
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "labelpilot-browser-test-"));
   const images = path.join(home, "images");
@@ -27,9 +27,17 @@ test("click rectangles, label picker and E review shortcut", {timeout:90000}, as
   const chrome = process.env.LABELPILOT_CHROME || "C:/Program Files/Google/Chrome/Application/chrome.exe";
   fs.mkdirSync(images);
   fs.mkdirSync(profile);
+  const modelFolder = path.join(home, "模型目录");
+  const weightFolder = path.join(modelFolder, "run", "weights");
+  fs.mkdirSync(weightFolder, {recursive:true});
+  const firstModel = path.join(modelFolder, "best.pt");
+  const secondModel = path.join(weightFolder, "final.pt");
+  fs.writeFileSync(firstModel, "test fixture; browsing must not deserialize weights");
+  fs.writeFileSync(secondModel, "nested test fixture; do not execute");
+  fs.writeFileSync(path.join(modelFolder, "ignore.json"), "not a model");
   const fixture = spawnSync(python, ["-c", "from PIL import Image; import sys; from pathlib import Path; [Image.new('RGB',(640,480),'#555577').save(Path(sys.argv[1])/f'image_{index}.png') for index in range(4)]", images], {windowsHide:true, encoding:"utf8"});
   assert.equal(fixture.status, 0, fixture.stderr || fixture.error?.message);
-  fs.writeFileSync(path.join(home, "projects.json"), JSON.stringify([{id:"test", name:"Browser test", image_root:images, classes:["class_a", "class_b"]}]));
+  fs.writeFileSync(path.join(home, "projects.json"), JSON.stringify([{id:"test", name:"Browser test", image_root:images, classes:["class_a", "class_b"], model_path:firstModel}]));
   const listener = net.createServer();
   await new Promise(resolve => listener.listen(0, "127.0.0.1", resolve));
   const port = listener.address().port;
@@ -176,6 +184,56 @@ test("click rectangles, label picker and E review shortcut", {timeout:90000}, as
     await box();
     await check('document.body.classList.contains("focus-mode") && element("labelPicker").open', "Label picker also works in the large-canvas workspace");
     await click("#cancelPickedLabel");
+    await click("#focusButton");
+    await cdp("Emulation.setDeviceMetricsOverride", {width:1600, height:1000, deviceScaleFactor:1, mobile:false});
+    await sleep(100);
+    const annotationBefore = await evaluate('JSON.stringify(state.current)');
+    await click("#modelSettingsSmall");
+    await click("#browseModelFile");
+    await waitFor('modelBrowser.listing && !modelBrowser.loading');
+    await check('document.querySelectorAll("[data-model-file]").length===1 && document.querySelectorAll("[data-model-directory]").length===1', "File browser lists folders and .pt files only");
+    await click("#cancelModelBrowser");
+    await check(`element("modelPath").value===${JSON.stringify(firstModel)} && state.project.model_path===${JSON.stringify(firstModel)}`, "Cancel leaves the saved model unchanged");
+    await click("#browseModelFolder");
+    await waitFor('modelBrowser.listing && !modelBrowser.loading');
+    await click("#searchModelFolder");
+    await waitFor('modelBrowser.listing.search && !modelBrowser.loading');
+    await check('document.querySelectorAll("[data-model-file]").length===2', "Folder selection finds nested model candidates");
+    const modelBrowserScreenshot = await cdp("Page.captureScreenshot", {format:"png"});
+    fs.writeFileSync(path.join(home,"model-browser.png"), Buffer.from(modelBrowserScreenshot.data,"base64"));
+    const secondSelector = '[data-model-file='+JSON.stringify(secondModel)+']';
+    await click(secondSelector);
+    await check(`!element("modelBrowserDialog").open && element("modelPath").value===${JSON.stringify(secondModel)} && state.project.model_path===${JSON.stringify(firstModel)}`, "Selecting a candidate fills its absolute path without saving or loading it");
+    await click("#saveModel");
+    await waitFor(`state.project.model_path===${JSON.stringify(secondModel)}`);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(home,"projects.json"),"utf8"))[0].model_path, secondModel);
+    context.diagnostic("Chosen model path persists in the isolated project configuration");
+    await click("#browseModelFile");
+    await waitFor('modelBrowser.listing && !modelBrowser.loading');
+    await check(`modelBrowser.listing.path===${JSON.stringify(weightFolder)}`, "Reopening starts in the saved model's folder");
+    await click("#modelBrowserUp");
+    await waitFor(`modelBrowser.listing.path===${JSON.stringify(path.dirname(weightFolder))} && !modelBrowser.loading`);
+    await click("#modelBrowserUp");
+    await waitFor(`modelBrowser.listing.path===${JSON.stringify(modelFolder)} && !modelBrowser.loading`);
+    await evaluate('element("modelBrowserPath").value='+JSON.stringify(path.join(home,"missing")));
+    await click("#modelBrowserGo");
+    await waitFor('!modelBrowser.loading && !!element("modelBrowserError").textContent');
+    await check(`state.project.model_path===${JSON.stringify(secondModel)}`, "Invalid folders show an error and do not change the selected model");
+    await evaluate('element("modelBrowserPath").value='+JSON.stringify(modelFolder));
+    await click("#modelBrowserGo");
+    await waitFor('!modelBrowser.loading && !element("modelBrowserError").textContent');
+    await click('[data-model-file='+JSON.stringify(firstModel)+']');
+    await click("#saveModel");
+    await waitFor(`state.project.model_path===${JSON.stringify(firstModel)}`);
+    await check(`JSON.stringify(state.current)===${JSON.stringify(annotationBefore)}`, "Switching models never replaces or edits the current annotations");
+    await click("#browseModelFolder");
+    await waitFor('modelBrowser.listing && !modelBrowser.loading');
+    for (const width of [1024,760]) {
+      await cdp("Emulation.setDeviceMetricsOverride", {width, height:1000, deviceScaleFactor:1, mobile:false});
+      await sleep(100);
+      await check('(()=>{const rect=element("modelBrowserDialog").getBoundingClientRect();return rect.left>=0 && rect.right<=innerWidth && rect.top>=0 && rect.bottom<=innerHeight;})()', `Model browser fits the viewport at width ${width}`);
+    }
+    await click("#cancelModelBrowser");
     assert.deepEqual(errors, [], "No browser runtime errors");
   } finally {
     if (socket?.readyState === WebSocket.OPEN && cdp) await cdp("Browser.close").catch(() => {});

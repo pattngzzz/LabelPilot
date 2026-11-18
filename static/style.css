@@ -13,6 +13,31 @@
 .focus-toggle { padding: 6px 9px; margin-left: 4px; font-size: 10px; }
 .focus-toggle[aria-pressed="true"] { background: #9770ff24; color: #cbb8ff; border-color: #9770ff66; }
 .class-row > span:nth-child(2) { overflow-wrap: anywhere; }
+.model-path-row, .model-browser-address, .model-browser-toolbar { display: flex; gap: 8px; align-items: center; }
+.model-path-row input, .model-browser-address input { flex: 1; width: 0; min-width: 0; }
+.model-path-row .button { padding: 10px; white-space: nowrap; font-size: 11px; }
+.model-selection-status { color: var(--muted); font-size: 11px; margin: 8px 0 12px; overflow-wrap: anywhere; }
+dialog.model-browser { width: min(760px, calc(100vw - 24px)); }
+.model-browser .dialog-body { padding: 18px; }
+.model-browser-address select { width: 112px; }
+.model-browser-toolbar { margin-top: 12px; }
+.model-browser-toolbar span { flex: 1; font-size: 11px; color: var(--muted); }
+#modelBrowserError { font-size: 11px; line-height: 1.6; }
+#modelBrowserError:empty { display: none; }
+.model-browser-list { height: min(390px, 42dvh); overflow: auto; margin-top: 12px; border: 1px solid var(--border); border-radius: 7px; }
+.model-file-row { display: flex; width: 100%; gap: 10px; align-items: center; padding: 12px; background: transparent; border-bottom: 1px solid var(--border); text-align: left; }
+.model-file-row:hover, .model-file-row:focus-visible { background: #9770ff20; }
+.model-file-row b { color: var(--purple); font-size: 11px; min-width: 23px; }
+.model-file-row.folder b { color: #facc7a; }
+.model-file-row span { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 12px; }
+.model-file-row small { color: var(--muted); font-size: 10px; white-space: nowrap; }
+@media (max-width: 600px) {
+  .model-path-row { flex-wrap: wrap; }
+  .model-path-row input { flex-basis: 100%; }
+  .model-browser-address { flex-wrap: wrap; }
+  .model-browser-address input { flex-basis: calc(100% - 120px); }
+  .model-file-row small { display: none; }
+}
 dialog.label-picker { position: fixed; inset: auto; margin: 0; width: 300px; max-width: calc(100vw - 24px); max-height: calc(100dvh - 24px); border: 1px solid #9770ff66; border-radius: 10px; padding: 0; overflow: auto; box-shadow: 0 14px 48px #0009; }
 dialog.label-picker::backdrop { background: transparent; backdrop-filter: none; }
 .label-picker .dialog-heading { padding: 10px 12px; }

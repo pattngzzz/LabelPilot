@@ -10,6 +10,7 @@ const state = {projects:[],project:null,items:[],filtered:0,offset:0,pageSize:60
 const canvas = element("canvas");
 const context = canvas.getContext("2d");
 const sessionToken = document.querySelector('meta[name="labelpilot-token"]').content;
+const modelBrowser = {mode:"file",listing:null,loading:false,sequence:0};
 let searchTimer;
 let jobTimer;
 
@@ -605,11 +606,74 @@ async function saveModelConfig() {
   if(path===state.project.model_path)return;
   const project=await api(projectUrl("/model"),"POST",{path});
   Object.assign(state.project,project);
+  element("modelSelectionStatus").textContent="模型配置已保存，下次预标注将使用此权重；首次推理校验类别。";
   toast("模型路径已保存；首次推理会校验类别映射");
+}
+function modelSelectionChanged() {
+  const path=element("modelPath").value.trim();
+  element("modelPath").title=path;
+  element("modelSelectionStatus").textContent=path===state.project?.model_path ? "当前已保存的模型" : path ? "已选择新模型，尚未保存配置" : "请选择可信的本地 .pt 模型";
+}
+function renderModelBrowser() {
+  const listing=modelBrowser.listing;
+  if(!listing)return;
+  element("modelBrowserPath").value=listing.path;
+  element("modelBrowserPath").title=listing.path;
+  element("modelBrowserDrive").innerHTML='<option value="">磁盘位置</option>'+listing.roots.map(path=>`<option value="${escapeHtml(path)}">${escapeHtml(path)}</option>`).join("");
+  element("modelBrowserCount").textContent=`${listing.search ? "含子文件夹 · " : ""}${listing.directories.length} 个文件夹 · ${listing.files.length} 个模型`;
+  const folders=listing.directories.map(item=>`<button type="button" class="model-file-row folder" data-model-directory="${escapeHtml(item.path)}" title="${escapeHtml(item.path)}"><b>▸</b><span>${escapeHtml(item.name)}</span><small>打开文件夹</small></button>`).join("");
+  const files=listing.files.map(item=>`<button type="button" class="model-file-row" data-model-file="${escapeHtml(item.path)}" title="${escapeHtml(item.path)}"><b>.pt</b><span>${escapeHtml(item.name)}</span><small>${(item.size/1024/1024).toFixed(1)} MB · 选择</small></button>`).join("");
+  element("modelBrowserList").innerHTML=folders+files || `<p class="empty-list">${listing.search ? "未找到 .pt 模型，请选择其他文件夹。" : "此处没有子文件夹或 .pt 模型。"}</p>`;
+  element("modelBrowserError").textContent=listing.partial ? "结果可能不完整（访问权限、扫描时间或数量上限）；请选择更具体的文件夹继续查找。" : "";
+}
+function setModelBrowserLoading(value) {
+  modelBrowser.loading=value;
+  for(const id of ["modelBrowserDrive","modelBrowserPath","modelBrowserGo","searchModelFolder"])element(id).disabled=value;
+  element("modelBrowserUp").disabled=value || !modelBrowser.listing?.parent;
+  element("searchModelFolder").disabled=value || !modelBrowser.listing;
+  element("modelBrowserList").querySelectorAll("button").forEach(button=>{button.disabled=value;});
+}
+async function loadModelDirectory(path, search=false) {
+  const sequence=++modelBrowser.sequence;
+  const projectId=state.project.id;
+  setModelBrowserLoading(true);
+  element("modelBrowserError").textContent="";
+  element("modelBrowserCount").textContent=search ? "正在查找 .pt 模型（包含子文件夹）…" : "正在读取本机文件夹…";
+  try {
+    const listing=await api(projectUrl(search ? "/model/search" : "/model/browse"),"POST",{path});
+    if(sequence!==modelBrowser.sequence || !element("modelBrowserDialog").open || state.project.id!==projectId)return;
+    modelBrowser.listing=listing;
+    renderModelBrowser();
+  } catch(error) {
+    if(sequence!==modelBrowser.sequence)return;
+    element("modelBrowserError").textContent=error.message;
+    element("modelBrowserCount").textContent="未能读取，请修改路径或返回上一级。";
+  } finally {if(sequence===modelBrowser.sequence)setModelBrowserLoading(false);}
+}
+async function openModelBrowser(mode) {
+  if(!state.project || state.busy)return;
+  modelBrowser.mode=mode;
+  modelBrowser.listing=null;
+  element("modelBrowserList").innerHTML="";
+  element("modelBrowserDrive").innerHTML='<option value="">磁盘位置</option>';
+  element("modelBrowserPath").value="";
+  element("modelBrowserTitle").textContent=mode==="folder" ? "选择模型文件夹" : "选择本机模型文件";
+  element("modelBrowserHelp").textContent=mode==="folder" ? "打开目标文件夹，点击下方“选择此文件夹并查找模型”，再从结果中明确选择一个 .pt 文件。" : "点击文件夹进入，点击 .pt 文件选择；仅读取路径，不上传或加载文件。";
+  element("searchModelFolder").hidden=mode!=="folder";
+  element("modelBrowserDialog").showModal();
+  await loadModelDirectory(null);
+}
+function chooseModelFile(path) {
+  if(modelBrowser.loading)return;
+  element("modelPath").value=path;
+  modelSelectionChanged();
+  element("modelBrowserDialog").close();
+  element("modelPath").focus({preventScroll:true});
 }
 function openModelDialog() {
   if(!state.project)return;
   element("modelPath").value=state.project.model_path;
+  modelSelectionChanged();
   element("batchScope").textContent=`范围：${filters().batch || "全部批次"}${filters().query ? " · 搜索 "+filters().query : ""}中的未开始图片（忽略状态筛选）；已有标注不会覆盖`;
   element("modelDialog").showModal();
   pollJobs().catch(error=>toast(error.message,true));
@@ -763,6 +827,22 @@ listen("classesTab","click",()=>{element("objectsContent").hidden=true;element("
 for(const id of ["modelSettings","modelSettingsSmall"])listen(id,"click",openModelDialog);
 listen("predictButton","click",predictCurrent);listen("singlePredict","click",predictCurrent);
 listen("saveModel","click",saveModelConfig);listen("batchPredict","click",startBatch);
+listen("browseModelFile","click",()=>openModelBrowser("file"));
+listen("browseModelFolder","click",()=>openModelBrowser("folder"));
+listen("modelPath","input",modelSelectionChanged);
+element("modelBrowserPathForm").addEventListener("submit",event=>{event.preventDefault();if(!modelBrowser.loading)loadModelDirectory(element("modelBrowserPath").value.trim());});
+listen("modelBrowserDrive","change",event=>{if(event.target.value)return loadModelDirectory(event.target.value);});
+listen("modelBrowserUp","click",()=>loadModelDirectory(modelBrowser.listing.parent));
+listen("searchModelFolder","click",()=>loadModelDirectory(modelBrowser.listing.path,true));
+listen("modelBrowserList","click",event=>{
+  if(modelBrowser.loading)return;
+  const folder=event.target.closest("[data-model-directory]");
+  if(folder)return loadModelDirectory(folder.dataset.modelDirectory);
+  const file=event.target.closest("[data-model-file]");
+  if(file)chooseModelFile(file.dataset.modelFile);
+});
+listen("cancelModelBrowser","click",()=>element("modelBrowserDialog").close());
+element("modelBrowserDialog").addEventListener("close",()=>{if(element("modelBrowserDialog").open)return;modelBrowser.sequence++;modelBrowser.loading=false;});
 listen("confidence","input",event=>{element("confidenceValue").value=Number(event.target.value).toFixed(2);});
 listen("iou","input",event=>{element("iouValue").value=Number(event.target.value).toFixed(2);});
 listen("discardPrediction","click",()=>{state.prediction=null;element("predictionDialog").close();});
