@@ -18,7 +18,7 @@ async function eventually(callback) {
   throw new Error("Browser test timed out waiting for application state");
 }
 
-test("crosshair guides, annotation, model selection and dataset split export", {timeout:120000}, async context => {
+test("crosshair guides, Q/Enter shortcuts, annotation, model selection and dataset split export", {timeout:120000}, async context => {
   const root = path.resolve(__dirname, "..");
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "labelpilot-browser-test-"));
   const images = path.join(home, "images");
@@ -106,9 +106,9 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
       try {return await eventually(() => evaluate(expression));}
       catch (error) {throw new Error(`${error.message}: ${expression}\n${JSON.stringify(await evaluate('({picker:element("labelPicker").open,error:element("pickerLabelError").textContent,input:element("pickerLabelInput").value,busy:state.busy,saving:state.labelPickerSaving})'))}`);}
     };
-    const press = async (key, code) => {
+    const press = async (key, code, options={}) => {
       const windowsVirtualKeyCode = {Escape:27, Enter:13, Tab:9}[key] || key.toUpperCase().charCodeAt(0);
-      await cdp("Input.dispatchKeyEvent", {type:"keyDown", key, code, windowsVirtualKeyCode, ...(key === "Enter" ? {text:"\r"} : {})});
+      await cdp("Input.dispatchKeyEvent", {type:"keyDown", key, code, windowsVirtualKeyCode, ...(key === "Enter" ? {text:"\r"} : {}), ...options});
       await cdp("Input.dispatchKeyEvent", {type:"keyUp", key, code, windowsVirtualKeyCode});
     };
     const mouseClick = async position => {
@@ -215,24 +215,68 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await click("#undoButton");
     await check('state.current.document.shapes.length===0', "New rectangle is one undo operation");
     await click("#redoButton");
+    await box();
+    await check('document.activeElement.id==="confirmPickedLabel"', "Rectangle picker initially focuses confirmation so Q is immediately available");
+    await press("q", "KeyQ", {modifiers:2});
+    await press("q", "KeyQ", {autoRepeat:true});
+    await evaluate('document.activeElement.dispatchEvent(new KeyboardEvent("keydown",{key:"q",code:"KeyQ",bubbles:true,isComposing:true}));');
+    await check('element("labelPicker").open && state.current.document.shapes.length===1', "Modified, held and composing Q do not confirm the picker");
+    await press("q", "KeyQ");
+    await waitFor('!element("labelPicker").open');
+    await check('state.current.document.shapes.length===2 && state.current.document.shapes.at(-1).label==="class_a" && state.current.version===0', "Q confirms the current label without saving, reviewing or advancing");
+    await click("#undoButton");
+    await box();
+    await evaluate('document.querySelector("[data-label=class_b]").focus();');
+    await press("Q", "KeyQ", {modifiers:8});
+    await waitFor('!element("labelPicker").open');
+    await check('state.current.document.shapes.length===2 && state.current.document.shapes.at(-1).label==="class_b"', "Uppercase Q activates the focused label button just like Enter");
+    await click("#undoButton");
+    await box();
+    await evaluate('element("cancelPickedLabel").focus();');
+    await press("q", "KeyQ");
+    await check('!element("labelPicker").open && !state.pendingShape && state.current.document.shapes.length===1', "Q respects a focused cancel button instead of confirming another label");
+    for (const key of ["q", "Enter"]) {
+      await press("p", "KeyP");
+      for (const coordinates of [[100,100],[350,100],[350,300]]) await mouseClick(await point(coordinates));
+      await press("q", "KeyQ", {modifiers:2});
+      await press("q", "KeyQ", {autoRepeat:true});
+      await evaluate('canvas.dispatchEvent(new KeyboardEvent("keydown",{key:"q",code:"KeyQ",bubbles:true,isComposing:true}));');
+      await check('state.polygon.length===3 && state.current.document.shapes.length===1', "Modified, held and composing Q leave the polygon unfinished");
+      await press(key, key === "q" ? "KeyQ" : "Enter");
+      await check('state.polygon.length===0 && state.current.document.shapes.length===2 && state.current.document.shapes.at(-1).shape_type==="polygon" && state.current.version===0', `${key} finishes the polygon without saving or reviewing`);
+      await click("#undoButton");
+    }
+    await press("p", "KeyP");
+    await mouseClick(await point([100,100]));
+    await mouseClick(await point([350,100]));
+    await press("q", "KeyQ");
+    await check('state.polygon.length===2 && state.current.document.shapes.length===1', "Q cannot finish a polygon with fewer than three vertices");
+    await press("Escape", "Escape");
     await box([350,300], [100,100]);
     await press("Escape", "Escape");
     await check('!state.pendingShape && !element("labelPicker").open && state.current.document.shapes.length===1', "Escape cancels the pending rectangle without changing existing objects");
     await box([350,300], [100,100]);
+    await click("#pickerLabelInput");
+    await press("q", "KeyQ", {text:"q"});
     await cdp("Input.insertText", {text:"rade_custom"});
+    await press("Q", "KeyQ", {text:"Q",modifiers:8});
+    await check('element("labelPicker").open && element("pickerLabelInput").value==="qrade_customQ" && state.current.document.shapes.length===1', "Lowercase and uppercase Q type literal label text without confirming");
     await press("e", "KeyE");
     await check('element("labelPicker").open && state.current.version===0', "E does not review while entering a label");
     await evaluate('window.testApi=api;api=async(path,method,...args)=>{if(method==="POST")throw new Error("simulated label failure");return testApi(path,method,...args);};');
-    await click("#confirmPickedLabel");
+    await evaluate('element("confirmPickedLabel").focus();');
+    await press("q", "KeyQ");
     await check('!!state.pendingShape && element("labelPicker").open && element("pickerLabelError").textContent.includes("simulated label failure") && state.current.document.shapes.length===1', "Failed label creation preserves the pending rectangle for retry");
     await evaluate('api=testApi;');
     await press("Enter", "Enter");
     await waitFor('!element("labelPicker").open');
-    await check('state.project.classes.length===3 && state.project.classes[2].name==="rade_custom" && state.current.document.shapes.at(-1).label==="rade_custom"', "Enter creates an append-only original-name label");
+    await check('state.project.classes.length===3 && state.project.classes[2].name==="qrade_customQ" && state.current.document.shapes.at(-1).label==="qrade_customQ"', "Enter creates an append-only original-name label including literal q and Q");
     await check('JSON.stringify(state.current.document.shapes.at(-1).points.map(position=>position.map(Math.round)))==="[[100,100],[350,100],[350,300],[100,300]]"', "Reverse clicks normalize rectangle corners");
     await box();
-    await cdp("Input.insertText", {text:"rade_custom"});
-    await press("Enter", "Enter");
+    await click("#pickerLabelInput");
+    await cdp("Input.insertText", {text:"qrade_customQ"});
+    await evaluate('element("confirmPickedLabel").focus();');
+    await press("q", "KeyQ");
     await waitFor('!element("labelPicker").open');
     await check('state.project.classes.length===3 && state.current.document.shapes.length===3', "Reusing a name does not duplicate class IDs");
     const first = await evaluate("state.current.item.id");
@@ -256,7 +300,7 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await waitFor(`state.current.item.id===${JSON.stringify(second)} && !state.busy`);
     await press("a", "KeyA");
     await waitFor(`state.current.item.id===${JSON.stringify(first)} && !state.busy`);
-    await check('state.current.document.shapes.length===3 && state.current.document.shapes.at(-1).label==="rade_custom"', "Saved rectangles and custom labels survive returning to the image");
+    await check('state.current.document.shapes.length===3 && state.current.document.shapes.at(-1).label==="qrade_customQ"', "Saved rectangles and custom labels survive returning to the image");
     for (const width of [1600,1024,760]) {
       await cdp("Emulation.setDeviceMetricsOverride", {width, height:1000, deviceScaleFactor:1, mobile:false});
       await sleep(100);

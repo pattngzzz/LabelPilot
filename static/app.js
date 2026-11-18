@@ -342,7 +342,7 @@ function openLabelPicker(points, anchor) {
   renderLabelOptions();
   element("labelPicker").showModal();
   positionLabelPicker();
-  element("pickerLabelInput").focus({preventScroll:true});
+  element("confirmPickedLabel").focus({preventScroll:true});
   draw();
 }
 
@@ -860,6 +860,15 @@ listen("zoomOut","click",()=>zoom(.8));listen("zoomIn","click",()=>zoom(1.25));l
 listen("focusButton","click",()=>toggleFocusMode());
 element("labelForm").addEventListener("submit",event=>{event.preventDefault();addCustomLabel().catch(error=>toast(error.message,true));});
 element("pickerLabelForm").addEventListener("submit",event=>{event.preventDefault();applyPickedLabel().catch(error=>toast(error.message,true));});
+element("labelPicker").addEventListener("keydown",event=>{
+  if(event.key.toLowerCase()!=="q" || event.ctrlKey || event.metaKey || event.altKey || event.isComposing)return;
+  if(["INPUT","TEXTAREA","SELECT"].includes(event.target.tagName) || event.target.isContentEditable)return;
+  event.preventDefault();
+  if(event.repeat || state.busy || state.labelPickerSaving)return;
+  const button=event.target.closest("button");
+  if(button)button.click();
+  else element("pickerLabelForm").requestSubmit(element("confirmPickedLabel"));
+});
 listen("pickerLabelInput","input",renderLabelOptions);
 listen("pickerLabelOptions","click",event=>{const button=event.target.closest("[data-label]");if(button)return applyPickedLabel(button.dataset.label);});
 for(const id of ["cancelPickedLabel","closeLabelPicker"])listen(id,"click",cancelLabelPicker);
@@ -910,25 +919,26 @@ window.addEventListener("blur",()=>{state.space=false;state.canvasPointer=null;u
 document.addEventListener("keyup",event=>{if(event.code==="Space"){state.space=false;updateCrosshair();}});
 document.addEventListener("keydown",event=>{
   const key=event.key.toLowerCase();
+  if(event.isComposing)return;
   if((event.ctrlKey || event.metaKey) && key==="s" && !document.querySelector("dialog[open]")){
     event.preventDefault();
     if(!state.busy){document.activeElement.blur();Promise.resolve().then(()=>saveCurrent("draft"));}
     return;
   }
-  if(["INPUT","TEXTAREA","SELECT"].includes(event.target.tagName) || document.querySelector("dialog[open]"))return;
+  if(["INPUT","TEXTAREA","SELECT"].includes(event.target.tagName) || event.target.isContentEditable || document.querySelector("dialog[open]"))return;
   if(key==="tab" && !event.ctrlKey && !event.metaKey && !event.altKey){event.preventDefault();toggleFocusMode();return;}
   if(event.code==="Space"){event.preventDefault();state.space=true;updateCrosshair();return;}
   if(state.busy)return;
   if((event.ctrlKey || event.metaKey) && key==="z"){event.preventDefault();undo(event.shiftKey);return;}
   if(event.ctrlKey || event.metaKey || event.altKey)return;
-  if(event.repeat && ["a","d","e"].includes(key))return;
+  if(event.repeat && ["a","d","e","q"].includes(key))return;
   if(key==="v")setTool("select");if(key==="r")setTool("rectangle");if(key==="p")setTool("polygon");if(key==="h")setTool("pan");if(key==="f")fitImage();
   if(key==="delete" || key==="backspace"){event.preventDefault();deleteShape();}
   if(key==="escape"){
     if(state.drag?.before)state.current.document=state.drag.before;
     state.drag=null;state.rectangle=null;state.polygon=[];state.selected=-1;renderObjects();draw();
   }
-  if(key==="enter" && state.polygon.length)finishPolygon();
+  if((key==="enter" || key==="q") && state.polygon.length){event.preventDefault();finishPolygon();}
   if(key==="l"){state.showLabels=!state.showLabels;draw();}
   if(key==="a")navigateImage(-1).catch(error=>toast(error.message,true));
   if(key==="d")navigateImage(1).catch(error=>toast(error.message,true));
