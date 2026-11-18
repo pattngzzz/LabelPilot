@@ -6,7 +6,7 @@ const escapeHtml = value => String(value ?? "").replace(/[&<>"']/g, character =>
 const statusNames = {unstarted:"未开始",imported:"人工标注 · 待审核",predicted:"模型待审核",draft:"编辑中",reviewed:"已审核",skipped:"已跳过",error:"读取异常"};
 const state = {projects:[],project:null,items:[],filtered:0,offset:0,pageSize:60,current:null,image:null,selected:-1,
   activeClass:0,tool:"select",dirty:false,busy:false,undo:[],redo:[],scale:1,panX:0,panY:0,drag:null,
-  polygon:[],rectangle:null,pendingShape:null,labelPickerSaving:false,space:false,showLabels:true,prediction:null,loadSequence:0,listSequence:0};
+  polygon:[],rectangle:null,pendingShape:null,labelPickerSaving:false,canvasPointer:null,space:false,showLabels:true,prediction:null,loadSequence:0,listSequence:0};
 const canvas = element("canvas");
 const context = canvas.getContext("2d");
 const sessionToken = document.querySelector('meta[name="labelpilot-token"]').content;
@@ -43,6 +43,7 @@ function setBusy(value, message="") {
   state.busy = value;
   for (const id of ["predictButton","singlePredict","batchPredict","saveModel","saveButton","reviewButton","skipButton","previousImage","nextImage","projectSelect","deleteShape","shapeClass","shapeDescription","shapeDifficult","newLabelInput","addLabelButton"]) element(id).disabled = value;
   element("connectionStatus").textContent = value ? message || "正在处理…" : "本地工作区 · 仅本机可访问";
+  updateCrosshair();
 }
 
 function setDirty(value=true) {
@@ -425,6 +426,21 @@ function resizeCanvas() {
   if (!state.drag) fitImage();
 }
 function screenPoint(point) { return [point[0]*state.scale+state.panX,point[1]*state.scale+state.panY]; }
+function updateCrosshair(event) {
+  if (event) state.canvasPointer = {clientX:event.clientX,clientY:event.clientY};
+  const guide = element("canvasCrosshair");
+  const pointer = state.canvasPointer;
+  const rect = canvas.getBoundingClientRect();
+  const horizontal = pointer ? pointer.clientX-rect.left : -1;
+  const vertical = pointer ? pointer.clientY-rect.top : -1;
+  guide.hidden = !pointer || !state.current || !state.image || state.tool!=="rectangle" || state.busy ||
+    state.space || state.drag?.type==="pan" || !!document.querySelector("dialog[open]") ||
+    horizontal<0 || vertical<0 || horizontal>=rect.width || vertical>=rect.height;
+  if (!guide.hidden) {
+    guide.style.setProperty("--crosshair-x",`${horizontal}px`);
+    guide.style.setProperty("--crosshair-y",`${vertical}px`);
+  }
+}
 function imagePoint(event,clamp=false) {
   const rect = canvas.getBoundingClientRect();
   let horizontal = (event.clientX-rect.left-state.panX)/state.scale;
@@ -450,6 +466,7 @@ function pathPoints(points,close=true) {
   if (close) context.closePath();
 }
 function draw() {
+  updateCrosshair();
   const size = viewport();
   context.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
   context.clearRect(0,0,size.width,size.height);
@@ -530,9 +547,10 @@ canvas.addEventListener("pointerdown",event => {
   if(!state.current || !state.image || state.busy || state.pendingShape)return;
   event.preventDefault();
   canvas.focus({preventScroll:true});
+  updateCrosshair(event);
   const point=imagePoint(event,true);
   const actual=imagePoint(event);
-  if(state.space || state.tool==="pan" || event.button===1 || event.button===2){canvas.setPointerCapture(event.pointerId);state.drag={type:"pan",client:[event.clientX,event.clientY],pan:[state.panX,state.panY]};return;}
+  if(state.space || state.tool==="pan" || event.button===1 || event.button===2){canvas.setPointerCapture(event.pointerId);state.drag={type:"pan",client:[event.clientX,event.clientY],pan:[state.panX,state.panY]};updateCrosshair();return;}
   if(event.button!==0)return;
   if(state.tool==="rectangle" && state.rectangle){
     const start=state.rectangle.start;
@@ -557,6 +575,7 @@ canvas.addEventListener("pointerdown",event => {
   if(state.selected>=0)state.drag={type:"move",start:point,original:copy(state.current.document.shapes[state.selected]),before:snapshot()};
 });
 canvas.addEventListener("pointermove",event => {
+  updateCrosshair(event);
   if(!state.current)return;
   const point=imagePoint(event,true);
   element("coordinateText").textContent=`x ${Math.round(point[0])} · y ${Math.round(point[1])}`;
@@ -592,7 +611,9 @@ function finishDrag() {
   draw();
 }
 canvas.addEventListener("pointerup",finishDrag);
-canvas.addEventListener("pointercancel",()=>{if(state.drag?.before)state.current.document=state.drag.before;state.drag=null;state.rectangle=null;draw();});
+canvas.addEventListener("pointerenter",updateCrosshair);
+canvas.addEventListener("pointerleave",()=>{state.canvasPointer=null;updateCrosshair();});
+canvas.addEventListener("pointercancel",()=>{if(state.drag?.before)state.current.document=state.drag.before;state.drag=null;state.rectangle=null;state.canvasPointer=null;draw();});
 canvas.addEventListener("dblclick",()=>{if(state.tool==="polygon" && !state.busy)finishPolygon();});
 canvas.addEventListener("contextmenu",event=>event.preventDefault());
 canvas.addEventListener("wheel",event=>{event.preventDefault();if(state.busy)return;const rect=canvas.getBoundingClientRect();zoom(Math.exp(-event.deltaY*.001),[event.clientX-rect.left,event.clientY-rect.top]);},{passive:false});
@@ -885,8 +906,8 @@ listen("historyButton","click",showHistory);listen("historyList","click",event=>
 for(const id of ["helpButton","keyboardHelp"])listen(id,"click",()=>element("helpDialog").showModal());
 listen("workspaceButton","click",()=>{document.querySelectorAll("dialog[open]").forEach(dialog=>dialog.close());});
 window.addEventListener("beforeunload",event=>{if(state.dirty){event.preventDefault();event.returnValue="";}});
-window.addEventListener("blur",()=>{state.space=false;});
-document.addEventListener("keyup",event=>{if(event.code==="Space")state.space=false;});
+window.addEventListener("blur",()=>{state.space=false;state.canvasPointer=null;updateCrosshair();});
+document.addEventListener("keyup",event=>{if(event.code==="Space"){state.space=false;updateCrosshair();}});
 document.addEventListener("keydown",event=>{
   const key=event.key.toLowerCase();
   if((event.ctrlKey || event.metaKey) && key==="s" && !document.querySelector("dialog[open]")){
@@ -896,7 +917,7 @@ document.addEventListener("keydown",event=>{
   }
   if(["INPUT","TEXTAREA","SELECT"].includes(event.target.tagName) || document.querySelector("dialog[open]"))return;
   if(key==="tab" && !event.ctrlKey && !event.metaKey && !event.altKey){event.preventDefault();toggleFocusMode();return;}
-  if(event.code==="Space"){event.preventDefault();state.space=true;return;}
+  if(event.code==="Space"){event.preventDefault();state.space=true;updateCrosshair();return;}
   if(state.busy)return;
   if((event.ctrlKey || event.metaKey) && key==="z"){event.preventDefault();undo(event.shiftKey);return;}
   if(event.ctrlKey || event.metaKey || event.altKey)return;

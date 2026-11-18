@@ -18,7 +18,7 @@ async function eventually(callback) {
   throw new Error("Browser test timed out waiting for application state");
 }
 
-test("annotation, model selection and dataset split export", {timeout:120000}, async context => {
+test("crosshair guides, annotation, model selection and dataset split export", {timeout:120000}, async context => {
   const root = path.resolve(__dirname, "..");
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "labelpilot-browser-test-"));
   const images = path.join(home, "images");
@@ -99,6 +99,18 @@ test("annotation, model selection and dataset split export", {timeout:120000}, a
     };
     const click = async selector => mouseClick(await evaluate(`(()=>{const rect=document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();return {x:rect.x+rect.width/2,y:rect.y+rect.height/2};})()`));
     const point = coordinates => evaluate(`(()=>{const position=screenPoint(${JSON.stringify(coordinates)});const rect=canvas.getBoundingClientRect();return {x:rect.left+position[0],y:rect.top+position[1]};})()`);
+    const checkCrosshair = async (position, message) => check(`(()=>{
+      const guide=element("canvasCrosshair"),rect=guide.getBoundingClientRect(),bounds=canvas.getBoundingClientRect();
+      const horizontal=getComputedStyle(guide,"::before"),vertical=getComputedStyle(guide,"::after");
+      return !guide.hidden && Math.abs(rect.left-bounds.left)<1 && Math.abs(rect.top-bounds.top)<1 &&
+        Math.abs(rect.right-bounds.right)<1 && Math.abs(rect.bottom-bounds.bottom)<1 &&
+        horizontal.borderTopStyle==="dashed" && vertical.borderLeftStyle==="dashed" &&
+        Math.abs(parseFloat(horizontal.left))<1 && Math.abs(parseFloat(horizontal.width)-bounds.width)<1 &&
+        Math.abs(parseFloat(vertical.top))<1 && Math.abs(parseFloat(vertical.height)-bounds.height)<1 &&
+        Math.abs(rect.top+parseFloat(horizontal.top)-${position.y})<1 &&
+        Math.abs(rect.left+parseFloat(vertical.left)-${position.x})<1 &&
+        getComputedStyle(guide).pointerEvents==="none" && document.elementFromPoint(${position.x},${position.y})===canvas;
+    })()`, message);
     const box = async (start=[100,100], end=[350,300]) => {
       await press("r", "KeyR");
       await mouseClick(await point(start));
@@ -111,8 +123,58 @@ test("annotation, model selection and dataset split export", {timeout:120000}, a
     await cdp("Runtime.enable");
     await cdp("Emulation.setDeviceMetricsOverride", {width:1600, height:1000, deviceScaleFactor:1, mobile:false});
     await waitFor('typeof state!=="undefined" && state.current && !state.busy');
+    let cursor=await point([320,240]);
+    await cdp("Input.dispatchMouseEvent", {type:"mouseMoved", buttons:0, ...cursor});
+    await check('element("canvasCrosshair").hidden', "Selection mode does not show rectangle crosshair guides");
     await press("r", "KeyR");
+    await checkCrosshair(cursor, "R immediately draws four dashed arms to the canvas edges without moving the mouse");
+    for (const pixelRatio of [1,2]) {
+      await cdp("Emulation.setDeviceMetricsOverride", {width:1600, height:1000, deviceScaleFactor:pixelRatio, mobile:false});
+      await sleep(100);
+      cursor=await point([290,210]);
+      await cdp("Input.dispatchMouseEvent", {type:"mouseMoved", buttons:0, ...cursor});
+      await cdp("Input.dispatchMouseEvent", {type:"mouseWheel", deltaX:0, deltaY:-120, ...cursor});
+      await checkCrosshair(cursor, `Guides stay aligned and reach the canvas edges after zooming at pixel ratio ${pixelRatio}`);
+    }
+    const previousPan=await evaluate('({x:state.panX,y:state.panY})');
+    await cdp("Input.dispatchKeyEvent", {type:"keyDown", key:" ", code:"Space", windowsVirtualKeyCode:32});
+    await check('element("canvasCrosshair").hidden', "Holding Space hides rectangle guides while panning");
+    await cdp("Input.dispatchMouseEvent", {type:"mousePressed", button:"left", clickCount:1, ...cursor});
+    cursor={x:cursor.x+24,y:cursor.y+18};
+    await cdp("Input.dispatchMouseEvent", {type:"mouseMoved", buttons:1, ...cursor});
+    await cdp("Input.dispatchMouseEvent", {type:"mouseReleased", button:"left", clickCount:1, ...cursor});
+    await cdp("Input.dispatchKeyEvent", {type:"keyUp", key:" ", code:"Space", windowsVirtualKeyCode:32});
+    await check(`Math.abs(state.panX-(${previousPan.x})-24)<1 && Math.abs(state.panY-(${previousPan.y})-18)<1`, "Space-drag still pans the image");
+    await checkCrosshair(cursor, "Guides resume at the cursor after image panning");
+    await evaluate('setBusy(true);');
+    await check('element("canvasCrosshair").hidden', "Busy operations hide the visual-only guides");
+    await evaluate('setBusy(false);');
+    await checkCrosshair(cursor, "Guides resume after a busy operation without editing annotations");
+    await cdp("Input.dispatchMouseEvent", {type:"mouseMoved", buttons:0, x:5, y:5});
+    await check('element("canvasCrosshair").hidden', "Leaving the canvas removes the guides");
+    await cdp("Input.dispatchMouseEvent", {type:"mouseMoved", buttons:0, ...cursor});
+    await checkCrosshair(cursor, "Re-entering the canvas restores the guides");
+    await press("v", "KeyV");
+    await check('element("canvasCrosshair").hidden', "Switching to V hides the guides immediately");
+    await press("p", "KeyP");
+    await check('element("canvasCrosshair").hidden', "Polygon mode is not affected by the rectangle guides");
+    await press("r", "KeyR");
+    await evaluate('canvas.dispatchEvent(new PointerEvent("pointercancel",{pointerId:1}));');
+    await check('element("canvasCrosshair").hidden', "Cancelled pointer interactions clear the guides");
+    await cdp("Input.dispatchMouseEvent", {type:"mouseMoved", buttons:0, ...cursor});
+    await evaluate('window.dispatchEvent(new Event("blur"));');
+    await check('element("canvasCrosshair").hidden', "Window blur does not leave a stale crosshair");
+    await cdp("Emulation.setDeviceMetricsOverride", {width:1600, height:1000, deviceScaleFactor:1, mobile:false});
+    await sleep(100);
+    await press("f", "KeyF");
+    cursor=await point([320,240]);
+    await cdp("Input.dispatchMouseEvent", {type:"mouseMoved", buttons:0, ...cursor});
+    await checkCrosshair(cursor, "Guide geometry remains correct after restoring the image view");
+    await check('!state.dirty && state.current.version===0 && state.current.document.shapes.length===0 && !state.rectangle', "Guide movements never create annotations or change the saved version");
+    const crosshairScreenshot=await cdp("Page.captureScreenshot", {format:"png"});
+    fs.writeFileSync(path.join(home,"rectangle-crosshair.png"),Buffer.from(crosshairScreenshot.data,"base64"));
     await mouseClick(await point([100,100]));
+    await checkCrosshair(await point([100,100]), "Guides stay visible after the first rectangle click");
     await check('!!state.rectangle && !state.dirty && state.current.document.shapes.length===0', "First click remains active after releasing the mouse");
     await mouseClick(await point([100,100]));
     await check('!!state.rectangle && !element("labelPicker").open', "Repeated clicks at the same point do not create an empty rectangle");
@@ -122,10 +184,12 @@ test("annotation, model selection and dataset split export", {timeout:120000}, a
     await check('!!state.rectangle && state.current.version===0', "E cannot review an unfinished rectangle");
     await mouseClick(await point([350,300]));
     await waitFor('element("labelPicker").open');
+    await check('element("canvasCrosshair").hidden', "The completed rectangle label picker hides the guides");
     await check('state.current.document.shapes.length===0 && !state.dirty', "Pending rectangle is not saved before a label is chosen");
     await click('[data-label="class_a"]');
     await waitFor('!element("labelPicker").open');
     await check('state.current.document.shapes.length===1 && state.current.document.shapes[0].label==="class_a"', "Existing original label applies on click");
+    await check('element("canvasCrosshair").hidden && !JSON.stringify(state.current.document).includes("canvasPointer")', "Crosshair guides are not part of the annotation document");
     await click("#undoButton");
     await check('state.current.document.shapes.length===0', "New rectangle is one undo operation");
     await click("#redoButton");
