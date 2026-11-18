@@ -844,7 +844,7 @@ async function exportDataset() {
       reviewed_only:element("reviewedOnly").checked,include_images:element("includeImages").checked,split,augmentation});
     const counts=result.split_counts;
     const summary=counts ? `训练 ${counts.train} 张 / 验证 ${counts.val} 张 / 测试 ${counts.test} 张。` : "未划分数据集。";
-    const augmentationSummary=result.augmented_images ? `其中原图 ${result.original_images} 张，训练增强 ${result.augmented_images} 张（未单独人工审核）。` : "";
+    const augmentationSummary=result.augmented_images ? `其中原图 ${result.original_images} 张，训练增强 ${result.augmented_images} 张（未单独人工审核）。`+(result.integrity_check?.passed ? `标注完整性校验通过：${result.integrity_check.images_checked} 张图片 / ${result.integrity_check.annotations_checked} 个对象。` : "") : "";
     element("exportResult").innerHTML=`<p class="muted">已导出 ${result.images} 张。${summary}${augmentationSummary}<a href="${escapeHtml(result.url)}" download>再次下载 ZIP</a></p>`;
     const link=document.createElement("a");link.href=result.url;link.download=result.filename;document.body.append(link);link.click();link.remove();
     toast(`已生成 ${result.images} 张数据的导出包`);

@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import io
+import math
 import random
 
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, __version__ as pillow_version
@@ -64,6 +65,43 @@ def plan_augmentation(options):
     return {"preset": preset, "copies": copies, "seed": seed, "scope": "train_only",
             "keep_originals": True, "algorithm_version": 1, "engine": f"Pillow {pillow_version}",
             "output": "JPEG", "alpha_background": "white"}
+
+
+def validate_augmented_sample(source, augmented, contents, settings, provenance):
+    def reject(reason):
+        raise Problem(f"增强标注一致性校验失败：{reason}；已中止导出，不会丢弃对象或自动修框", 422)
+
+    size = (source["imageWidth"], source["imageHeight"])
+    if (augmented.get("imageWidth"), augmented.get("imageHeight")) != size:
+        reject("图片尺寸被改变")
+    try:
+        with Image.open(io.BytesIO(contents)) as image:
+            image.load()
+            if image.size != size or image.getexif().get(274, 1) != 1:
+                reject("增强图片尺寸或方向与标注不一致")
+    except (OSError, ValueError) as error:
+        raise Problem("增强图片无法完整解码，已中止导出", 422) from error
+    if augmented.get("labelpilot", {}).get("image_sha256") != hashlib.sha256(contents).hexdigest():
+        reject("增强图片指纹不匹配")
+    horizontal = PRESETS[settings["preset"]].get("horizontal_flip", False)
+    if provenance.get("preset") != settings["preset"] or provenance.get("operations", {}).get("horizontal_flip") is not horizontal:
+        reject("增强操作与所选方案不一致")
+    shapes = augmented.get("shapes")
+    if not isinstance(shapes, list) or len(shapes) != len(source["shapes"]):
+        reject("标注对象数量发生变化")
+    for index, (original, actual) in enumerate(zip(source["shapes"], shapes), 1):
+        if not isinstance(actual, dict):
+            reject(f"第 {index} 个对象格式无效")
+        expected = copy.deepcopy(original)
+        if horizontal:
+            expected["points"] = [[size[0] - point[0], point[1]] for point in original["points"]]
+        if actual != expected:
+            reject(f"第 {index} 个对象的标签、坐标或属性不匹配")
+        for point in actual["points"]:
+            if (any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in point)
+                    or not 0 <= point[0] <= size[0] or not 0 <= point[1] <= size[1]):
+                reject(f"第 {index} 个对象坐标无效或越界")
+    return len(shapes)
 
 
 def augmented_variants(path, document, source_id, source_sha256, settings):

@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from labelpilot.exporting import export_project, plan_splits
-from labelpilot.augmentation import PRESETS, augmented_variants, plan_augmentation
+from labelpilot.augmentation import PRESETS, augmented_variants, plan_augmentation, validate_augmented_sample
 from labelpilot import model_files
 from labelpilot import server
 from labelpilot.inference import Inference, Jobs, model_class_names
@@ -151,6 +151,9 @@ def test_augmentation_export_train_only_and_preservation(reviewed_store, dataset
     with zipfile.ZipFile(store.home / "exports" / result["filename"]) as archive:
         manifest = json.loads(archive.read("export_manifest.json"))
         assert manifest["augmentation"]["scope"] == "train_only"
+        assert result["integrity_check"] == manifest["integrity_check"]
+        assert manifest["integrity_check"]["passed"] and manifest["integrity_check"]["images_checked"] == 8
+        assert manifest["integrity_check"]["annotations_checked"] == sum(entry["annotation_count"] for entry in manifest["items"])
         assert len(manifest["items"]) == len({entry["image"] for entry in manifest["items"]}) == 8
         assert len({entry["id"] for entry in manifest["items"]}) == 8
         originals = {entry["id"]: entry for entry in manifest["items"] if "augmentation" not in entry}
@@ -300,6 +303,125 @@ def test_augmentation_limit_and_failed_decode_cleanup(reviewed_store, monkeypatc
     with pytest.raises(OSError, match="simulated"):
         export_project(reviewed_store, "test", options)
     assert not list((reviewed_store.home / "exports").glob("*.zip"))
+
+
+@pytest.mark.parametrize("corruption", ["shift", "missing", "label"])
+def test_augmented_box_shift_missing_or_label_change_aborts_export(store, monkeypatch, corruption):
+    import labelpilot.exporting as exporting
+
+    store.save("test", item(store, "human")["id"], payload(store, "human", "reviewed"))
+    source_generator = exporting.augmented_variants
+    def corrupted_variants(*args, **kwargs):
+        for index, contents, augmented, provenance in source_generator(*args, **kwargs):
+            if augmented["shapes"]:
+                if corruption == "shift":
+                    augmented["shapes"][0]["points"][0][0] += 1
+                elif corruption == "missing":
+                    augmented["shapes"].pop()
+                else:
+                    augmented["shapes"][0]["label"] = "missing-class"
+            yield index, contents, augmented, provenance
+
+    monkeypatch.setattr(exporting, "augmented_variants", corrupted_variants)
+    with pytest.raises(Problem, match="对象数量|标签、坐标"):
+        export_project(store, "test", {"split": {"train": 100, "val": 0, "test": 0},
+                                        "augmentation": {"preset": "horizontal"}})
+    assert not list((store.home / "exports").glob("*.zip"))
+
+
+@pytest.mark.parametrize("format_name", ["labelme", "coco", "yolo"])
+def test_augmented_serialized_annotation_corruption_aborts_export(store, monkeypatch, format_name):
+    import labelpilot.exporting as exporting
+
+    store.save("test", item(store, "human")["id"], payload(store, "human", "reviewed"))
+    original_write = exporting.write_annotation
+    def corrupted_write(archive, selected_format, *args, **kwargs):
+        original_write(archive, selected_format, *args, **kwargs)
+        image_name = args[2]
+        subset = args[3]
+        split_config = args[4]
+        if "__aug_" not in image_name:
+            return
+        suffix = f"/{subset}" if split_config else ""
+        base = Path(image_name).stem
+        if selected_format == "labelme":
+            archive.writestr(f"annotations{suffix}/{base}.json", "{}")
+        elif selected_format == "yolo":
+            archive.writestr(f"labels{suffix}/{base}.txt", "")
+        else:
+            document = args[5][subset]
+            if document["annotations"]:
+                document["annotations"].pop()
+
+    monkeypatch.setattr(exporting, "write_annotation", corrupted_write)
+    with pytest.raises(Problem, match="回读校验失败"):
+        export_project(store, "test", {"format": format_name, "split": {"train": 100, "val": 0, "test": 0},
+                                        "augmentation": {"preset": "horizontal"}})
+    assert not list((store.home / "exports").glob("*.zip"))
+
+
+@pytest.mark.parametrize("corruption", ["dimensions", "undecodable", "checksum", "extra", "attributes", "operation"])
+def test_augmented_sample_integrity_rejects_corruption(store, corruption):
+    current = store.detail("test", item(store, "human")["id"])
+    source = current["document"]
+    settings = plan_augmentation({"split": {}, "augmentation": {"preset": "horizontal"}})
+    path = store.project("test").item(current["item"]["id"])["path"]
+    _, contents, augmented, provenance = next(augmented_variants(path, source, "human", current["image_sha256"], settings))
+    if corruption == "dimensions":
+        with io.BytesIO() as buffer:
+            Image.new("RGB", (120, 60)).save(buffer, format="JPEG")
+            contents = buffer.getvalue()
+        augmented["labelpilot"]["image_sha256"] = hashlib.sha256(contents).hexdigest()
+    elif corruption == "undecodable":
+        contents = b"invalid image"
+    elif corruption == "checksum":
+        augmented["labelpilot"]["image_sha256"] = "incorrect"
+    elif corruption == "extra":
+        augmented["shapes"].append(copy.deepcopy(augmented["shapes"][0]))
+    elif corruption == "attributes":
+        augmented["shapes"][0]["attributes"]["occlusion"] = "incorrect"
+    else:
+        provenance["operations"]["horizontal_flip"] = False
+    with pytest.raises(Problem, match="已中止导出"):
+        validate_augmented_sample(source, augmented, contents, settings, provenance)
+
+
+def test_augmentation_missing_variant_aborts_export(store, monkeypatch):
+    store.save("test", item(store, "human")["id"], payload(store, "human", "reviewed"))
+    monkeypatch.setattr("labelpilot.exporting.augmented_variants", lambda *args, **kwargs: iter(()))
+    with pytest.raises(Problem, match="副本数量缺失"):
+        export_project(store, "test", {"split": {"train": 100, "val": 0, "test": 0},
+                                        "augmentation": {"preset": "gentle"}})
+    assert not list((store.home / "exports").glob("*.zip"))
+
+
+@pytest.mark.parametrize("preset", PRESETS)
+@pytest.mark.parametrize("seed", [0, 1, 42, 4294967295])
+def test_augmented_raster_objects_remain_aligned_with_boxes(tmp_path, preset, seed):
+    source = tmp_path / "asymmetric.png"
+    with Image.new("RGB", (101, 79), "black") as image:
+        image.paste("white", (13, 11, 41, 32))
+        image.paste("white", (57, 45, 93, 71))
+        image.save(source)
+    document = {"imageWidth": 101, "imageHeight": 79, "shapes": [
+        {"label": "Raw_Label-1", "shape_type": "rectangle", "points": [[13, 11], [41, 32]]},
+        {"label": "Raw_Label-2", "shape_type": "rectangle", "points": [[57, 45], [93, 45], [93, 71], [57, 71]]}]}
+    before = copy.deepcopy(document)
+    settings = plan_augmentation({"split": {}, "augmentation": {"preset": preset, "copies": 3, "seed": seed}})
+    for _, contents, augmented, provenance in augmented_variants(source, document, "asymmetric", digest(source), settings):
+        assert validate_augmented_sample(document, augmented, contents, settings, provenance) == 2
+        assert [shape["label"] for shape in augmented["shapes"]] == ["Raw_Label-1", "Raw_Label-2"]
+        with Image.open(io.BytesIO(contents)) as image:
+            mask = image.convert("L").point(lambda value: 255 if value > 100 else 0)
+            for index, shape in enumerate(augmented["shapes"]):
+                xs, ys = zip(*shape["points"])
+                upper, lower = ((0, 39) if index == 0 else (39, 79))
+                raster_bounds = mask.crop((0, upper, 101, lower)).getbbox()
+                assert raster_bounds is not None
+                raster_bounds = [raster_bounds[0], raster_bounds[1] + upper, raster_bounds[2], raster_bounds[3] + upper]
+                expected = [min(xs), min(ys), max(xs), max(ys)]
+                assert max(abs(actual - target) for actual, target in zip(raster_bounds, expected)) <= 1
+    assert document == before
 
 
 def test_augmentation_catalog_api(store):
