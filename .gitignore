@@ -1,0 +1,14 @@
+data/
+exports/
+__pycache__/
+.pytest_cache/
+*.pyc
+Ultralytics/
+projects.json
+.env
+.env.*
+*.pt
+*.onnx
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
