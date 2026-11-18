@@ -37,8 +37,12 @@ PRESETS = {
 
 
 def augmentation_presets():
-    return {"presets": [{"id": name, "name": preset["name"], "description": preset["description"]}
-                        for name, preset in PRESETS.items()], "max_copies": MAX_COPIES}
+    presets = [{"id": name, "name": preset["name"], "description": preset["description"], "preset_count": 1}
+               for name, preset in PRESETS.items()]
+    presets.append({"id": "all", "name": "全部方案（分别生成）", "preset_count": len(PRESETS),
+                    "description": "轻量通用、光照变化、画质扰动、水平翻转四种方案分别从原图生成，不连续叠加。"
+                                   "含镜像和模糊：文字、方向有含义或特别小的目标请谨慎，不适合时改选单一方案。"})
+    return {"presets": presets, "max_copies": MAX_COPIES}
 
 
 def plan_augmentation(options):
@@ -48,11 +52,11 @@ def plan_augmentation(options):
     if not isinstance(settings, dict) or set(settings) - {"preset", "copies", "seed"}:
         raise Problem("增强设置必须包含 preset，以及可选的 copies、seed", 422)
     preset = settings.get("preset")
-    if not isinstance(preset, str) or preset not in PRESETS:
+    if not isinstance(preset, str) or preset not in {*PRESETS, "all"}:
         raise Problem("请选择有效的数据增强方案", 422)
     copies = settings.get("copies", 1)
     if isinstance(copies, bool) or not isinstance(copies, int) or not 1 <= copies <= MAX_COPIES:
-        raise Problem(f"每张训练图片额外生成数量必须为 1 到 {MAX_COPIES} 的整数", 422)
+        raise Problem(f"每张训练图片、每种方案额外生成数量必须为 1 到 {MAX_COPIES} 的整数", 422)
     seed = settings.get("seed", 42)
     if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= 4294967295:
         raise Problem("增强随机种子必须为 0 到 4294967295 的整数", 422)
@@ -62,7 +66,9 @@ def plan_augmentation(options):
         raise Problem("数据增强必须勾选包含图片，否则增强标注无法配对", 422)
     if not options.get("reviewed_only", True):
         raise Problem("数据增强仅支持已人工确认的标注，请勾选只导出已人工确认", 422)
-    return {"preset": preset, "copies": copies, "seed": seed, "scope": "train_only",
+    presets = list(PRESETS) if preset == "all" else [preset]
+    return {"preset": preset, "presets": presets, "copies": copies, "variants_per_image": copies * len(presets),
+            "seed": seed, "scope": "train_only",
             "keep_originals": True, "algorithm_version": 1, "engine": f"Pillow {pillow_version}",
             "output": "JPEG", "alpha_background": "white"}
 

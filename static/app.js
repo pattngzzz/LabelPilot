@@ -819,11 +819,17 @@ function updateExportSplit() {
   for(const id of ["augmentationCopies","augmentationSeed"])element(id).disabled=!enabled;
   const preset=exportAugmentation.presets.find(item=>item.id===element("augmentationPreset").value);
   element("augmentationDescription").textContent=preset?.description || "不生成额外图片。";
+  const presetCount=preset?.preset_count || 1;
+  element("augmentationCopiesLabel").textContent=presetCount>1 ? "每张训练图片、每种方案额外生成" : "每张训练图片额外生成";
   let augmentationInvalid=false;
   let augmentationMessage="原图和已有标注只读，默认不增强。";
   try{
     const augmentation=exportAugmentationOptions();
-    if(augmentation)augmentationMessage=`保留全部原图，每张训练图片额外生成 ${augmentation.copies} 张，训练集最终为原来的 ${augmentation.copies+1} 倍；验证 / 测试张数不变。增强文件是派生标注，未单独人工审核。`;
+    if(augmentation){
+      const extra=augmentation.copies*presetCount;
+      const perPreset=presetCount>1 ? `${presetCount} 种方案分别生成，每方案 ${augmentation.copies} 张；` : "";
+      augmentationMessage=`保留全部原图，${perPreset}每张训练图片额外生成 ${extra} 张，含原图共 ${extra+1} 张，训练集最终为原来的 ${extra+1} 倍；验证 / 测试张数不变。增强文件是派生标注，未单独人工审核。`;
+    }
   }catch(error){augmentationInvalid=true;augmentationMessage=error.message;}
   element("augmentationSummary").textContent=augmentationMessage;
   element("augmentationSummary").dataset.invalid=String(augmentationInvalid);

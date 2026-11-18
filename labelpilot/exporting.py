@@ -165,7 +165,7 @@ def export_project(store, project_id, options):
         raise Problem("请按批次导出，每次不超过 10000 张", 422)
     assignments, split_config, split_counts = plan_splits(rows, options)
     source_split_counts = copy.deepcopy(split_counts)
-    augmented_images = split_counts["train"] * augmentation["copies"] if augmentation else 0
+    augmented_images = split_counts["train"] * augmentation["variants_per_image"] if augmentation else 0
     if len(rows) + augmented_images > 20000:
         raise Problem("增强后每次导出最多 20000 张，请减少副本数量或按批次导出", 422)
     if augmentation:
@@ -219,34 +219,36 @@ def export_project(store, project_id, options):
                                              split_config, coco_documents, len(manifest["items"]), annotation_offset)
                     manifest["items"][-1]["annotation_count"] = len(source_document["shapes"])
                 if augmentation and subset == "train":
-                    produced = 0
-                    for index, contents, augmented, provenance in augmented_variants(
-                            io.BytesIO(source_contents), copy.deepcopy(source_document), row["id"], current["image_sha256"], augmentation):
-                        if (index != produced + 1 or index > augmentation["copies"] or provenance.get("variant") != index
-                                or provenance.get("source_id") != row["id"] or provenance.get("source_sha256") != current["image_sha256"]):
-                            raise Problem("增强副本编号或来源不一致，已中止导出", 422)
-                        produced += 1
-                        shape_count = validate_augmented_sample(source_document, augmented, contents, augmentation, provenance)
-                        variant_id = f"{row['id']}__aug_{augmentation['preset']}_{index}"
-                        variant_name = f"images/train/{Path(filename).stem}__aug_{augmentation['preset']}_{index}.jpg"
-                        archive.writestr(variant_name, contents)
-                        if hashlib.sha256(archive.read(variant_name)).hexdigest() != augmented["labelpilot"]["image_sha256"]:
-                            raise Problem("增强图片 ZIP 回读指纹不匹配，已中止导出", 422)
-                        manifest["items"].append({"photo_id": row["photo_id"], "id": variant_id, "status": "augmented",
-                                                  "revision": 0, "sha256": augmented["labelpilot"]["image_sha256"],
-                                                  "source_group": item["source_group"], "image": variant_name,
-                                                  "split": "train", "source_id": row["id"],
-                                                  "source_revision": current["version"], "human_reviewed": False,
-                                                  "annotation_count": shape_count,
-                                                  "augmentation": provenance})
-                        expected_document = copy.deepcopy(augmented)
-                        annotation_offset = len(coco_documents["train"]["annotations"])
-                        write_annotation(archive, format_name, project, augmented, variant_name, "train", split_config,
-                                         coco_documents, len(manifest["items"]))
-                        verify_export_annotation(archive, format_name, project, expected_document, variant_name, "train",
-                                                 split_config, coco_documents, len(manifest["items"]), annotation_offset)
-                    if produced != augmentation["copies"]:
-                        raise Problem("增强副本数量缺失，已中止导出", 422)
+                    for preset in augmentation["presets"]:
+                        settings = {**augmentation, "preset": preset}
+                        produced = 0
+                        for index, contents, augmented, provenance in augmented_variants(
+                                io.BytesIO(source_contents), copy.deepcopy(source_document), row["id"], current["image_sha256"], settings):
+                            if (index != produced + 1 or index > settings["copies"] or provenance.get("variant") != index
+                                    or provenance.get("source_id") != row["id"] or provenance.get("source_sha256") != current["image_sha256"]):
+                                raise Problem("增强副本编号或来源不一致，已中止导出", 422)
+                            produced += 1
+                            shape_count = validate_augmented_sample(source_document, augmented, contents, settings, provenance)
+                            variant_id = f"{row['id']}__aug_{preset}_{index}"
+                            variant_name = f"images/train/{Path(filename).stem}__aug_{preset}_{index}.jpg"
+                            archive.writestr(variant_name, contents)
+                            if hashlib.sha256(archive.read(variant_name)).hexdigest() != augmented["labelpilot"]["image_sha256"]:
+                                raise Problem("增强图片 ZIP 回读指纹不匹配，已中止导出", 422)
+                            manifest["items"].append({"photo_id": row["photo_id"], "id": variant_id, "status": "augmented",
+                                                      "revision": 0, "sha256": augmented["labelpilot"]["image_sha256"],
+                                                      "source_group": item["source_group"], "image": variant_name,
+                                                      "split": "train", "source_id": row["id"],
+                                                      "source_revision": current["version"], "human_reviewed": False,
+                                                      "annotation_count": shape_count,
+                                                      "augmentation": provenance})
+                            expected_document = copy.deepcopy(augmented)
+                            annotation_offset = len(coco_documents["train"]["annotations"])
+                            write_annotation(archive, format_name, project, augmented, variant_name, "train", split_config,
+                                             coco_documents, len(manifest["items"]))
+                            verify_export_annotation(archive, format_name, project, expected_document, variant_name, "train",
+                                                     split_config, coco_documents, len(manifest["items"]), annotation_offset)
+                        if produced != settings["copies"]:
+                            raise Problem("增强副本数量缺失，已中止导出", 422)
             archive.writestr("classes.txt", "\n".join(project.names) + "\n")
             if format_name == "yolo":
                 paths = "" if not split_config else "".join(

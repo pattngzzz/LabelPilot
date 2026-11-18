@@ -134,31 +134,41 @@ def test_split_is_reproducible_and_seeded():
     assert assignments != plan_splits(rows, {"split": {**settings["split"], "seed": 43}})[0]
 
 
-@pytest.mark.parametrize("preset", PRESETS)
+@pytest.mark.parametrize("preset,copies", [(preset, 2) for preset in PRESETS] + [("all", 1), ("all", 3)])
 @pytest.mark.parametrize("format_name", ["yolo", "labelme", "coco"])
-def test_augmentation_export_train_only_and_preservation(reviewed_store, dataset, preset, format_name):
+def test_augmentation_export_train_only_and_preservation(reviewed_store, dataset, preset, copies, format_name):
     store = reviewed_store
     sources = {path: digest(path) for folder in dataset[1:] for path in folder.rglob("*") if path.is_file()}
     with store.connect() as connection:
         annotations = [tuple(row) for row in connection.execute("SELECT * FROM annotations ORDER BY item")]
         revisions = [tuple(row) for row in connection.execute("SELECT * FROM revisions ORDER BY item, version")]
     options = {"format": format_name, "split": {"train": 50, "val": 25, "test": 25, "seed": 42},
-               "augmentation": {"preset": preset, "copies": 2, "seed": 43}}
+               "augmentation": {"preset": preset, "copies": copies, "seed": 43}}
     result = export_project(store, "test", options)
-    assert (result["images"], result["original_images"], result["augmented_images"]) == (8, 4, 4)
+    presets = list(PRESETS) if preset == "all" else [preset]
+    augmented_count = 2 * copies * len(presets)
+    total = 4 + augmented_count
+    assert (result["images"], result["original_images"], result["augmented_images"]) == (total, 4, augmented_count)
     assert result["source_split_counts"] == {"train": 2, "val": 1, "test": 1}
-    assert result["split_counts"] == {"train": 6, "val": 1, "test": 1}
+    assert result["split_counts"] == {"train": 2 + augmented_count, "val": 1, "test": 1}
     with zipfile.ZipFile(store.home / "exports" / result["filename"]) as archive:
         manifest = json.loads(archive.read("export_manifest.json"))
         assert manifest["augmentation"]["scope"] == "train_only"
+        assert manifest["augmentation"]["presets"] == presets
+        assert manifest["augmentation"]["variants_per_image"] == copies * len(presets)
         assert result["integrity_check"] == manifest["integrity_check"]
-        assert manifest["integrity_check"]["passed"] and manifest["integrity_check"]["images_checked"] == 8
+        assert manifest["integrity_check"]["passed"] and manifest["integrity_check"]["images_checked"] == total
         assert manifest["integrity_check"]["annotations_checked"] == sum(entry["annotation_count"] for entry in manifest["items"])
-        assert len(manifest["items"]) == len({entry["image"] for entry in manifest["items"]}) == 8
-        assert len({entry["id"] for entry in manifest["items"]}) == 8
+        assert len(manifest["items"]) == len({entry["image"] for entry in manifest["items"]}) == total
+        assert len({entry["id"] for entry in manifest["items"]}) == total
         originals = {entry["id"]: entry for entry in manifest["items"] if "augmentation" not in entry}
         variants = [entry for entry in manifest["items"] if "augmentation" in entry]
-        assert len(variants) == 4
+        assert len(variants) == augmented_count
+        for source in originals.values():
+            actual = {(entry["augmentation"]["preset"], entry["augmentation"]["variant"])
+                      for entry in variants if entry["source_id"] == source["id"]}
+            expected = {(name, index) for name in presets for index in range(1, copies + 1)} if source["split"] == "train" else set()
+            assert actual == expected
         for entry in originals.values():
             assert archive.read(entry["image"]) == Path(store.project("test").item(entry["id"])["path"]).read_bytes()
         for entry in variants:
@@ -172,7 +182,7 @@ def test_augmentation_export_train_only_and_preservation(reviewed_store, dataset
                 assert image.size == (240, 120) and image.format == "JPEG"
             original = store.detail("test", entry["source_id"])["document"]
             expected = copy.deepcopy(original["shapes"])
-            if preset == "horizontal":
+            if entry["augmentation"]["preset"] == "horizontal":
                 for shape in expected:
                     shape["points"] = [[240 - point[0], point[1]] for point in shape["points"]]
             stem = Path(entry["image"]).stem
@@ -207,8 +217,8 @@ def test_augmentation_export_train_only_and_preservation(reviewed_store, dataset
         if format_name == "coco":
             documents = [json.loads(archive.read(f"annotations/{subset}.json")) for subset in ("train", "val", "test")]
             ids = [image["id"] for document in documents for image in document["images"]]
-            assert len(ids) == len(set(ids)) == 8
-            assert [len(document["images"]) for document in documents] == [6, 1, 1]
+            assert len(ids) == len(set(ids)) == total
+            assert [len(document["images"]) for document in documents] == [2 + augmented_count, 1, 1]
         repeated = export_project(store, "test", options)
         with zipfile.ZipFile(store.home / "exports" / repeated["filename"]) as other:
             assert all(archive.read(entry["image"]) == other.read(entry["image"]) for entry in variants)
@@ -216,6 +226,33 @@ def test_augmentation_export_train_only_and_preservation(reviewed_store, dataset
     with store.connect() as connection:
         assert annotations == [tuple(row) for row in connection.execute("SELECT * FROM annotations ORDER BY item")]
         assert revisions == [tuple(row) for row in connection.execute("SELECT * FROM revisions ORDER BY item, version")]
+
+
+def test_all_augmentation_matches_independent_presets_and_seeded_split(reviewed_store):
+    options = {"format": "labelme", "split": {"train": 50, "val": 25, "test": 25, "seed": 42},
+               "augmentation": {"preset": "all", "copies": 2, "seed": 43}}
+    result = export_project(reviewed_store, "test", options)
+    with zipfile.ZipFile(reviewed_store.home / "exports" / result["filename"]) as combined:
+        manifest = json.loads(combined.read("export_manifest.json"))
+        variants = {entry["id"]: entry for entry in manifest["items"] if "augmentation" in entry}
+        for preset in PRESETS:
+            single = export_project(reviewed_store, "test", {**options, "augmentation": {**options["augmentation"], "preset": preset}})
+            with zipfile.ZipFile(reviewed_store.home / "exports" / single["filename"]) as archive:
+                single_manifest = json.loads(archive.read("export_manifest.json"))
+                for entry in single_manifest["items"]:
+                    if "augmentation" in entry:
+                        assert entry["augmentation"] == variants[entry["id"]]["augmentation"]
+                        assert combined.read(entry["image"]) == archive.read(entry["image"])
+                        annotation = f"annotations/train/{Path(entry['image']).stem}.json"
+                        assert combined.read(annotation) == archive.read(annotation)
+        changed = export_project(reviewed_store, "test", {**options, "augmentation": {**options["augmentation"], "seed": 44}})
+        with zipfile.ZipFile(reviewed_store.home / "exports" / changed["filename"]) as archive:
+            changed_manifest = json.loads(archive.read("export_manifest.json"))
+            assert {entry["id"]: entry["split"] for entry in changed_manifest["items"]} == {
+                entry["id"]: entry["split"] for entry in manifest["items"]}
+            for entry in changed_manifest["items"]:
+                if "augmentation" in entry:
+                    assert entry["augmentation"]["operations"] != variants[entry["id"]]["augmentation"]["operations"]
 
 
 @pytest.mark.parametrize("format_name", ["labelme", "coco", "yolo"])
@@ -289,10 +326,11 @@ def test_augmentation_seed_and_copy_prefix_stability(store):
     assert len({entry[1] for entry in variants}) == 3
 
 
-def test_augmentation_limit_and_failed_decode_cleanup(reviewed_store, monkeypatch):
-    options = {"split": {"train": 100, "val": 0, "test": 0}, "augmentation": {"preset": "gentle", "copies": 3}}
+@pytest.mark.parametrize("preset,multiplier", [("gentle", 1500), ("all", 400)])
+def test_augmentation_limit_and_failed_decode_cleanup(reviewed_store, monkeypatch, preset, multiplier):
+    options = {"split": {"train": 100, "val": 0, "test": 0}, "augmentation": {"preset": preset, "copies": 3}}
     listing = reviewed_store.listing
-    monkeypatch.setattr(reviewed_store, "listing", lambda *args, **kwargs: {"items": listing(*args, **kwargs)["items"] * 1500})
+    monkeypatch.setattr(reviewed_store, "listing", lambda *args, **kwargs: {"items": listing(*args, **kwargs)["items"] * multiplier})
     with pytest.raises(Problem, match="20000"):
         export_project(reviewed_store, "test", options)
     assert not (reviewed_store.home / "exports").exists()
@@ -306,14 +344,15 @@ def test_augmentation_limit_and_failed_decode_cleanup(reviewed_store, monkeypatc
 
 
 @pytest.mark.parametrize("corruption", ["shift", "missing", "label"])
-def test_augmented_box_shift_missing_or_label_change_aborts_export(store, monkeypatch, corruption):
+@pytest.mark.parametrize("preset", ["horizontal", "all"])
+def test_augmented_box_shift_missing_or_label_change_aborts_export(store, monkeypatch, corruption, preset):
     import labelpilot.exporting as exporting
 
     store.save("test", item(store, "human")["id"], payload(store, "human", "reviewed"))
     source_generator = exporting.augmented_variants
     def corrupted_variants(*args, **kwargs):
         for index, contents, augmented, provenance in source_generator(*args, **kwargs):
-            if augmented["shapes"]:
+            if augmented["shapes"] and provenance["preset"] == "horizontal":
                 if corruption == "shift":
                     augmented["shapes"][0]["points"][0][0] += 1
                 elif corruption == "missing":
@@ -325,7 +364,7 @@ def test_augmented_box_shift_missing_or_label_change_aborts_export(store, monkey
     monkeypatch.setattr(exporting, "augmented_variants", corrupted_variants)
     with pytest.raises(Problem, match="对象数量|标签、坐标"):
         export_project(store, "test", {"split": {"train": 100, "val": 0, "test": 0},
-                                        "augmentation": {"preset": "horizontal"}})
+                                        "augmentation": {"preset": preset}})
     assert not list((store.home / "exports").glob("*.zip"))
 
 
@@ -386,12 +425,13 @@ def test_augmented_sample_integrity_rejects_corruption(store, corruption):
         validate_augmented_sample(source, augmented, contents, settings, provenance)
 
 
-def test_augmentation_missing_variant_aborts_export(store, monkeypatch):
+@pytest.mark.parametrize("preset", ["gentle", "all"])
+def test_augmentation_missing_variant_aborts_export(store, monkeypatch, preset):
     store.save("test", item(store, "human")["id"], payload(store, "human", "reviewed"))
     monkeypatch.setattr("labelpilot.exporting.augmented_variants", lambda *args, **kwargs: iter(()))
     with pytest.raises(Problem, match="副本数量缺失"):
         export_project(store, "test", {"split": {"train": 100, "val": 0, "test": 0},
-                                        "augmentation": {"preset": "gentle"}})
+                                        "augmentation": {"preset": preset}})
     assert not list((store.home / "exports").glob("*.zip"))
 
 
@@ -428,7 +468,9 @@ def test_augmentation_catalog_api(store):
     with TestClient(create_app(store.home)) as client:
         response = client.get("/api/augmentation-presets")
         assert response.status_code == 200
-        assert {preset["id"] for preset in response.json()["presets"]} == set(PRESETS)
+        catalog = response.json()["presets"]
+        assert {preset["id"] for preset in catalog} == {*PRESETS, "all"}
+        assert all(preset["preset_count"] == (len(PRESETS) if preset["id"] == "all" else 1) for preset in catalog)
         assert response.json()["max_copies"] == 3
         assert response.headers["cache-control"] == "no-store"
 

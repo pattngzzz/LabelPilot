@@ -372,9 +372,9 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await click("#exportButton");
     await waitFor('element("exportDialog").open');
     await waitFor('exportAugmentation.loaded');
-    await check('element("augmentationPreset").value==="none" && element("augmentationPreset").options.length===5 && element("augmentationCopies").disabled', "Export defaults to no augmentation and offers four server-provided presets");
+    await check('element("augmentationPreset").value==="none" && element("augmentationPreset").options.length===6 && element("augmentationCopies").disabled', "Export defaults to no augmentation and offers four presets plus all-presets mode");
     await check('element("splitDataset").checked && element("splitTrain").value==="80" && element("splitVal").value==="10" && element("splitTest").value==="10" && !element("createExport").disabled', "Export defaults to an editable 80/10/10 split");
-    const setExportValue = (id, value) => evaluate(`element(${JSON.stringify(id)}).value=${JSON.stringify(String(value))};element(${JSON.stringify(id)}).dispatchEvent(new Event("input",{bubbles:true}));`);
+    const setExportValue = (id, value) => evaluate(`element(${JSON.stringify(id)}).value=${JSON.stringify(String(value))};element(${JSON.stringify(id)}).dispatchEvent(new Event(element(${JSON.stringify(id)}).tagName==="SELECT" ? "change" : "input",{bubbles:true}));`);
     await evaluate('window.exportApi=api;window.exportRequests=[];api=async(path,method,body)=>{if(path.endsWith("/export"))exportRequests.push(body);const result=await exportApi(path,method,body);if(path.endsWith("/export"))window.lastExportResult=result;return result;};');
     await setExportValue("splitTrain", 70);
     await check('element("createExport").disabled && element("exportSplitSummary").textContent.includes("90%")', "Invalid total disables export and shows the actual percentage");
@@ -451,6 +451,24 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     assert.equal(augmentationCheck.status, 0, augmentationCheck.stderr || augmentationCheck.error?.message);
     await check('element("exportResult").textContent.includes("标注完整性校验通过")', "Export displays the completed runtime image and object integrity checks");
     await check(`JSON.stringify(state.current)===${JSON.stringify(beforeExport)}`, "Augmented export never alters the current annotation or review state");
+    await setExportValue("augmentationPreset", "all");
+    await check('element("augmentationCopiesLabel").textContent.includes("每种方案") && element("augmentationSummary").textContent.includes("额外生成 8 张") && element("augmentationSummary").textContent.includes("9 倍")', "All-presets mode counts copies per preset and displays the true total");
+    await setExportValue("augmentationCopies", 3);
+    await check('element("augmentationSummary").textContent.includes("额外生成 12 张") && element("augmentationSummary").textContent.includes("13 倍")', "All-presets mode correctly counts the maximum copy setting");
+    await setExportValue("augmentationCopies", 1);
+    await check('element("augmentationSummary").textContent.includes("每方案 1 张") && element("augmentationSummary").textContent.includes("含原图共 5 张") && element("augmentationDescription").textContent.includes("不连续叠加")', "All-presets mode explains independent generation and the recommended count");
+    const downloadsBeforeAll = fs.readdirSync(downloads).filter(name => name.endsWith(".zip"));
+    await click("#createExport");
+    await waitFor('element("exportResult").textContent.includes("训练增强 8 张") && !element("createExport").disabled');
+    await check('lastExportResult.images===12 && lastExportResult.augmented_images===8 && lastExportResult.split_counts.train===10 && JSON.stringify(exportRequests.at(-1).augmentation)===JSON.stringify({preset:"all",copies:1,seed:43})', "All-presets selection reaches the backend with correct train-only totals");
+    await eventually(() => fs.readdirSync(downloads).filter(name => name.endsWith(".zip")).length === 4);
+    const allExport = path.join(downloads, fs.readdirSync(downloads).find(name => name.endsWith(".zip") && !downloadsBeforeAll.includes(name)));
+    const allCheck = spawnSync(python, ["-c", "import io,json,sys,zipfile; from PIL import Image; archive=zipfile.ZipFile(sys.argv[1]); manifest=json.loads(archive.read('export_manifest.json')); assert manifest['split_counts']=={'train':10,'val':1,'test':1}; assert manifest['augmentation']['preset']=='all' and manifest['augmentation']['variants_per_image']==4; assert manifest['integrity_check']['passed'] and manifest['integrity_check']['augmented_images_checked']==8; originals={item['id']:item for item in manifest['items'] if 'augmentation' not in item}; variants=[item for item in manifest['items'] if 'augmentation' in item]; assert len(originals)==4 and len(variants)==8; assert len({item['image'] for item in manifest['items']})==12; assert len(archive.namelist())==len(set(archive.namelist())); assert all({entry['augmentation']['preset'] for entry in variants if entry['source_id']==item['id']}==({'gentle','lighting','quality','horizontal'} if item['split']=='train' else set()) for item in originals.values()); assert all(item['split']==originals[item['source_id']]['split']=='train' and item['annotation_count']==originals[item['source_id']]['annotation_count'] for item in variants); [Image.open(io.BytesIO(archive.read(item['image']))).load() for item in variants]; assert all(len(archive.read(item['image'].replace('images/','labels/',1).rsplit('.',1)[0]+'.txt').decode().splitlines())==item['annotation_count'] for item in manifest['items']); print('All four presets independently downloaded with matching boxes and unique paths')", allExport], {windowsHide:true, encoding:"utf8"});
+    assert.equal(allCheck.status, 0, allCheck.stderr || allCheck.error?.message);
+    await check(`JSON.stringify(state.current)===${JSON.stringify(beforeExport)}`, "All-presets export preserves the current annotation and review state");
+    await setExportValue("augmentationPreset", "gentle");
+    await check('!element("augmentationCopiesLabel").textContent.includes("每种方案") && element("augmentationSummary").textContent.includes("含原图共 2 张")', "Returning to a single preset restores its original count unit");
+    await setExportValue("augmentationPreset", "all");
     for (const width of [1600,760,480]) {
       await cdp("Emulation.setDeviceMetricsOverride", {width,height:1000,deviceScaleFactor:1,mobile:false});
       await sleep(100);
@@ -459,7 +477,7 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     }
     const augmentationScreenshot = await cdp("Page.captureScreenshot", {format:"png"});
     fs.writeFileSync(path.join(home,"augmentation-export.png"), Buffer.from(augmentationScreenshot.data,"base64"));
-    context.diagnostic("Four augmentation presets, safety validation, real YOLO ZIP and original annotation preservation passed");
+    context.diagnostic("Four augmentation presets and all-presets mode, copy totals, safety validation, downloaded YOLO ZIPs and annotation preservation passed");
     await evaluate('api=exportApi;');
     assert.deepEqual(errors, [], "No browser runtime errors");
   } finally {
