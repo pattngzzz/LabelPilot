@@ -1,5 +1,7 @@
 import collections
 import copy
+import hashlib
+import io
 import json
 import os
 import re
@@ -11,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
+from labelpilot.augmentation import PRESETS, augmented_variants, plan_augmentation, validate_augmented_sample
 from labelpilot.exporting import export_project, plan_splits, preview_export
 from labelpilot import model_files
 from labelpilot import server
@@ -155,6 +158,379 @@ def test_grouped_split_requires_known_and_sufficient_groups():
     rows[0]["source_group"] = "video-b"
     _, _, counts = plan_splits(rows, options)
     assert counts == {"train": 4, "val": 1, "test": 0}
+
+@pytest.mark.parametrize("preset,copies", [(preset, 2) for preset in PRESETS] + [("all", 1), ("all", 3)])
+@pytest.mark.parametrize("format_name", ["yolo", "labelme", "coco"])
+def test_augmentation_export_train_only_and_preservation(reviewed_store, dataset, preset, copies, format_name):
+    store = reviewed_store
+    sources = {path: digest(path) for folder in dataset[1:] for path in folder.rglob("*") if path.is_file()}
+    with store.connect() as connection:
+        annotations = [tuple(row) for row in connection.execute("SELECT * FROM annotations ORDER BY item")]
+        revisions = [tuple(row) for row in connection.execute("SELECT * FROM revisions ORDER BY item, version")]
+    options = {"format": format_name, "split": {"train": 50, "val": 25, "test": 25, "seed": 42},
+               "augmentation": {"preset": preset, "copies": copies, "seed": 43}}
+    result = export_project(store, "test", options)
+    presets = list(PRESETS) if preset == "all" else [preset]
+    augmented_count = 2 * copies * len(presets)
+    total = 4 + augmented_count
+    assert (result["images"], result["original_images"], result["augmented_images"]) == (total, 4, augmented_count)
+    assert result["source_split_counts"] == {"train": 2, "val": 1, "test": 1}
+    assert result["split_counts"] == {"train": 2 + augmented_count, "val": 1, "test": 1}
+    with zipfile.ZipFile(store.home / "exports" / result["filename"]) as archive:
+        manifest = json.loads(archive.read("export_manifest.json"))
+        assert manifest["augmentation"]["scope"] == "train_only"
+        assert manifest["augmentation"]["presets"] == presets
+        assert manifest["augmentation"]["variants_per_image"] == copies * len(presets)
+        assert result["integrity_check"] == manifest["integrity_check"]
+        assert manifest["integrity_check"]["passed"] and manifest["integrity_check"]["images_checked"] == total
+        assert manifest["integrity_check"]["annotations_checked"] == sum(entry["annotation_count"] for entry in manifest["items"])
+        assert len(manifest["items"]) == len({entry["image"] for entry in manifest["items"]}) == total
+        assert len({entry["id"] for entry in manifest["items"]}) == total
+        originals = {entry["id"]: entry for entry in manifest["items"] if "augmentation" not in entry}
+        variants = [entry for entry in manifest["items"] if "augmentation" in entry]
+        assert len(variants) == augmented_count
+        for source in originals.values():
+            actual = {(entry["augmentation"]["preset"], entry["augmentation"]["variant"])
+                      for entry in variants if entry["source_id"] == source["id"]}
+            expected = {(name, index) for name in presets for index in range(1, copies + 1)} if source["split"] == "train" else set()
+            assert actual == expected
+        for entry in originals.values():
+            assert archive.read(entry["image"]) == Path(store.project("test").item(entry["id"])["path"]).read_bytes()
+        for entry in variants:
+            source = originals[entry["source_id"]]
+            assert entry["split"] == source["split"] == "train"
+            assert not entry["human_reviewed"] and entry["status"] == "augmented"
+            contents = archive.read(entry["image"])
+            assert hashlib.sha256(contents).hexdigest() == entry["sha256"]
+            with Image.open(io.BytesIO(contents)) as image:
+                image.load()
+                assert image.size == (240, 120) and image.format == "JPEG"
+            original = store.detail("test", entry["source_id"])["document"]
+            expected = copy.deepcopy(original["shapes"])
+            if entry["augmentation"]["preset"] == "horizontal":
+                for shape in expected:
+                    shape["points"] = [[240 - point[0], point[1]] for point in shape["points"]]
+            stem = Path(entry["image"]).stem
+            if format_name == "labelme":
+                document = json.loads(archive.read(f"annotations/train/{stem}.json"))
+                assert document["shapes"] == expected
+                assert document["flags"] == original["flags"]
+                if "custom_top_level" in original:
+                    assert document["custom_top_level"] == original["custom_top_level"]
+                assert document["imagePath"] == "../../" + entry["image"] and document["imageData"] is None
+                assert not document["checked"] and not document["labelpilot"]["human_reviewed"]
+                assert document["labelpilot"]["image_sha256"] == entry["sha256"]
+                assert document["labelpilot"]["augmentation"] == entry["augmentation"]
+            elif format_name == "yolo":
+                lines = archive.read(f"labels/train/{stem}.txt").decode().splitlines()
+                assert len(lines) == len(expected)
+                for line, shape in zip(lines, expected):
+                    values = line.split()
+                    xs, ys = zip(*shape["points"])
+                    assert values[0] == "0"
+                    assert list(map(float, values[1:])) == pytest.approx([
+                        (min(xs) + max(xs)) / 480, (min(ys) + max(ys)) / 240,
+                        (max(xs) - min(xs)) / 240, (max(ys) - min(ys)) / 120])
+            else:
+                document = json.loads(archive.read("annotations/train.json"))
+                image_id = next(image["id"] for image in document["images"] if image["file_name"] == entry["image"])
+                shapes = [shape for shape in document["annotations"] if shape["image_id"] == image_id]
+                assert len(shapes) == len(expected)
+                for annotation, shape in zip(shapes, expected):
+                    xs, ys = zip(*shape["points"])
+                    assert annotation["bbox"] == pytest.approx([min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)])
+        if format_name == "coco":
+            documents = [json.loads(archive.read(f"annotations/{subset}.json")) for subset in ("train", "val", "test")]
+            ids = [image["id"] for document in documents for image in document["images"]]
+            assert len(ids) == len(set(ids)) == total
+            assert [len(document["images"]) for document in documents] == [2 + augmented_count, 1, 1]
+        repeated = export_project(store, "test", options)
+        with zipfile.ZipFile(store.home / "exports" / repeated["filename"]) as other:
+            assert all(archive.read(entry["image"]) == other.read(entry["image"]) for entry in variants)
+    assert all(digest(path) == fingerprint for path, fingerprint in sources.items())
+    with store.connect() as connection:
+        assert annotations == [tuple(row) for row in connection.execute("SELECT * FROM annotations ORDER BY item")]
+        assert revisions == [tuple(row) for row in connection.execute("SELECT * FROM revisions ORDER BY item, version")]
+
+
+def test_all_augmentation_matches_independent_presets_and_seeded_split(reviewed_store):
+    options = {"format": "labelme", "split": {"train": 50, "val": 25, "test": 25, "seed": 42},
+               "augmentation": {"preset": "all", "copies": 2, "seed": 43}}
+    result = export_project(reviewed_store, "test", options)
+    with zipfile.ZipFile(reviewed_store.home / "exports" / result["filename"]) as combined:
+        manifest = json.loads(combined.read("export_manifest.json"))
+        variants = {entry["id"]: entry for entry in manifest["items"] if "augmentation" in entry}
+        for preset in PRESETS:
+            single = export_project(reviewed_store, "test", {**options, "augmentation": {**options["augmentation"], "preset": preset}})
+            with zipfile.ZipFile(reviewed_store.home / "exports" / single["filename"]) as archive:
+                single_manifest = json.loads(archive.read("export_manifest.json"))
+                for entry in single_manifest["items"]:
+                    if "augmentation" in entry:
+                        assert entry["augmentation"] == variants[entry["id"]]["augmentation"]
+                        assert combined.read(entry["image"]) == archive.read(entry["image"])
+                        annotation = f"annotations/train/{Path(entry['image']).stem}.json"
+                        assert combined.read(annotation) == archive.read(annotation)
+        changed = export_project(reviewed_store, "test", {**options, "augmentation": {**options["augmentation"], "seed": 44}})
+        with zipfile.ZipFile(reviewed_store.home / "exports" / changed["filename"]) as archive:
+            changed_manifest = json.loads(archive.read("export_manifest.json"))
+            assert {entry["id"]: entry["split"] for entry in changed_manifest["items"]} == {
+                entry["id"]: entry["split"] for entry in manifest["items"]}
+            for entry in changed_manifest["items"]:
+                if "augmentation" in entry:
+                    assert entry["augmentation"]["operations"] != variants[entry["id"]]["augmentation"]["operations"]
+
+
+@pytest.mark.parametrize("format_name", ["labelme", "coco", "yolo"])
+def test_augmentation_flip_geometry_and_pixels(store, format_name):
+    source = Path(store.project("test").item(item(store, "human")["id"])["path"])
+    with Image.new("RGB", (240, 120), "red") as image:
+        image.paste("blue", (120, 0, 240, 120))
+        image.save(source)
+    data = payload(store, "human", "reviewed")
+    data["document"]["shapes"].append({"label": "object", "shape_type": "rectangle",
+                                     "points": [[0, 0], [240, 0], [240, 120], [0, 120]]})
+    if format_name != "yolo":
+        data["document"]["shapes"].append({"label": "object", "shape_type": "polygon",
+                                         "points": [[10, 10], [80, 10], [80, 50]]})
+    store.save("test", item(store, "human")["id"], data)
+    options = {"format": format_name, "split": {"train": 100, "val": 0, "test": 0},
+               "augmentation": {"preset": "horizontal"}}
+    result = export_project(store, "test", options)
+    with zipfile.ZipFile(store.home / "exports" / result["filename"]) as archive:
+        manifest = json.loads(archive.read("export_manifest.json"))
+        variant = next(entry for entry in manifest["items"] if "augmentation" in entry)
+        with Image.open(io.BytesIO(archive.read(variant["image"]))) as image:
+            assert image.getpixel((20, 60))[2] > image.getpixel((20, 60))[0] + 100
+            assert image.getpixel((220, 60))[0] > image.getpixel((220, 60))[2] + 100
+        if format_name == "labelme":
+            document = json.loads(archive.read("annotations/train/" + Path(variant["image"]).stem + ".json"))
+            for actual, original in zip(document["shapes"], data["document"]["shapes"]):
+                expected = [[240 - point[0], point[1]] for point in original["points"]]
+                if original["shape_type"] == "rectangle" and len(expected) == 4:
+                    xs, ys = zip(*expected)
+                    expected = [[min(xs), min(ys)], [max(xs), max(ys)]]
+                assert actual["points"] == expected
+                assert actual["label"] == original["label"]
+        elif format_name == "coco":
+            document = json.loads(archive.read("annotations/train.json"))
+            polygon = document["annotations"][-1]
+            assert polygon["segmentation"] == [[230, 10, 160, 10, 160, 50]]
+            assert polygon["bbox"] == [160, 10, 70, 40] and polygon["area"] == 1400
+        else:
+            lines = archive.read("labels/train/" + Path(variant["image"]).stem + ".txt").decode().splitlines()
+            assert list(map(float, lines[-1].split()[1:])) == [0.5, 0.5, 1.0, 1.0]
+
+
+@pytest.mark.parametrize("settings", [False, [], {}, {"preset": "unknown"}, {"preset": []},
+    *({"preset": "gentle", "copies": value} for value in (False, 0, 4, 1.5, "1")),
+    *({"preset": "gentle", "seed": value} for value in (True, -1, 4294967296, 1.5, "42")),
+    {"preset": "gentle", "unknown": 1}])
+def test_invalid_augmentation_before_export(reviewed_store, settings):
+    with pytest.raises(Problem) as error:
+        export_project(reviewed_store, "test", {"split": {"train": 100, "val": 0, "test": 0}, "augmentation": settings})
+    assert error.value.status == 422
+    assert not (reviewed_store.home / "exports").exists()
+
+
+@pytest.mark.parametrize("extra", [{"split": None}, {"include_images": False}, {"reviewed_only": False}])
+def test_augmentation_requires_split_images_and_review(reviewed_store, extra):
+    options = {"split": {"train": 100, "val": 0, "test": 0}, "augmentation": {"preset": "gentle"}, **extra}
+    with pytest.raises(Problem) as error:
+        export_project(reviewed_store, "test", options)
+    assert error.value.status == 422
+    assert not (reviewed_store.home / "exports").exists()
+
+
+def test_augmentation_seed_and_copy_prefix_stability(store):
+    current = store.detail("test", item(store, "human")["id"])
+    source = store.project("test").item(current["item"]["id"])["path"]
+    options = {"split": {"train": 100, "val": 0, "test": 0}, "augmentation": {"preset": "gentle", "copies": 3}}
+    settings = plan_augmentation(options)
+    before = copy.deepcopy(current["document"])
+    variants = list(augmented_variants(source, before, "human", current["image_sha256"], settings))
+    fewer = list(augmented_variants(source, before, "human", current["image_sha256"], {**settings, "copies": 1}))
+    changed = list(augmented_variants(source, before, "human", current["image_sha256"], {**settings, "seed": 43}))
+    assert before == current["document"] and variants[0] == fewer[0]
+    assert [entry[3]["operations"] for entry in variants] != [entry[3]["operations"] for entry in changed]
+    assert len({entry[1] for entry in variants}) == 3
+
+
+@pytest.mark.parametrize("preset,multiplier", [("gentle", 1500), ("all", 400)])
+def test_augmentation_limit_and_failed_decode_cleanup(reviewed_store, monkeypatch, preset, multiplier):
+    options = {"split": {"train": 100, "val": 0, "test": 0}, "augmentation": {"preset": preset, "copies": 3}}
+    listing = reviewed_store.listing
+    def large_listing(*args, **kwargs):
+        rows = listing(*args, **kwargs)["items"] * multiplier
+        return {"items": rows, "filtered": len(rows)}
+
+    monkeypatch.setattr(reviewed_store, "listing", large_listing)
+    with pytest.raises(Problem, match="20000"):
+        export_project(reviewed_store, "test", options)
+    assert not (reviewed_store.home / "exports").exists()
+    monkeypatch.setattr(reviewed_store, "listing", listing)
+    def fail_decode(*args, **kwargs):
+        raise OSError("simulated augmentation decode failure")
+    monkeypatch.setattr("labelpilot.exporting.augmented_variants", fail_decode)
+    with pytest.raises(OSError, match="simulated"):
+        export_project(reviewed_store, "test", options)
+    assert not list((reviewed_store.home / "exports").glob("*.zip"))
+
+
+@pytest.mark.parametrize("corruption", ["shift", "missing", "label"])
+@pytest.mark.parametrize("preset", ["horizontal", "all"])
+def test_augmented_box_shift_missing_or_label_change_aborts_export(store, monkeypatch, corruption, preset):
+    import labelpilot.exporting as exporting
+
+    store.save("test", item(store, "human")["id"], payload(store, "human", "reviewed"))
+    source_generator = exporting.augmented_variants
+    def corrupted_variants(*args, **kwargs):
+        for index, contents, augmented, provenance in source_generator(*args, **kwargs):
+            if augmented["shapes"] and provenance["preset"] == "horizontal":
+                if corruption == "shift":
+                    augmented["shapes"][0]["points"][0][0] += 1
+                elif corruption == "missing":
+                    augmented["shapes"].pop()
+                else:
+                    augmented["shapes"][0]["label"] = "missing-class"
+            yield index, contents, augmented, provenance
+
+    monkeypatch.setattr(exporting, "augmented_variants", corrupted_variants)
+    with pytest.raises(Problem, match="对象数量|标签、坐标"):
+        export_project(store, "test", {"split": {"train": 100, "val": 0, "test": 0},
+                                        "augmentation": {"preset": preset}})
+    assert not list((store.home / "exports").glob("*.zip"))
+
+
+@pytest.mark.parametrize("format_name", ["labelme", "coco", "yolo"])
+def test_augmented_serialized_annotation_corruption_aborts_export(store, monkeypatch, format_name):
+    import labelpilot.exporting as exporting
+
+    store.save("test", item(store, "human")["id"], payload(store, "human", "reviewed"))
+    original_write = exporting.write_annotation
+    def corrupted_write(archive, selected_format, *args, **kwargs):
+        original_write(archive, selected_format, *args, **kwargs)
+        image_name = args[2]
+        subset = args[3]
+        split_config = args[4]
+        if "__aug_" not in image_name:
+            return
+        suffix = f"/{subset}" if split_config else ""
+        base = Path(image_name).stem
+        if selected_format == "labelme":
+            archive.writestr(f"annotations{suffix}/{base}.json", "{}")
+        elif selected_format == "yolo":
+            archive.writestr(f"labels{suffix}/{base}.txt", "")
+        else:
+            document = args[5][subset]
+            if document["annotations"]:
+                document["annotations"].pop()
+
+    monkeypatch.setattr(exporting, "write_annotation", corrupted_write)
+    with pytest.raises(Problem, match="回读校验失败"):
+        export_project(store, "test", {"format": format_name, "split": {"train": 100, "val": 0, "test": 0},
+                                        "augmentation": {"preset": "horizontal"}})
+    assert not list((store.home / "exports").glob("*.zip"))
+
+
+@pytest.mark.parametrize("corruption", ["dimensions", "undecodable", "checksum", "extra", "attributes", "operation"])
+def test_augmented_sample_integrity_rejects_corruption(store, corruption):
+    current = store.detail("test", item(store, "human")["id"])
+    source = current["document"]
+    settings = plan_augmentation({"split": {}, "augmentation": {"preset": "horizontal"}})
+    path = store.project("test").item(current["item"]["id"])["path"]
+    _, contents, augmented, provenance = next(augmented_variants(path, source, "human", current["image_sha256"], settings))
+    if corruption == "dimensions":
+        with io.BytesIO() as buffer:
+            Image.new("RGB", (120, 60)).save(buffer, format="JPEG")
+            contents = buffer.getvalue()
+        augmented["labelpilot"]["image_sha256"] = hashlib.sha256(contents).hexdigest()
+    elif corruption == "undecodable":
+        contents = b"invalid image"
+    elif corruption == "checksum":
+        augmented["labelpilot"]["image_sha256"] = "incorrect"
+    elif corruption == "extra":
+        augmented["shapes"].append(copy.deepcopy(augmented["shapes"][0]))
+    elif corruption == "attributes":
+        augmented["shapes"][0]["attributes"]["occlusion"] = "incorrect"
+    else:
+        provenance["operations"]["horizontal_flip"] = False
+    with pytest.raises(Problem, match="已中止导出"):
+        validate_augmented_sample(source, augmented, contents, settings, provenance)
+
+
+@pytest.mark.parametrize("preset", ["gentle", "all"])
+def test_augmentation_missing_variant_aborts_export(store, monkeypatch, preset):
+    store.save("test", item(store, "human")["id"], payload(store, "human", "reviewed"))
+    monkeypatch.setattr("labelpilot.exporting.augmented_variants", lambda *args, **kwargs: iter(()))
+    with pytest.raises(Problem, match="副本数量缺失"):
+        export_project(store, "test", {"split": {"train": 100, "val": 0, "test": 0},
+                                        "augmentation": {"preset": preset}})
+    assert not list((store.home / "exports").glob("*.zip"))
+
+
+@pytest.mark.parametrize("preset", PRESETS)
+@pytest.mark.parametrize("seed", [0, 1, 42, 4294967295])
+def test_augmented_raster_objects_remain_aligned_with_boxes(tmp_path, preset, seed):
+    source = tmp_path / "asymmetric.png"
+    with Image.new("RGB", (101, 79), "black") as image:
+        image.paste("white", (13, 11, 41, 32))
+        image.paste("white", (57, 45, 93, 71))
+        image.save(source)
+    document = {"imageWidth": 101, "imageHeight": 79, "shapes": [
+        {"label": "Raw_Label-1", "shape_type": "rectangle", "points": [[13, 11], [41, 32]]},
+        {"label": "Raw_Label-2", "shape_type": "rectangle", "points": [[57, 45], [93, 45], [93, 71], [57, 71]]}]}
+    before = copy.deepcopy(document)
+    settings = plan_augmentation({"split": {}, "augmentation": {"preset": preset, "copies": 3, "seed": seed}})
+    for _, contents, augmented, provenance in augmented_variants(source, document, "asymmetric", digest(source), settings):
+        assert validate_augmented_sample(document, augmented, contents, settings, provenance) == 2
+        assert [shape["label"] for shape in augmented["shapes"]] == ["Raw_Label-1", "Raw_Label-2"]
+        with Image.open(io.BytesIO(contents)) as image:
+            mask = image.convert("L").point(lambda value: 255 if value > 100 else 0)
+            for index, shape in enumerate(augmented["shapes"]):
+                xs, ys = zip(*shape["points"])
+                upper, lower = ((0, 39) if index == 0 else (39, 79))
+                raster_bounds = mask.crop((0, upper, 101, lower)).getbbox()
+                assert raster_bounds is not None
+                raster_bounds = [raster_bounds[0], raster_bounds[1] + upper, raster_bounds[2], raster_bounds[3] + upper]
+                expected = [min(xs), min(ys), max(xs), max(ys)]
+                assert max(abs(actual - target) for actual, target in zip(raster_bounds, expected)) <= 1
+    assert document == before
+
+
+def test_augmentation_catalog_api(store):
+    with TestClient(create_app(store.home)) as client:
+        response = client.get("/api/augmentation-presets")
+        assert response.status_code == 200
+        catalog = response.json()["presets"]
+        assert {preset["id"] for preset in catalog} == {*PRESETS, "all"}
+        assert all(preset["preset_count"] == (len(PRESETS) if preset["id"] == "all" else 1) for preset in catalog)
+        assert response.json()["max_copies"] == 3
+        assert response.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.parametrize("mode", ["RGBA", "P"])
+def test_augmentation_transparency_uses_documented_white_background(tmp_path, mode):
+    source = tmp_path / "transparent.png"
+    with Image.new("RGBA", (20, 10), (255, 0, 0, 0)) as image:
+        if mode == "P":
+            image = image.convert("P")
+        image.save(source)
+    document = {"imageWidth": 20, "imageHeight": 10, "shapes": []}
+    settings = plan_augmentation({"split": {}, "augmentation": {"preset": "horizontal"}})
+    variant = next(augmented_variants(source, document, "transparent", digest(source), settings))
+    with Image.open(io.BytesIO(variant[1])) as image:
+        assert min(image.getpixel((5, 5))) > 200
+    assert variant[2]["shapes"] == [] and not variant[2]["checked"]
+
+
+def test_augmented_yolo_still_rejects_polygons(store):
+    data = payload(store, "human", "reviewed")
+    data["document"]["shapes"][0].update(shape_type="polygon", points=[[10, 10], [80, 10], [80, 50]])
+    store.save("test", item(store, "human")["id"], data)
+    with pytest.raises(Problem, match="多边形"):
+        export_project(store, "test", {"split": {"train": 100, "val": 0, "test": 0},
+                                        "augmentation": {"preset": "horizontal"}})
+    assert not list((store.home / "exports").glob("*.zip"))
 
 
 @pytest.mark.parametrize("ratios,count,expected", [
@@ -375,6 +751,93 @@ def test_project_registration_and_duplicate_names(store, dataset):
     assert registered["id"] in Store(store.home).projects
     with pytest.raises(Problem, match="独立"):
         store.register({"name": "Unsafe", "image_root": str(store.home), "classes": ["object"]})
+
+
+def test_selected_image_files_persist_rescan_and_preserve_annotations(store, dataset):
+    images, native = dataset[1:3]
+    nested = images / "中文图片"
+    nested.mkdir()
+    extra = nested / "New_Target.PNG"
+    Image.new("RGB", (240, 120)).save(extra)
+    sources = {path: digest(path) for folder in dataset[1:] for path in folder.rglob("*") if path.is_file()}
+    before = store.detail("test", item(store, "human")["id"])
+    registered = store.register({"name": "Selected", "image_root": str(images),
+                                 "image_files": [str(images / "human.jpg"), "中文图片/New_Target.PNG"],
+                                 "annotation_root": str(native), "classes": ["object", "New_Target"]})
+    project_id = registered["id"]
+    assert registered["total"] == 2
+    selected = store.project(project_id)
+    assert {entry["relative"] for entry in selected.items} == {"human.jpg", "中文图片/New_Target.PNG"}
+    assert set(selected.config["image_files"]) == {"human.jpg", "中文图片/New_Target.PNG"}
+    human = next(entry for entry in selected.items if entry["photo_id"] == "human")
+    current = store.detail(project_id, human["id"])
+    assert current["status"] == "imported"
+    saved = store.save(project_id, human["id"], {**current, "expected_version": current["version"], "status": "reviewed"})
+    Image.new("RGB", (240, 120)).save(images / "not_selected.jpg")
+    assert store.rescan(project_id)["total"] == 2
+    reloaded = Store(store.home)
+    assert reloaded.project(project_id).summary()["total"] == 2
+    assert reloaded.detail(project_id, human["id"])["document"] == saved["document"]
+    assert reloaded.detail(project_id, human["id"])["status"] == "reviewed"
+    assert reloaded.detail("test", item(reloaded, "human")["id"]) == before
+    assert all(digest(path) == fingerprint for path, fingerprint in sources.items())
+
+
+@pytest.mark.parametrize("selected", [False, "human.jpg", [], ["human.jpg"] * 10001,
+    [False], [""], ["\x00"], ["missing.jpg"], ["."], ["human.jpg", "./human.jpg"]])
+def test_invalid_selected_images_do_not_register(store, dataset, selected):
+    before = store.registry_path.read_bytes()
+    with pytest.raises(Problem):
+        store.register({"name": "Invalid", "image_root": str(dataset[1]), "image_files": selected, "classes": ["object"]})
+    assert store.registry_path.read_bytes() == before
+    assert set(store.projects) == {"test"}
+
+
+def test_selected_images_reject_outside_unsupported_and_manifest_conflict(store, dataset):
+    images = dataset[1]
+    outside = images.parent / "outside.jpg"
+    Image.new("RGB", (240, 120)).save(outside)
+    unsupported = images / "notes.txt"
+    unsupported.write_text("not an image", encoding="utf8")
+    before = store.registry_path.read_bytes()
+    for files in ([str(outside)], ["../outside.jpg"], ["notes.txt"]):
+        with pytest.raises(Problem):
+            store.register({"name": "Invalid", "image_root": str(images), "image_files": files, "classes": ["object"]})
+    with pytest.raises(Problem, match="任务清单"):
+        store.register({"name": "Conflict", "image_root": str(images), "image_files": ["human.jpg"],
+                        "manifest_path": str(images / "manifest.json"), "classes": ["object"]})
+    assert store.registry_path.read_bytes() == before
+
+
+def test_image_browser_api_filters_and_preserves_source_without_existing_project(dataset):
+    home, images, native, predictions = dataset
+    folder = images / "中文目录"
+    folder.mkdir()
+    Image.new("RGB", (30, 20)).save(folder / "选择.PNG")
+    (images / "ignore.pt").write_bytes(b"do not load")
+    (images / "ignore.txt").write_text("not an image", encoding="utf8")
+    (home / "projects.json").write_text("[]", encoding="utf8")
+    app = create_app(home)
+    sources = {path: digest(path) for root in (images, native, predictions) for path in root.rglob("*") if path.is_file()}
+    with TestClient(app) as client:
+        headers = {"X-LabelPilot-Token": app.state.token}
+        assert client.post("/api/images/browse", json={"path": str(images)}).status_code == 403
+        assert client.post("/api/images/browse", json={"path": str(images)}, headers={**headers, "Origin": "https://evil.example"}).status_code == 403
+        listing = client.post("/api/images/browse", json={"path": str(images)}, headers=headers).json()
+        assert listing["path"] == str(images)
+        assert listing["parent"] == str(images.parent)
+        assert listing["directories"] == [{"name": "中文目录", "path": str(folder)}]
+        assert {entry["name"] for entry in listing["files"]} == {"human.jpg", "model.jpg", "empty.jpg", "another.jpg"}
+        assert listing["roots"] and not listing["partial"]
+        nested = client.post("/api/images/browse", json={"path": str(folder)}, headers=headers).json()
+        assert [entry["name"] for entry in nested["files"]] == ["选择.PNG"]
+        assert client.post("/api/images/browse", json={}, headers=headers).status_code == 200
+        for value in ("", "relative/path", False, [], str(images / "human.jpg"), str(images / "missing")):
+            assert client.post("/api/images/browse", json={"path": value}, headers=headers).status_code == 422
+        response = client.post("/api/projects", json={"name": "Chosen", "image_root": str(folder),
+                                                     "image_files": ["选择.PNG"], "classes": ["Raw_Label"]}, headers=headers)
+        assert response.status_code == 200 and response.json()["total"] == 1
+    assert all(digest(path) == fingerprint for path, fingerprint in sources.items())
 
 
 def test_original_label_names_not_translated(store, dataset):

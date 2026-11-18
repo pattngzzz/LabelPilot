@@ -24,6 +24,10 @@ dialog.model-browser { width: min(760px, calc(100vw - 24px)); }
 .model-browser-toolbar span { flex: 1; font-size: 11px; color: var(--muted); }
 #modelBrowserError { font-size: 11px; line-height: 1.6; }
 #modelBrowserError:empty { display: none; }
+#imageBrowserError { font-size: 11px; line-height: 1.6; }
+#imageBrowserError:empty { display: none; }
+#newProjectButton { padding: 7px 10px; white-space: nowrap; font-size: 11px; }
+.image-file-row[aria-pressed="true"] { background: #9770ff30; outline: 1px solid #9770ff66; outline-offset: -1px; }
 .model-browser-list { height: min(390px, 42dvh); overflow: auto; margin-top: 12px; border: 1px solid var(--border); border-radius: 7px; }
 .model-file-row { display: flex; width: 100%; gap: 10px; align-items: center; padding: 12px; background: transparent; border-bottom: 1px solid var(--border); text-align: left; }
 .model-file-row:hover, .model-file-row:focus-visible { background: #9770ff20; }
@@ -181,3 +185,8 @@ dialog.export-dialog[open] { display: flex; flex-direction: column; }
   .topbar select { flex: 1 1 90px; }
   .topbar-right { flex: 1 0 100%; justify-content: flex-end; }
 }
+
+.export-split:disabled { opacity: .5; }
+.export-split p { margin-top: 10px; }
+#exportSplitSummary[data-invalid="true"], #augmentationSummary[data-invalid="true"] { color: var(--red, #f4949a); }
+@media (max-width: 480px) { .export-ratios { grid-template-columns: 1fr; } }

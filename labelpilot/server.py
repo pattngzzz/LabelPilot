@@ -13,10 +13,11 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from .augmentation import augmentation_presets
 from .exporting import export_project, preview_export
 from .inference import Inference, Jobs
 from . import model_files
-from .store import Problem, Store
+from .store import IMAGE_SUFFIXES, Problem, Store
 from .training import TrainingJobs, has_training_dependencies
 
 
@@ -100,6 +101,11 @@ def create_app(home=None):
         if not isinstance(payload.get("image_root"), str) or not payload["image_root"].strip():
             raise Problem("请填写图片目录", 422)
         return store.register(payload)
+
+    @app.post("/api/images/browse")
+    def browse_images(payload: dict):
+        path = payload.get("path")
+        return model_files.browse(str(Path.home()) if path is None else path, IMAGE_SUFFIXES)
 
     @app.post("/api/projects/{project_id}/model")
     def model(project_id: str, payload: dict):
@@ -219,6 +225,10 @@ def create_app(home=None):
     @app.post("/api/projects/{project_id}/export/preview")
     def export_preview(project_id: str, payload: dict):
         return preview_export(store, project_id, payload)
+
+    @app.get("/api/augmentation-presets")
+    def export_augmentation_presets():
+        return augmentation_presets()
 
     @app.post("/api/projects/{project_id}/export")
     def export(project_id: str, payload: dict):

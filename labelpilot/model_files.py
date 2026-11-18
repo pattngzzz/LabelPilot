@@ -46,7 +46,7 @@ def weight(entry):
     return {"name": entry.name, "path": str(Path(entry.path)), "size": info.st_size}
 
 
-def browse(path):
+def browse(path, suffixes=(".pt",)):
     path = directory(path)
     folders, files = [], []
     partial = False
@@ -61,7 +61,7 @@ def browse(path):
                         continue
                     if entry.is_dir(follow_symlinks=False):
                         folders.append({"name": entry.name, "path": str(Path(entry.path))})
-                    elif entry.name.lower().endswith(".pt") and entry.is_file(follow_symlinks=False):
+                    elif Path(entry.name).suffix.lower() in suffixes and entry.is_file(follow_symlinks=False):
                         files.append(weight(entry))
                 except OSError:
                     partial = True

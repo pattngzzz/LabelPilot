@@ -19,6 +19,10 @@ const exportSplitHints = {
   directory:"同一原图文件夹的图片会进入同一个集合。若同源图分散在不同文件夹，请使用任务清单分组。",
   image:"逐张随机分配。同一视频的相邻帧或重复图片可能跨集。"
 };
+
+const imageBrowser = {mode:"folder",listing:null,selected:new Set(),loading:false,valid:false,sequence:0};
+const projectImages = {files:[]};
+const exportAugmentation = {presets:[],maxCopies:3,loaded:false};
 let searchTimer;
 let jobTimer;
 let trainingTimer;
@@ -81,7 +85,7 @@ async function initialize() {
   for (const failure of response.errors) toast(`${failure.name}：${failure.error}`, true);
   element("projectSelect").innerHTML = state.projects.map(project => `<option value="${escapeHtml(project.id)}">${escapeHtml(project.name)}</option>`).join("");
   if (!state.projects.length) {
-    showCanvasMessage("接入你的第一个数据集", "点击左上角 +，选择本机图片和标注目录");
+    showCanvasMessage("接入你的第一个数据集", "点击左上角“选择图片”，选择本机图片文件或文件夹");
     element("projectDialog").showModal();
     return;
   }
@@ -739,6 +743,68 @@ function chooseModelFile(path) {
   element("modelBrowserDialog").close();
   element("modelPath").focus({preventScroll:true});
 }
+function updateImageSelection() {
+  const files=projectImages.files;
+  element("newImageRoot").title=element("newImageRoot").value;
+  element("newImageSelection").textContent=files.length ? `仅导入已选 ${files.length} 张图片：${files.slice(0,3).join("、")}${files.length>3 ? " 等" : ""}。重新扫描不会加入其他图片。` : "文件夹模式：读取目录及子目录内的图片；文件模式：仅导入明确选中的图片。";
+  element("useEntireImageFolder").hidden=!files.length;
+}
+function updateImageBrowserControls() {
+  const {listing,loading,valid,selected,mode}=imageBrowser;
+  for(const id of ["imageBrowserDrive","imageBrowserPath","imageBrowserGo"])element(id).disabled=loading;
+  element("imageBrowserUp").disabled=loading || !listing?.parent;
+  element("confirmImageSelection").disabled=loading || !valid || (mode==="file" && !selected.size);
+  element("confirmImageSelection").textContent=mode==="folder" ? "选择此文件夹" : `使用所选图片（${selected.size} 张）`;
+  element("imageBrowserList").querySelectorAll("button").forEach(button=>{button.disabled=loading || !valid || (mode==="folder" && button.hasAttribute("data-image-file"));});
+  if(valid)element("imageBrowserCount").textContent=`${listing.directories.length} 个文件夹 · ${listing.files.length} 张图片${mode==="file" ? ` · 已选 ${selected.size} 张` : ""}`;
+}
+function renderImageBrowser() {
+  const listing=imageBrowser.listing;
+  element("imageBrowserPath").value=listing.path;
+  element("imageBrowserPath").title=listing.path;
+  element("imageBrowserDrive").innerHTML='<option value="">磁盘位置</option>'+listing.roots.map(path=>`<option value="${escapeHtml(path)}">${escapeHtml(path)}</option>`).join("");
+  const folders=listing.directories.map(item=>`<button type="button" class="model-file-row folder" data-image-directory="${escapeHtml(item.path)}" title="${escapeHtml(item.path)}"><b>▸</b><span>${escapeHtml(item.name)}</span><small>打开文件夹</small></button>`).join("");
+  const files=listing.files.map(item=>`<button type="button" class="model-file-row image-file-row" data-image-file="${escapeHtml(item.path)}" aria-pressed="false" title="${escapeHtml(item.path)}"><b>图片</b><span>${escapeHtml(item.name)}</span><small>${(item.size/1024/1024).toFixed(2)} MB${imageBrowser.mode==="file" ? " · 点击勾选" : ""}</small></button>`).join("");
+  element("imageBrowserList").innerHTML=folders+files || '<p class="empty-list">此处没有子文件夹或支持的图片。</p>';
+  element("imageBrowserError").textContent=listing.partial ? "当前列表可能不完整（权限或数量上限）；可进入更具体的文件夹继续选择。" : "";
+}
+async function loadImageDirectory(path) {
+  const sequence=++imageBrowser.sequence;
+  imageBrowser.loading=true;imageBrowser.valid=false;
+  element("imageBrowserError").textContent="";
+  element("imageBrowserCount").textContent="正在读取本机图片文件夹…";
+  updateImageBrowserControls();
+  try {
+    const listing=await api("/api/images/browse","POST",{path});
+    if(sequence!==imageBrowser.sequence || !element("imageBrowserDialog").open)return;
+    imageBrowser.listing=listing;imageBrowser.selected.clear();imageBrowser.valid=true;
+    renderImageBrowser();
+  } catch(error) {
+    if(sequence!==imageBrowser.sequence)return;
+    element("imageBrowserError").textContent=error.message;
+    element("imageBrowserCount").textContent="未能读取，请修改路径或返回上一级；尚未改变所选图片。";
+  } finally {if(sequence===imageBrowser.sequence){imageBrowser.loading=false;updateImageBrowserControls();}}
+}
+async function openImageBrowser(mode) {
+  if(state.busy)return;
+  imageBrowser.mode=mode;imageBrowser.listing=null;imageBrowser.selected.clear();imageBrowser.valid=false;
+  element("imageBrowserTitle").textContent=mode==="folder" ? "选择待标注图片文件夹" : "选择待标注图片（可多选）";
+  element("imageBrowserHelp").textContent=mode==="folder" ? "进入目标目录后点击“选择此文件夹”，导入其中及子目录内的图片。仅引用路径，不上传或修改源文件。" : "点击图片勾选或取消，可选择同一文件夹内的多张图片；切换文件夹会清空本次勾选。支持 JPG、JPEG、PNG、BMP、WEBP、TIF、TIFF。";
+  element("imageBrowserList").innerHTML="";
+  element("imageBrowserDrive").innerHTML='<option value="">磁盘位置</option>';
+  element("imageBrowserPath").value="";
+  element("imageBrowserDialog").showModal();
+  await loadImageDirectory(element("newImageRoot").value.trim() || state.project?.image_root || null);
+}
+function confirmImageSelection() {
+  if(imageBrowser.loading || !imageBrowser.valid || (imageBrowser.mode==="file" && !imageBrowser.selected.size))return;
+  const listing=imageBrowser.listing;
+  element("newImageRoot").value=listing.path;
+  projectImages.files=imageBrowser.mode==="file" ? listing.files.filter(item=>imageBrowser.selected.has(item.path)).map(item=>item.name) : [];
+  updateImageSelection();
+  element("imageBrowserDialog").close();
+  element("newImageRoot").focus({preventScroll:true});
+}
 function openModelDialog() {
   if(!state.project)return;
   element("modelPath").value=state.project.model_path;
@@ -831,6 +897,49 @@ function setExportPreviewStatus(message, error=false) {
   status.dataset.error = String(error);
 }
 
+function exportAugmentationOptions() {
+  const preset = exportAugmentation.presets.find(item => item.id === element("augmentationPreset").value);
+  for (const id of ["augmentationCopies", "augmentationSeed"]) element(id).disabled = !preset;
+  element("augmentationDescription").textContent = preset?.description || "不生成额外图片。";
+  const count = preset?.preset_count || 1;
+  element("augmentationCopiesLabel").textContent = count > 1 ? "每张训练图片、每种方案额外生成" : "每张训练图片额外生成";
+  const summary = element("augmentationSummary");
+  summary.textContent = "";
+  summary.dataset.invalid = "false";
+  if (!preset) return null;
+  const copies = element("augmentationCopies").valueAsNumber;
+  const seed = element("augmentationSeed").valueAsNumber;
+  let issue;
+  if (!element("splitDataset").checked) issue = "增强需先划分数据集。仅训练可设为 100 / 0 / 0。";
+  else if (!element("includeImages").checked) issue = "数据增强必须勾选包含图片。";
+  else if (!element("reviewedOnly").checked) issue = "数据增强仅支持已人工确认的标注。";
+  else if (!Number.isInteger(copies) || copies < 1 || copies > exportAugmentation.maxCopies) issue = `额外生成数量必须为 1 到 ${exportAugmentation.maxCopies} 的整数。`;
+  else if (!Number.isInteger(seed) || seed < 0 || seed > 4294967295) issue = "增强种子必须在 0 到 4294967295 之间。";
+  if (issue) {
+    summary.textContent = issue;
+    summary.dataset.invalid = "true";
+    throw new Error(issue);
+  }
+  const prefix = count > 1 ? `${count} 种方案分别生成，每方案 ${copies} 张。` : "";
+  summary.textContent = `${prefix}每张训练图额外生成 ${copies * count} 张，含原图共 ${1 + copies * count} 张（${1 + copies * count} 倍）。`;
+  return {preset:preset.id, copies, seed};
+}
+
+async function loadAugmentationCatalog() {
+  if (exportAugmentation.loaded) return;
+  try {
+    const catalog = await api("/api/augmentation-presets");
+    exportAugmentation.presets = catalog.presets;
+    exportAugmentation.maxCopies = catalog.max_copies;
+    exportAugmentation.loaded = true;
+    element("augmentationPreset").append(...catalog.presets.map(item => new Option(item.name, item.id)));
+    element("augmentationCopies").max = catalog.max_copies;
+    element("augmentationPreset").disabled = false;
+  } catch (error) {
+    element("augmentationDescription").textContent = `增强方案加载失败。${error.message}`;
+  }
+}
+
 function renderExportPreview(data, options) {
   const counts = data.split_counts;
   const configuredSplits = Object.keys(exportSplitLabels);
@@ -839,6 +948,7 @@ function renderExportPreview(data, options) {
   if (data.excluded) notes.push(`${data.excluded} 张未纳入`);
   if (data.unreviewed) notes.push(`${data.unreviewed} 张待审核`);
   if (data.group_count) notes.push(`${data.group_count} 个分组`);
+  if (data.augmented_images) notes.push(`训练集将额外生成 ${data.augmented_images} 张增强图`);
   if (state.dirty) notes.push("当前画布有未保存的修改，预检使用已保存版本");
   setExportPreviewStatus(notes.join(" · "));
 
@@ -921,8 +1031,12 @@ function updateExportPreview() {
   summary.textContent = "";
   summary.hidden = true;
 
+  let augmentation;
+  try { augmentation = exportAugmentationOptions(); }
+  catch (error) { setExportPreviewStatus(error.message, true); return; }
+
   const options = {format:element("exportFormat").value, batch:element("exportBatch").value,
-    reviewed_only:element("reviewedOnly").checked, include_images:element("includeImages").checked, clean, split};
+    reviewed_only:element("reviewedOnly").checked, include_images:element("includeImages").checked, clean, split, augmentation};
   const url = projectUrl("/export");
   setExportPreviewStatus(clean ? "正在读取原图并检查重复和标注异常…" : "正在统计本次导出的标注…");
   exportPreview.timer = setTimeout(async () => {
@@ -938,19 +1052,22 @@ function updateExportPreview() {
   }, 150);
 }
 
-function openExportDialog(clean=false) {
+async function openExportDialog(clean=false) {
   if (!state.project) return;
   if (exportPreview.running) return toast("正在生成上一次的导出包");
   element("exportResult").textContent = "";
   element("cleanDataset").checked = clean;
   if (clean) {
+    element("augmentationPreset").value = "none";
     element("exportFormat").value = "labelme";
     element("exportBatch").value = filters().batch;
     element("includeImages").checked = true;
     element("splitDataset").checked = false;
   }
   element("exportDialog").showModal();
+  element("exportDialog").querySelector(".dialog-body").scrollTop = 0;
   updateExportPreview();
+  await loadAugmentationCatalog();
 }
 
 const trainingStatuses = {preparing:"准备清洗版数据", running:"训练中", cancelling:"正在停止", cancelled:"已停止",
@@ -1062,7 +1179,9 @@ async function exportDataset() {
     const result=await api(plan.url, "POST", {...plan.options, preview_token:plan.data.preview_token});
     const counts=result.split_counts;
     const summary=counts ? `训练 ${counts.train} 张 / 验证 ${counts.val} 张 / 测试 ${counts.test} 张。` : "未划分数据集。";
-    status.innerHTML=`<p class="muted">已导出 ${result.images} 张。${summary}<a href="${escapeHtml(result.url)}" download>再次下载 ZIP</a></p>`;
+    const augmented = result.augmented_images ? `原图 ${result.original_images} 张，训练增强 ${result.augmented_images} 张。` : "";
+    const verified = result.integrity_check?.passed ? "标注完整性校验通过。" : "";
+    status.innerHTML=`<p class="muted">已导出 ${result.images} 张。${summary}${augmented}${verified}<a href="${escapeHtml(result.url)}" download>再次下载 ZIP</a></p>`;
     const link=document.createElement("a");link.href=result.url;link.download=result.filename;document.body.append(link);link.click();link.remove();
     toast(`已生成 ${result.images} 张数据的导出包`);
   } catch (error) {
@@ -1078,10 +1197,11 @@ async function exportDataset() {
   }
 }
 async function createProject() {
-  if(state.busy)return;
+  if(state.busy || !await ensureSaved())return;
   element("createProject").disabled=true;
   try{
     const project=await api("/api/projects","POST",{name:element("newProjectName").value.trim(),image_root:element("newImageRoot").value.trim(),
+      ...(projectImages.files.length ? {image_files:projectImages.files} : {}),
       annotation_root:element("newAnnotationRoot").value.trim(),preannotation_root:element("newPreannotationRoot").value.trim(),
       classes:element("newClasses").value.split(/\r?\n/).map(name=>name.trim()).filter(Boolean),class_map_path:element("newClassMap").value.trim(),
       model_path:element("newModelPath").value.trim(),manifest_path:element("newManifest").value.trim()});
@@ -1194,10 +1314,11 @@ listen("jobsList","click",async event=>{const button=event.target.closest("[data
 for (const id of ["railExport", "exportButton"]) listen(id, "click", () => openExportDialog());
 listen("cleanButton", "click", () => openExportDialog(true));
 for (const id of ["exportFormat", "exportBatch", "reviewedOnly", "includeImages", "cleanDataset", "splitDataset",
-  "exportSplitUnit", "splitTrain", "splitVal", "splitTest", "splitSeed"]) listen(id, "input", () => {
+  "exportSplitUnit", "splitTrain", "splitVal", "splitTest", "splitSeed", "augmentationPreset", "augmentationCopies", "augmentationSeed"]) listen(id, "input", () => {
   element("exportResult").textContent = "";
   updateExportPreview();
 });
+listen("augmentationPreset", "change", updateExportPreview);
 listen("refreshExportPreview", "click", updateExportPreview);
 listen("exportCleaningExamples", "click", async event => {
   const button = event.target.closest("[data-clean-item]");
@@ -1243,6 +1364,28 @@ listen("trainingRuns", "click", async event => {
   } finally { use.disabled = false; }
 });
 listen("newProjectButton","click",()=>element("projectDialog").showModal());listen("createProject","click",createProject);
+listen("chooseImageFiles","click",()=>openImageBrowser("file"));
+listen("chooseImageFolder","click",()=>openImageBrowser("folder"));
+listen("newImageRoot","input",()=>{projectImages.files=[];updateImageSelection();});
+listen("useEntireImageFolder","click",()=>{projectImages.files=[];updateImageSelection();});
+element("imageBrowserPathForm").addEventListener("submit",event=>{event.preventDefault();if(!imageBrowser.loading)loadImageDirectory(element("imageBrowserPath").value.trim());});
+listen("imageBrowserDrive","change",event=>{if(event.target.value)return loadImageDirectory(event.target.value);});
+listen("imageBrowserUp","click",()=>loadImageDirectory(imageBrowser.listing.parent));
+listen("imageBrowserList","click",event=>{
+  if(imageBrowser.loading || !imageBrowser.valid)return;
+  const folder=event.target.closest("[data-image-directory]");
+  if(folder)return loadImageDirectory(folder.dataset.imageDirectory);
+  const file=event.target.closest("[data-image-file]");
+  if(!file || imageBrowser.mode!=="file")return;
+  const path=file.dataset.imageFile;
+  if(imageBrowser.selected.has(path))imageBrowser.selected.delete(path);
+  else {if(imageBrowser.selected.size>=10000)throw new Error("单次最多选择 10000 张图片");imageBrowser.selected.add(path);}
+  file.setAttribute("aria-pressed",String(imageBrowser.selected.has(path)));
+  updateImageBrowserControls();
+});
+listen("confirmImageSelection","click",confirmImageSelection);
+listen("cancelImageBrowser","click",()=>element("imageBrowserDialog").close());
+element("imageBrowserDialog").addEventListener("close",()=>{if(element("imageBrowserDialog").open)return;imageBrowser.sequence++;imageBrowser.loading=false;imageBrowser.valid=false;});
 listen("historyButton","click",showHistory);listen("historyList","click",event=>{const button=event.target.closest("[data-restore]");if(button)return restoreRevision(Number(button.dataset.restore));});
 for(const id of ["helpButton","keyboardHelp"])listen(id,"click",()=>element("helpDialog").showModal());
 listen("workspaceButton","click",()=>{document.querySelectorAll("dialog[open]").forEach(dialog=>dialog.close());});
