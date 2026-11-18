@@ -18,7 +18,7 @@ async function eventually(callback) {
   throw new Error("Browser test timed out waiting for application state");
 }
 
-test("crosshair guides, Q/Enter shortcuts, annotation, model selection and dataset split export", {timeout:120000}, async context => {
+test("annotation, priority review, cleaning, split export and training controls", {timeout:120000}, async context => {
   const root = path.resolve(__dirname, "..");
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "labelpilot-browser-test-"));
   const images = path.join(home, "images");
@@ -35,7 +35,7 @@ test("crosshair guides, Q/Enter shortcuts, annotation, model selection and datas
   fs.writeFileSync(firstModel, "test fixture; browsing must not deserialize weights");
   fs.writeFileSync(secondModel, "nested test fixture; do not execute");
   fs.writeFileSync(path.join(modelFolder, "ignore.json"), "not a model");
-  const fixture = spawnSync(python, ["-c", "from PIL import Image; import sys; from pathlib import Path; [Image.new('RGB',(640,480),'#555577').save(Path(sys.argv[1])/f'image_{index}.png') for index in range(4)]", images], {windowsHide:true, encoding:"utf8"});
+  const fixture = spawnSync(python, ["-c", "from PIL import Image; import sys; from pathlib import Path; [Image.new('RGB',(640,480),color).save(Path(sys.argv[1])/f'image_{index}.png') for index,color in enumerate(('#555577','#555578','#555579','#555579'))]", images], {windowsHide:true, encoding:"utf8"});
   assert.equal(fixture.status, 0, fixture.stderr || fixture.error?.message);
   const manifestPath = path.join(home, "capture-manifest.json");
   fs.writeFileSync(manifestPath, JSON.stringify({tasks:["capture-a", "capture-a", "capture-b", "capture-c"].map((group, index) => ({
@@ -371,6 +371,22 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await click("#cancelModelBrowser");
     await evaluate('element("modelDialog").close();');
     await cdp("Emulation.setDeviceMetricsOverride", {width:1600, height:1000, deviceScaleFactor:1, mobile:false});
+    await evaluate(`(async()=>{
+      for(const item of state.items.slice(0,2)){
+        const url=projectUrl("/items/"+item.id);
+        const current=await api(url);
+        await api(url,"PUT",{...current,expected_version:current.version,status:"draft"});
+      }
+    })()`);
+    await click("#reviewQueueButton");
+    await waitFor('state.current?.item.photo_id==="image_1" && !state.busy');
+    await check('state.items.length===2 && element("imageList").textContent.includes("待确认空图")', "Priority review puts an unconfirmed empty draft ahead of a populated draft");
+    await press("d", "KeyD");
+    await waitFor('state.current?.item.photo_id==="image_0" && !state.busy');
+    await press("e", "KeyE");
+    await waitFor('state.items.length===1 && state.current?.item.photo_id==="image_1" && !state.busy');
+    await click("#reviewQueueButton");
+    await waitFor('state.items.length===4 && state.current?.item.photo_id==="image_0" && !state.busy');
     const downloads = path.join(home, "downloads");
     fs.mkdirSync(downloads);
     await cdp("Browser.setDownloadBehavior", {behavior:"allow", downloadPath:downloads});
@@ -436,7 +452,37 @@ with zipfile.ZipFile(sys.argv[1]) as archive:
     await check(`exportRequests.at(-1).split===null && JSON.stringify(state.current)===${JSON.stringify(beforeExport)}`, "Exports never change current annotations or their review state");
     await eventually(() => fs.readdirSync(downloads).filter(name => name.endsWith(".zip")).length === 2);
     context.diagnostic("Custom ratios, validation, actual ZIP download and unsplit export passed");
-    await evaluate('api=exportApi;');
+    await evaluate('element("exportDialog").close();');
+    await click("#cleanButton");
+    await waitFor('!element("exportCleaning").hidden && !element("createExport").disabled');
+    await check('element("exportImageCount").textContent==="3" && element("exportCleaningSummary").textContent.includes("重复副本 1 张")', "One-click cleaning previews identical duplicate removal");
+    await click("#createExport");
+    await waitFor('exportRequests.at(-1).clean===true && lastExportResult.images===3');
+    await eventually(() => fs.readdirSync(downloads).filter(name => name.endsWith(".zip")).length === 3);
+    const cleaningScreenshot = await cdp("Page.captureScreenshot", {format:"png"});
+    fs.writeFileSync(path.join(home,"cleaning.png"), Buffer.from(cleaningScreenshot.data,"base64"));
+    await evaluate('element("exportDialog").close();');
+
+    await evaluate(`window.requestedTraining=null;
+      api=async (route,method,body)=>{
+        if(!route.endsWith("/trainings"))return exportApi(route,method,body);
+        if(method==="POST"){window.requestedTraining=body;return {};}
+        return window.requestedTraining ? [{id:"demo",status:"completed",created_at:"2026-11-18T08:00:00Z",
+          progress:{epoch:1,epochs:1,device:"CPU",metrics:{map50_95:0.51,recall:0.62}},options:window.requestedTraining,
+          split_counts:{train:2,val:1},cleaned_out:1,weights:${JSON.stringify(secondModel)},has_log:true,has_dataset:true}] : [];
+      };`);
+    await click("#trainingButton");
+    await waitFor('element("trainingDialog").open && element("trainingRuns").textContent.includes("暂无")');
+    await check('element("trainingUnit").value==="source_group" && element("trainingMode").value==="fine_tune"', "Training uses capture groups and the local project model by default");
+    await evaluate('element("trainingMode").value="scratch"; element("trainingEpochs").value="1";');
+    await click("#startTraining");
+    await waitFor('element("trainingRuns").textContent.includes("mAP50–95 0.510")');
+    await check('requestedTraining.epochs===1 && requestedTraining.mode==="scratch" && !!element("trainingRuns").querySelector("a[download][href$=weights]")', "Training controls submit settings and show metrics and the checkpoint link");
+    const trainingScreenshot = await cdp("Page.captureScreenshot", {format:"png"});
+    fs.writeFileSync(path.join(home,"training.png"), Buffer.from(trainingScreenshot.data,"base64"));
+    await click('[data-use-training="demo"]');
+    await waitFor(`state.project.model_path===${JSON.stringify(secondModel)}`);
+    await evaluate('element("trainingDialog").close(); api=exportApi;');
     assert.deepEqual(errors, [], "No browser runtime errors");
   } finally {
     if (socket?.readyState === WebSocket.OPEN && cdp) await cdp("Browser.close").catch(() => {});

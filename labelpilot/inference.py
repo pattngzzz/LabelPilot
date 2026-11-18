@@ -2,11 +2,15 @@ import copy
 import os
 import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 from PIL import Image
 
 from .store import Problem, atomic_json, digest, now, read_json
+
+
+DISABLED_INTEGRATIONS = ("sync", "hub", "wandb", "mlflow", "comet", "clearml", "dvc", "neptune", "raytune", "tensorboard")
 
 
 def model_class_names(names, project_names):
@@ -28,10 +32,28 @@ class Inference:
         os.environ["YOLO_OFFLINE"] = "true"
         os.environ["YOLO_AUTOINSTALL"] = "false"
         self.lock = threading.Lock()
+        self.training = threading.Event()
         self.model = None
         self.signature = None
         self.model_digest = None
         self.device = None
+
+    @contextmanager
+    def prediction_slot(self):
+        while not self.lock.acquire(timeout=0.1):
+            if self.training.is_set():
+                raise Problem("本地训练正在占用模型运行环境，请等待或停止训练", 409)
+        try:
+            yield
+        finally:
+            self.lock.release()
+
+    def release_cached_model(self):
+        if self.model is not None:
+            import torch
+            self.model = self.signature = self.model_digest = self.device = None
+            if torch.cuda.is_initialized():
+                torch.cuda.empty_cache()
 
     def predict(self, project_id, item_id, options):
         project = self.store.project(project_id)
@@ -47,14 +69,12 @@ class Inference:
             raise Problem("IoU 必须在 0.01 到 1 之间", 422)
         if not isinstance(image_size, int) or image_size not in (640, 960, 1280):
             raise Problem("输入尺寸必须为 640、960 或 1280", 422)
-        with self.lock:
+        with self.prediction_slot():
             import torch
             from ultralytics import YOLO
             from ultralytics.utils import SETTINGS
 
-            SETTINGS.update({"sync": False, "hub": False, "wandb": False, "mlflow": False,
-                             "comet": False, "clearml": False, "dvc": False, "neptune": False,
-                             "raytune": False, "tensorboard": False})
+            SETTINGS.update({name: False for name in DISABLED_INTEGRATIONS if name in SETTINGS})
 
             signature = (str(path.resolve()), path.stat().st_size, path.stat().st_mtime_ns)
             if self.signature != signature:
@@ -140,6 +160,8 @@ class Jobs:
             raise Problem("当前范围没有未开始图片；已有标注一律不会覆盖", 422)
         job_id = uuid.uuid4().hex
         with self.lock:
+            if self.inference.training.is_set():
+                raise Problem("本地训练正在占用模型运行环境，请等待或停止训练", 409)
             if any(record["status"] in ("running", "queued") for record in self.records.values()):
                 raise Problem("已有预标注任务运行中，请先完成或取消", 409)
             record = {"id": job_id, "project": project_id, "status": "queued", "total": len(ids),

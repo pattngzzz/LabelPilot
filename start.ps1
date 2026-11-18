@@ -1,7 +1,12 @@
 param([int]$Port = 8765, [switch]$NoBrowser)
 $ErrorActionPreference = 'Stop'
 $python = $env:LABELPILOT_PYTHON
-if (-not $python) { $python = 'D:\Miniconda3\envs\key_action_py311\python.exe' }
+if (-not $python) {
+    $python = 'D:\Miniconda3\envs\key_action_py311\python.exe'
+    if (-not (Test-Path -LiteralPath $python)) {
+        $python = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
+    }
+}
 if (-not (Test-Path -LiteralPath $python)) { $python = (Get-Command python -ErrorAction Stop).Source }
 $url = "http://127.0.0.1:$Port"
 try {

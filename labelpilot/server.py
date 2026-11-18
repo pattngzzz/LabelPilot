@@ -3,11 +3,12 @@ import io
 import os
 import re
 import secrets
+from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -16,6 +17,7 @@ from .exporting import export_project, preview_export
 from .inference import Inference, Jobs
 from . import model_files
 from .store import Problem, Store
+from .training import TrainingJobs, has_training_dependencies
 
 
 ASSETS = Path(__file__).resolve().parent.parent / "static"
@@ -27,10 +29,20 @@ def create_app(home=None):
     store = Store(home)
     inference = Inference(store)
     jobs = Jobs(store, inference)
-    app = FastAPI(title="LabelPilot", docs_url=None, redoc_url=None, openapi_url=None)
+    training = TrainingJobs(store, inference, jobs)
+
+    @asynccontextmanager
+    async def lifespan(app):
+        try:
+            yield
+        finally:
+            training.shutdown()
+
+    app = FastAPI(title="LabelPilot", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.store = store
     app.state.inference = inference
     app.state.jobs = jobs
+    app.state.training = training
     app.state.token = secrets.token_urlsafe(32)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"])
 
@@ -70,10 +82,14 @@ def create_app(home=None):
     @app.get("/api/system")
     def system():
         import sys
-        import torch
-        return {"python": sys.executable, "torch": torch.__version__, "cuda": torch.cuda.is_available(),
-                "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU",
-                "data_directory": str(store.data)}
+        try:
+            import torch
+        except (ImportError, OSError):
+            torch = None
+        cuda = bool(torch and torch.cuda.is_available())
+        return {"python": sys.executable, "torch": str(torch.__version__) if torch else None, "cuda": cuda,
+                "device": torch.cuda.get_device_name(0) if cuda else "CPU", "data_directory": str(store.data),
+                "training_available": bool(torch and has_training_dependencies())}
 
     @app.get("/api/projects")
     def projects():
@@ -176,6 +192,29 @@ def create_app(home=None):
     @app.post("/api/jobs/{job_id}/cancel")
     def cancel_job(job_id: str):
         return jobs.cancel(job_id)
+
+    @app.get("/api/projects/{project_id}/trainings")
+    def list_trainings(project_id: str):
+        store.project(project_id)
+        return training.list(project_id)
+
+    @app.post("/api/projects/{project_id}/trainings", status_code=202)
+    def start_training(project_id: str, payload: dict):
+        return training.start(project_id, payload)
+
+    @app.post("/api/projects/{project_id}/trainings/{run_id}/cancel")
+    def cancel_training(project_id: str, run_id: str):
+        return training.cancel(project_id, run_id)
+
+    @app.get("/api/projects/{project_id}/trainings/{run_id}/{kind}")
+    def training_artifact(project_id: str, run_id: str, kind: str):
+        path = training.artifact(project_id, run_id, kind)
+        if kind == "log":
+            with path.open("rb") as stream:
+                stream.seek(max(0, stream.seek(0, 2) - 65536))
+                return PlainTextResponse(stream.read(65536).decode("utf-8", errors="replace"))
+        name = f"labelpilot-{run_id[:8]}-best.pt" if kind == "weights" else "export_manifest.json"
+        return FileResponse(path, filename=name)
 
     @app.post("/api/projects/{project_id}/export/preview")
     def export_preview(project_id: str, payload: dict):

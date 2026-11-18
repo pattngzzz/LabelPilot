@@ -521,10 +521,10 @@ def test_zero_area_polygon_rejected(store):
 
 
 def test_batch_processes_only_unstarted_images(store):
-    class FakeInference:
+    class FakeInference(Inference):
         def predict(self, project_id, item_id, options):
             return {"shapes": [], "provenance": {"human_reviewed": False}}
-    jobs = Jobs(store, FakeInference())
+    jobs = Jobs(store, FakeInference(store))
     job = jobs.start("test", {"limit": 10})
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:

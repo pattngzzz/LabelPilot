@@ -4,6 +4,7 @@ const element = id => document.getElementById(id);
 const copy = value => structuredClone(value);
 const escapeHtml = value => String(value ?? "").replace(/[&<>"']/g, character => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[character]));
 const statusNames = {unstarted:"未开始",imported:"人工标注 · 待审核",predicted:"模型待审核",draft:"编辑中",reviewed:"已审核",skipped:"已跳过",error:"读取异常"};
+const reviewModes = new Set(["review", "review_empty", "review_difficult", "review_low"]);
 const state = {projects:[],project:null,items:[],filtered:0,offset:0,pageSize:60,current:null,image:null,selected:-1,
   activeClass:0,tool:"select",dirty:false,busy:false,undo:[],redo:[],scale:1,panX:0,panY:0,drag:null,
   polygon:[],rectangle:null,pendingShape:null,labelPickerSaving:false,canvasPointer:null,space:false,showLabels:true,prediction:null,loadSequence:0,listSequence:0};
@@ -20,6 +21,10 @@ const exportSplitHints = {
 };
 let searchTimer;
 let jobTimer;
+let trainingTimer;
+let trainingSequence = 0;
+let trainingSubmitting = false;
+let trainingRuns = [];
 
 function toast(message, error=false) {
   const node = document.createElement("div");
@@ -83,8 +88,8 @@ async function initialize() {
   const previous = localStorage.getItem("labelpilot-project");
   await selectProject(state.projects.find(project => project.id === previous)?.id || state.projects[0].id);
   api("/api/system").then(system => {
-    element("modelRuntime").textContent = `运行设备：${system.device} · PyTorch ${system.torch}`;
-    element("modelCaption").textContent = `${system.cuda ? "CUDA" : "CPU"} · 本地模型 · 按需加载`;
+    element("modelRuntime").textContent = system.torch ? `运行设备 ${system.device} · PyTorch ${system.torch}` : "当前 Python 缺少 PyTorch";
+    element("modelCaption").textContent = system.torch ? `${system.cuda ? "CUDA" : "CPU"} · 本地模型 · 按需加载` : "需要本地模型环境";
   }).catch(error => toast(error.message, true));
 }
 
@@ -126,6 +131,10 @@ async function refreshList() {
   const values = filters();
   const response = await api(projectUrl("/items?") + new URLSearchParams({...values,offset:state.offset,limit:state.pageSize}));
   if (sequence !== state.listSequence) return;
+  if (state.offset && state.offset >= response.filtered) {
+    state.offset = Math.max(0, Math.floor((response.filtered - 1) / state.pageSize) * state.pageSize);
+    return refreshList();
+  }
   state.items = response.items;
   state.filtered = response.filtered;
   element("filteredCount").textContent = response.filtered.toLocaleString();
@@ -143,7 +152,31 @@ async function refreshList() {
 }
 
 function renderQueue() {
-  element("imageList").innerHTML = state.items.map(item => `<button class="image-row ${state.current?.item.id === item.id ? "selected" : ""}" data-item="${item.id}" title="${escapeHtml(item.relative)}"><img loading="lazy" src="${projectUrl(`/items/${item.id}/image?thumbnail=true`)}" alt=""><span class="image-row-info"><strong>${escapeHtml(item.photo_id)}</strong><small>${escapeHtml(statusNames[item.status])} · ${item.count} 对象</small></span><i class="row-dot ${item.status}"></i></button>`).join("") || '<p class="empty-list">当前筛选暂无图片<br>试试其他批次或状态</p>';
+  const review = reviewModes.has(filters().status);
+  element("reviewQueueButton").setAttribute("aria-pressed", String(review));
+  element("imageList").innerHTML = state.items.map(item => {
+    const reasons = [];
+    if (item.review?.empty) reasons.push("待确认空图");
+    if (item.review?.difficult) reasons.push("难例");
+    if (item.review?.low_confidence) reasons.push(`低置信 ${Math.round(item.review.confidence * 100)}%`);
+    return `<button class="image-row ${state.current?.item.id === item.id ? "selected" : ""}" data-item="${item.id}" title="${escapeHtml(item.relative)}">
+      <img loading="lazy" src="${projectUrl(`/items/${item.id}/image?thumbnail=true`)}" alt="">
+      <span class="image-row-info"><strong>${escapeHtml(item.photo_id)}</strong><small>${statusNames[item.status]} · ${item.count} 对象</small>
+      ${reasons.length ? `<small class="review-reasons">${reasons.join(" · ")}</small>` : ""}</span><i class="row-dot ${item.status}"></i>
+    </button>`;
+  }).join("") || `<p class="empty-list">${review ? "当前范围没有待审核图片" : "当前筛选暂无图片"}</p>`;
+}
+
+function finishReviewQueue() {
+  Object.assign(state, {current:null, image:null, selected:-1, undo:[], redo:[], drag:null,
+    rectangle:null, polygon:[], pendingShape:null});
+  element("imageTitle").textContent = "待审核队列";
+  element("imageMeta").textContent = "";
+  element("sourceNote").textContent = "";
+  setStatus("");
+  showCanvasMessage("当前范围没有待审核图片", "切换批次或审核筛选继续");
+  renderObjects();
+  draw();
 }
 
 async function ensureSaved() {
@@ -214,10 +247,17 @@ async function navigateImage(direction, reviewed=false) {
   if (!state.current || state.busy) return;
   if (reviewed && (state.rectangle || state.polygon.length || state.pendingShape)) return toast("请先完成或取消当前绘制", true);
   const previousIds = state.items.map(item => item.id);
+  const previousOffset = state.offset;
   const currentIndex = previousIds.indexOf(state.current.item.id);
   const nextId = previousIds[currentIndex + direction];
   if (reviewed && !await saveCurrent("reviewed")) return;
   if (!reviewed && state.dirty && !await saveCurrent("draft")) return;
+  if (reviewed && reviewModes.has(filters().status)) {
+    const stillNext = state.items.find(item => item.id === nextId);
+    const next = stillNext || (state.offset === previousOffset && state.items[currentIndex]) || state.items[0];
+    if (next) return loadItem(next.id);
+    return finishReviewQueue();
+  }
   if (nextId) return loadItem(nextId);
   if (direction > 0 && state.offset + state.pageSize < state.filtered) {
     state.offset += state.pageSize;
@@ -829,6 +869,19 @@ function renderExportPreview(data, options) {
   }
   element("exportPreviewIssues").innerHTML = issues.map(issue => `<p>${escapeHtml(issue)}</p>`).join("");
   element("exportPreviewIssues").hidden = !issues.length;
+  element("exportCleaning").hidden = !data.cleaning;
+  if (data.cleaning) {
+    const labels = {duplicate:"重复副本", conflict:"标注冲突", unreadable:"图片不可用", annotation:"标注异常"};
+    const excluded = Object.entries(data.cleaning.counts).filter(([, count]) => count);
+    element("exportCleaningSummary").textContent = excluded.length
+      ? excluded.map(([reason, count]) => `${labels[reason]} ${count} 张`).join(" · ") : "清洗检查完成 · 排除 0 张";
+    element("exportCleaningDetails").hidden = !data.cleaning.examples.length;
+    element("exportCleaningExamples").innerHTML = data.cleaning.examples.map(row => {
+      const reviewLink = ["conflict", "annotation"].includes(row.reason)
+        ? ` <button class="button" type="button" data-clean-item="${escapeHtml(row.id)}">查看图片</button>` : "";
+      return `<li><strong>${escapeHtml(row.photo_id)}</strong> · ${labels[row.reason]} · ${escapeHtml(row.detail)}${reviewLink}</li>`;
+    }).join("");
+  }
 
   element("exportClassColumns").innerHTML = '<th scope="col">类别</th><th scope="col">合计</th>' + activeSplits.map(name =>
     `<th scope="col">${exportSplitLabels[name]}</th>`).join("");
@@ -852,6 +905,10 @@ function updateExportPreview() {
   splitSettings.hidden = splitSettings.disabled;
   element("exportSplitHint").textContent = exportSplitHints[element("exportSplitUnit").value];
   const summary = element("exportSplitSummary");
+  const clean = element("cleanDataset").checked;
+  element("reviewedOnly").disabled = clean;
+  if (clean) element("reviewedOnly").checked = true;
+  element("createExport").textContent = clean ? "下载清洗版 ZIP" : "生成 ZIP 并下载";
   let split;
   try {
     split = exportSplitOptions();
@@ -865,9 +922,9 @@ function updateExportPreview() {
   summary.hidden = true;
 
   const options = {format:element("exportFormat").value, batch:element("exportBatch").value,
-    reviewed_only:element("reviewedOnly").checked, include_images:element("includeImages").checked, split};
+    reviewed_only:element("reviewedOnly").checked, include_images:element("includeImages").checked, clean, split};
   const url = projectUrl("/export");
-  setExportPreviewStatus("正在统计本次导出的标注…");
+  setExportPreviewStatus(clean ? "正在读取原图并检查重复和标注异常…" : "正在统计本次导出的标注…");
   exportPreview.timer = setTimeout(async () => {
     try {
       const data = await api(`${url}/preview`, "POST", options);
@@ -879,6 +936,114 @@ function updateExportPreview() {
       if (sequence === exportPreview.sequence && element("exportDialog").open) setExportPreviewStatus(error.message, true);
     }
   }, 150);
+}
+
+function openExportDialog(clean=false) {
+  if (!state.project) return;
+  if (exportPreview.running) return toast("正在生成上一次的导出包");
+  element("exportResult").textContent = "";
+  element("cleanDataset").checked = clean;
+  if (clean) {
+    element("exportFormat").value = "labelme";
+    element("exportBatch").value = filters().batch;
+    element("includeImages").checked = true;
+    element("splitDataset").checked = false;
+  }
+  element("exportDialog").showModal();
+  updateExportPreview();
+}
+
+const trainingStatuses = {preparing:"准备清洗版数据", running:"训练中", cancelling:"正在停止", cancelled:"已停止",
+  interrupted:"已中断", completed:"已完成", failed:"训练失败"};
+
+function trainingMessage(message, error=false) {
+  const status = element("trainingMessage");
+  status.textContent = message;
+  status.dataset.error = String(error);
+}
+
+function renderTrainingRuns(runs) {
+  const active = runs.some(run => ["preparing", "running", "cancelling"].includes(run.status));
+  element("startTraining").disabled = active || trainingSubmitting;
+  if (JSON.stringify(runs) === JSON.stringify(trainingRuns)) return;
+  trainingRuns = runs;
+  element("trainingRuns").innerHTML = runs.map(run => {
+    const url = escapeHtml(projectUrl(`/trainings/${run.id}`));
+    const counts = run.split_counts;
+    const progress = run.progress;
+    const epoch = progress.epoch ?? 0;
+    const epochs = progress.epochs ?? run.options.epochs;
+    const metrics = [["mAP50–95", progress.metrics?.map50_95], ["mAP50", progress.metrics?.map50],
+      ["召回率", progress.metrics?.recall], ["精确率", progress.metrics?.precision]];
+    const scored = metrics.filter(([, value]) => Number.isFinite(value));
+    const information = [escapeHtml(run.options.batch || "全部批次")];
+    if (counts) information.push(`训练 ${counts.train} 张 · 验证 ${counts.val} 张`, `清洗排除 ${run.cleaned_out} 张`);
+    if (progress.device) information.push(escapeHtml(progress.device));
+    const statusLabel = trainingStatuses[run.status];
+    return `<article class="training-run" data-training-id="${escapeHtml(run.id)}">
+      <div class="training-run-heading"><strong>${statusLabel}</strong><time>${new Date(run.created_at).toLocaleString()}</time></div>
+      <p class="muted">${information.join(" · ")}</p>
+      ${progress.epochs ? `<progress max="${epochs}" value="${epoch}" aria-label="训练轮数"></progress><small>${epoch} / ${epochs} 轮</small>` : ""}
+      ${scored.length ? `<p>${scored.map(([name, value]) => `${name} ${value.toFixed(3)}`).join(" · ")}</p>` : ""}
+      ${run.error ? `<p class="training-error">${escapeHtml(run.error)}</p>` : ""}
+      <div class="training-run-actions">
+        ${run.has_log ? `<a class="button" href="${url}/log" target="_blank" rel="noopener">日志</a>` : ""}
+        ${run.has_dataset ? `<a class="button" href="${url}/dataset" download>数据清单</a>` : ""}
+        ${run.weights ? `<a class="button" href="${url}/weights" download>下载权重</a><button class="button" data-use-training="${escapeHtml(run.id)}">设为预标注模型</button>` : ""}
+        ${["preparing", "running"].includes(run.status) ? `<button class="button" data-cancel-training="${escapeHtml(run.id)}">停止训练</button>` : ""}
+      </div>
+    </article>`;
+  }).join("") || '<p class="muted">当前项目暂无训练记录</p>';
+}
+
+async function refreshTrainingRuns() {
+  if (!element("trainingDialog").open) return;
+  const sequence = ++trainingSequence;
+  const runs = await api(projectUrl("/trainings"));
+  if (element("trainingDialog").open && sequence === trainingSequence) renderTrainingRuns(runs);
+}
+
+async function openTrainingDialog() {
+  if (!state.project) return;
+  element("trainingBatch").innerHTML = element("exportBatch").innerHTML;
+  element("trainingBatch").value = filters().batch;
+  element("trainingUnit").value = state.project.has_source_groups ? "source_group" : "image";
+  element("trainingMode").value = state.project.model_path ? "fine_tune" : "scratch";
+  element("trainingRuns").textContent = "正在读取训练记录…";
+  trainingRuns = null;
+  trainingMessage("");
+  element("trainingRuntime").textContent = "正在检查本地训练环境…";
+  element("trainingDialog").showModal();
+  clearInterval(trainingTimer);
+  trainingTimer = setInterval(() => refreshTrainingRuns().catch(error => trainingMessage(error.message, true)), 1500);
+  await Promise.all([
+    refreshTrainingRuns(),
+    api("/api/system").then(system => {
+      element("trainingRuntime").textContent = system.training_available ? `可用设备 ${system.device}${system.cuda ? " 或 CPU" : ""}`
+        : "当前 Python 需要安装 PyTorch 和 Ultralytics。";
+    })
+  ]);
+}
+
+async function startTraining(event) {
+  event.preventDefault();
+  if (trainingSubmitting || element("startTraining").disabled) return;
+  trainingSubmitting = true;
+  element("startTraining").disabled = true;
+  trainingMessage("正在创建训练任务…");
+  const options = {batch:element("trainingBatch").value, unit:element("trainingUnit").value,
+    mode:element("trainingMode").value, device:element("trainingDevice").value,
+    epochs:element("trainingEpochs").valueAsNumber, image_size:element("trainingImageSize").valueAsNumber,
+    batch_size:element("trainingBatchSize").valueAsNumber, seed:element("trainingSeed").valueAsNumber};
+  try {
+    await api(projectUrl("/trainings"), "POST", options);
+    trainingMessage("训练任务已启动，可返回标注工作台。");
+  } catch (error) {
+    trainingMessage(error.message, true);
+  } finally {
+    trainingSubmitting = false;
+    await refreshTrainingRuns();
+  }
 }
 
 async function exportDataset() {
@@ -934,9 +1099,20 @@ listen("objectList","click",event=>{const button=event.target.closest("[data-sha
 listen("classList","click",event=>{const button=event.target.closest("[data-class]");if(button){state.activeClass=Number(button.dataset.class);renderClasses();}});
 document.querySelectorAll("[data-tool]").forEach(button=>button.addEventListener("click",()=>{if(!state.busy)setTool(button.dataset.tool);}));
 for(const id of ["batchSelect","statusSelect"])listen(id,"change",async()=>{
-  if(state.busy || !await ensureSaved())return;
+  if(!state.project || state.busy || !await ensureSaved())return;
   localStorage.setItem(`labelpilot-batch-${state.project.id}`,element("batchSelect").value);
-  state.offset=0;await refreshList();if(state.items[0])await loadItem(state.items[0].id);
+  state.offset=0;await refreshList();
+  if(state.items[0])await loadItem(state.items[0].id);
+  else if(reviewModes.has(filters().status))finishReviewQueue();
+});
+listen("reviewQueueButton", "click", async () => {
+  if (!state.project || state.busy || !await ensureSaved()) return;
+  const status = element("statusSelect");
+  status.value = reviewModes.has(status.value) ? "" : "review";
+  state.offset = 0;
+  await refreshList();
+  if (state.items[0]) await loadItem(state.items[0].id);
+  else if (reviewModes.has(status.value)) finishReviewQueue();
 });
 listen("searchInput","input",()=>{clearTimeout(searchTimer);searchTimer=setTimeout(()=>{state.offset=0;refreshList().catch(error=>toast(error.message,true));},220);});
 listen("refreshButton","click",async()=>{
@@ -959,7 +1135,11 @@ listen("saveButton","click",()=>saveCurrent("draft"));
 listen("reviewButton","click",()=>navigateImage(1,true));
 listen("previousImage","click",()=>navigateImage(-1));
 listen("nextImage","click",()=>navigateImage(1));
-listen("skipButton","click",async()=>{if(await saveCurrent("skipped"))await navigateImage(1);});
+listen("skipButton", "click", async () => {
+  if (!await saveCurrent("skipped")) return;
+  if (reviewModes.has(filters().status) && !state.items.length) finishReviewQueue();
+  else await navigateImage(1);
+});
 listen("undoButton","click",()=>undo());listen("redoButton","click",()=>undo(true));
 listen("zoomOut","click",()=>zoom(.8));listen("zoomIn","click",()=>zoom(1.25));listen("fitButton","click",fitImage);
 listen("focusButton","click",()=>toggleFocusMode());
@@ -1011,19 +1191,20 @@ listen("iou","input",event=>{element("iouValue").value=Number(event.target.value
 listen("discardPrediction","click",()=>{state.prediction=null;element("predictionDialog").close();});
 listen("appendPrediction","click",()=>applyPrediction(true));listen("replacePrediction","click",()=>applyPrediction(false));
 listen("jobsList","click",async event=>{const button=event.target.closest("[data-cancel-job]");if(button){await api(`/api/jobs/${button.dataset.cancelJob}/cancel`,"POST",{});toast("已请求取消；当前推理结束后停止，不会写入该张结果");}});
-for (const id of ["railExport", "exportButton"]) listen(id, "click", () => {
-  if (!state.project) return;
-  if (exportPreview.running) return toast("正在生成上一次的导出包");
-  element("exportResult").textContent = "";
-  element("exportDialog").showModal();
-  updateExportPreview();
-});
-for (const id of ["exportFormat", "exportBatch", "reviewedOnly", "includeImages", "splitDataset",
+for (const id of ["railExport", "exportButton"]) listen(id, "click", () => openExportDialog());
+listen("cleanButton", "click", () => openExportDialog(true));
+for (const id of ["exportFormat", "exportBatch", "reviewedOnly", "includeImages", "cleanDataset", "splitDataset",
   "exportSplitUnit", "splitTrain", "splitVal", "splitTest", "splitSeed"]) listen(id, "input", () => {
   element("exportResult").textContent = "";
   updateExportPreview();
 });
 listen("refreshExportPreview", "click", updateExportPreview);
+listen("exportCleaningExamples", "click", async event => {
+  const button = event.target.closest("[data-clean-item]");
+  if (!button || state.busy || !await ensureSaved()) return;
+  element("exportDialog").close();
+  await loadItem(button.dataset.cleanItem);
+});
 element("exportDialog").addEventListener("close", () => {
   if (element("exportDialog").open) return;
   clearTimeout(exportPreview.timer);
@@ -1031,6 +1212,36 @@ element("exportDialog").addEventListener("close", () => {
   exportPreview.plan = null;
 });
 listen("createExport","click",exportDataset);
+listen("trainingButton", "click", openTrainingDialog);
+listen("trainingForm", "submit", startTraining);
+element("trainingDialog").addEventListener("close", () => {
+  if (element("trainingDialog").open) return;
+  clearInterval(trainingTimer);
+  trainingSequence++;
+});
+listen("trainingRuns", "click", async event => {
+  const cancel = event.target.closest("[data-cancel-training]");
+  if (cancel) {
+    cancel.disabled = true;
+    try {
+      await api(projectUrl(`/trainings/${cancel.dataset.cancelTraining}/cancel`), "POST", {});
+      await refreshTrainingRuns();
+    } finally { cancel.disabled = false; }
+    return;
+  }
+  const use = event.target.closest("[data-use-training]");
+  if (!use) return;
+  const run = trainingRuns?.find(record => record.id === use.dataset.useTraining);
+  if (!run?.weights) return;
+  use.disabled = true;
+  try {
+    const project = await api(projectUrl("/model"), "POST", {path:run.weights});
+    Object.assign(state.project, project);
+    element("modelPath").value = project.model_path;
+    element("trainingMode").value = "fine_tune";
+    trainingMessage("已将该轮训练的权重设为项目预标注模型。");
+  } finally { use.disabled = false; }
+});
 listen("newProjectButton","click",()=>element("projectDialog").showModal());listen("createProject","click",createProject);
 listen("historyButton","click",showHistory);listen("historyList","click",event=>{const button=event.target.closest("[data-restore]");if(button)return restoreRevision(Number(button.dataset.restore));});
 for(const id of ["helpButton","keyboardHelp"])listen(id,"click",()=>element("helpDialog").showModal());

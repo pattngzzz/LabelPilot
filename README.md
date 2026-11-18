@@ -5,7 +5,7 @@
 双击本目录的 `start.cmd`。启动窗口保持打开，浏览器会自动打开 `http://127.0.0.1:8765`。
 关闭服务：在启动窗口按 `Ctrl+C`。服务仅监听本机，不开放局域网访问。
 
-当前默认解释器是 `D:\Miniconda3\envs\key_action_py311\python.exe`，使用已有 CUDA / Ultralytics 环境，没有安装或升级依赖。可以在 PowerShell 中通过 `$env:LABELPILOT_PYTHON='你的python.exe'` 切换解释器；换端口可运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1 -Port 8767`。
+启动器优先使用 `LABELPILOT_PYTHON` 指定的解释器，其次检查 `D:\Miniconda3\envs\key_action_py311\python.exe`、项目内的 `.venv\Scripts\python.exe` 和 PATH 上的 Python。可在 PowerShell 中用 `$env:LABELPILOT_PYTHON='你的python.exe'` 切换到已有的 CUDA / Ultralytics 环境。换端口可运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1 -Port 8767`。
 
 ## 已接入的数据
 
@@ -27,6 +27,12 @@
 界面默认采用紧凑布局，优先给图片分配空间。按 **Tab** 或点击工具栏的“大画布”，可收起顶部和两侧面板，再按一次恢复；偏好会在本机浏览器保留。滚轮以鼠标位置为中心缩放，F 适应画布，空格拖拽平移。
 
 按 **R** 进入矩形框模式后，十字光标的上下左右各有一条延伸至画布边缘的虚线，随鼠标移动，辅助对齐框选位置；图片缩放 / 平移不改变辅助线与光标的对齐。鼠标离开画布、切换工具、打开框选标签窗口或按住空格平移时隐藏。辅助线仅用于界面显示，不写入标注或导出数据。
+
+### 待审核队列
+
+在左侧点击“待审核队列”，按优先级查看导入标注、模型候选和草稿。队列先呈现未确认空图，其次是标有难例的图片，再按最低对象置信度排列低于 50% 的候选。状态下拉菜单可以单独查看其中一种原因。关键词和批次筛选同时生效。
+
+按 **E** 审核当前图片并进入下一张。确认空图仍需应答确认提示。按 **A / D** 时仍按原流程翻页并暂存草稿。审核通过或跳过的图片离开待审核队列。
 
 ### 自定义标签
 
@@ -74,6 +80,22 @@
 - **Labelme / X-AnyLabeling** 将逐图 JSON 写入 `annotations/train|val|test`，保留对象属性，并将普通矩形导出为两个对角点。`imagePath` 指向对应的图片副本。
 - **COCO** 按启用的集合生成 `annotations/train.json`、`annotations/val.json`、`annotations/test.json`，其中 `file_name` 相对于解压后的数据集根目录。
 
+## 一键清洗
+
+顶部的“一键清洗”立即扫描当前批次的已审核图片，预览保留张数和排除原因。图片文件不可用或已变更、标注结构异常的项会单独列出。完全相同的图片按文件 SHA-256 识别。标注一致的重复组保留一张，标注冲突的重复组暂时排除全部副本，可从预检示例打开对应图片核对。
+
+默认生成保留对象属性的 Labelme ZIP。可切换格式或开启分组划分。真实负样本仍可纳入，清洗结果和完整排除记录写到独立的导出包及 `export_manifest.json`，源文件和审核历史继续以只读方式引用。清洗依据精确重复和可校验的结构问题，近似帧及语义错误需要人工检查。
+
+## 一键训练
+
+顶部的“一键训练”会用所选批次的已审核检测框创建清洗版数据，并按 80% / 20% 划分训练集和验证集。两个集合都需要有带框图片。项目有任务清单来源组时默认按组划分，也可以按原图文件夹划分。共享已知来源组的训练集和验证集会被拒绝。
+
+可微调从项目模型设置选中的可信本地 `.pt` 权重，或使用 Ultralytics 自带的 YOLO11n 配置从零训练。默认自动选择设备，也可以显式选 CPU 或 CUDA。训练尺寸、轮数、批大小和随机种子在同一个窗口配置。训练依赖项与本地推理相同，CPU 或 CUDA 取决于 `start.cmd` 使用的 PyTorch 环境。
+
+点击“开始训练”后，本地后台任务复制并校验图片、保存数据清单、启动 YOLO。训练记录提供轮数进度、验证集 mAP、召回率、精确率、日志和停止按钮。成功后可以下载 `best.pt`，或者显式设为项目预标注模型。每次运行的快照、日志和权重保存在 `data/training/<任务 ID>/`，关闭浏览器后可通过同一服务继续查看。退出本地服务会停止其训练进程，未完成的记录会保留。
+
+一键训练当前使用目标检测框。需要保留多边形的项目可用 COCO 或 Labelme 导出。外部训练标签或模型效果可结合独立测试集做额外验收。
+
 ## 数据保存与保护
 
 - 图片、任务清单、原生标注和旧预标注只读。新修改保存在本目录 `data\workbench.sqlite3`，包含每次保存的完整版本以及首次导入快照。
@@ -85,7 +107,7 @@
 
 ## 当前边界
 
-支持检测框和多边形，不包含 SAM 点击分割、旋转框、关键点、多人协作和训练调度。YOLO 检测导出遇到多边形会报错，不会悄悄转成外接框；多边形请选择 COCO / Labelme。含 EXIF 旋转的原图会阻止编辑，需先建立方向归一化的独立副本。
+支持检测框和多边形，不包含 SAM 点击分割、旋转框、关键点和多人协作。YOLO 检测导出遇到多边形会报错，不会悄悄转成外接框；多边形请选择 COCO / Labelme。含 EXIF 旋转的原图会阻止编辑，需先建立方向归一化的独立副本。
 
 真实人工标注准确性、模型独立泛化指标、长期批量运行稳定性：`NOT_PROVEN`，需要真实人工审核 / 独立验证集 / 长时间运行证据。预标注减少多少人工时间也尚未测量。
 
@@ -96,7 +118,7 @@
 ```powershell
 $py = 'D:\Miniconda3\envs\key_action_py311\python.exe'
 $temp = Join-Path $env:TEMP ('labelpilot-tests-' + [guid]::NewGuid().ToString('N'))
-& $py -m pytest tests/test_workbench.py -q --basetemp $temp
+& $py -m pytest tests -q --basetemp $temp
 node --check static/app.js
 $env:LABELPILOT_PYTHON = $py
 node --test tests/test_browser.cjs

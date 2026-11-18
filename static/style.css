@@ -153,3 +153,31 @@ dialog.export-dialog[open] { display: flex; flex-direction: column; }
   .export-layout { grid-template-columns: minmax(0, 1fr); gap: 16px; }
   .export-preview { padding: 12px; }
 }
+
+.topbar-right { gap: 8px; }
+.queue-review { justify-content: center; }
+.queue-review[aria-pressed="true"] { color: #e0d5ff; border-color: #a38bf1; background: #9270ef26; }
+.image-row-info .review-reasons { color: #e6bc83; }
+.export-cleaning { display: grid; gap: 8px; font-size: 12px; }
+.export-cleaning p { color: #c1cbdf; line-height: 1.5; }
+.export-cleaning ul { margin: 7px 0 0; padding-left: 18px; overflow-wrap: anywhere; }
+.export-cleaning li + li { margin-top: 4px; }
+.export-cleaning summary, .training-advanced summary { color: #cbd3e5; cursor: pointer; }
+.training-note { margin-bottom: 12px; color: var(--muted); line-height: 1.55; }
+.training-advanced { padding: 10px; border: 1px solid var(--border); border-radius: 8px; }
+.training-advanced[open] summary { margin-bottom: 10px; }
+.training-runs { display: grid; gap: 9px; }
+.training-run { padding: 10px; display: grid; gap: 7px; border: 1px solid var(--border); border-radius: 8px; }
+.training-run-heading { display: flex; gap: 6px 10px; flex-wrap: wrap; align-items: baseline; justify-content: space-between; }
+.training-run time { color: var(--muted); font-size: 11px; }
+.training-run progress { width: 100%; height: 7px; accent-color: #a58af3; }
+.training-run p { line-height: 1.55; overflow-wrap: anywhere; }
+.training-run .training-error, #trainingMessage[data-error="true"] { color: #f4949a; }
+.training-run-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.training-run-actions .button { padding: 5px 8px; text-decoration: none; }
+#trainingMessage { flex: 1 1 200px; line-height: 1.6; overflow-wrap: anywhere; }
+@media (max-width: 640px) {
+  .topbar { height: auto; min-height: 56px; padding: 7px 12px; flex-wrap: wrap; }
+  .topbar select { flex: 1 1 90px; }
+  .topbar-right { flex: 1 0 100%; justify-content: flex-end; }
+}

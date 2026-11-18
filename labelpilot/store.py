@@ -13,6 +13,9 @@ from PIL import Image
 
 
 STATUSES = ("unstarted", "imported", "predicted", "draft", "reviewed", "skipped", "error")
+PENDING_REVIEW = ("imported", "predicted", "draft")
+REVIEW_FILTERS = {"review": None, "review_empty": "empty", "review_difficult": "difficult", "review_low": "low_confidence"}
+REVIEW_CONFIDENCE = 0.5
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 COLORS = ["#a78bfa", "#38bdf8", "#fb923c", "#f472b6", "#34d399", "#facc15",
           "#60a5fa", "#e879f9", "#2dd4bf", "#f87171", "#a3e635", "#fbbf24", "#22d3ee"]
@@ -35,6 +38,20 @@ def read_json(path):
 def read_annotation_snapshot(path):
     contents = Path(path).read_bytes()
     return json.loads(contents.decode("utf-8-sig")), hashlib.sha256(contents).hexdigest()
+
+
+def review_info(document):
+    shapes = document["shapes"]
+    objects = [shape for shape in shapes if isinstance(shape, dict)]
+    scores = [shape.get("score") for shape in objects]
+    confidence = min((score for score in scores if type(score) in (int, float) and 0 <= score < REVIEW_CONFIDENCE), default=None)
+    return {"empty": not shapes, "difficult": any(shape.get("difficult") is True for shape in objects),
+            "low_confidence": confidence is not None, "confidence": confidence}
+
+
+def review_priority(item):
+    info = item["review"]
+    return (not info["empty"], not info["difficult"], info["confidence"] if info["low_confidence"] else 1)
 
 
 def source_group(value):
@@ -147,11 +164,12 @@ class Project:
             if source:
                 try:
                     document = read_json(source)
-                    if not isinstance(document.get("shapes"), list):
+                    if not isinstance(document, dict) or not isinstance(document.get("shapes"), list):
                         raise ValueError("缺少 shapes 数组")
                     is_prediction = bool(document.get("preannotation")) or photo_id not in native
                     item.update(source=str(source), status="predicted" if is_prediction else "imported",
-                                count=len(document["shapes"]), source_kind="model" if is_prediction else "human")
+                                count=len(document["shapes"]), source_kind="model" if is_prediction else "human",
+                                review=review_info(document))
                 except (ValueError, OSError, TypeError) as exc:
                     item.update(status="error", error=f"标注读取失败：{exc}")
         self.items.sort(key=lambda item: (item["batch"], item["photo_id"], item["relative"]))
@@ -300,7 +318,7 @@ class Store:
             project.names = names
         return project.summary()
 
-    def overlay(self, project_id, include_documents=False):
+    def overlay(self, project_id, include_documents=False, include_review=False):
         overlays = {}
         with self.connect() as connection:
             rows = connection.execute("SELECT item, version, status, document, updated FROM annotations WHERE project=?", (project_id,))
@@ -310,12 +328,16 @@ class Store:
                         "count": len(document["shapes"]), "updated": row["updated"]}
                 if include_documents:
                     item["document"] = document
+                if include_review and row["status"] in PENDING_REVIEW:
+                    item["review"] = review_info(document)
                 overlays[row["item"]] = item
         return overlays
 
     def listing(self, project_id, query="", batch="", status="", offset=0, limit=80, *, include_documents=False):
         project = self.project(project_id)
-        overlays = self.overlay(project_id, include_documents=include_documents)
+        review_queue = status in REVIEW_FILTERS
+        reason = REVIEW_FILTERS.get(status)
+        overlays = self.overlay(project_id, include_documents=include_documents, include_review=review_queue)
         counts = dict.fromkeys(STATUSES, 0)
         filtered = []
         for original in project.items:
@@ -326,13 +348,20 @@ class Store:
                 continue
             if batch and item["batch"] != batch:
                 continue
-            if status and item["status"] != status:
-                continue
+            if review_queue:
+                if item["status"] not in PENDING_REVIEW or (reason and not item["review"][reason]):
+                    continue
+            else:
+                item.pop("review", None)
+                if status and item["status"] != status:
+                    continue
             filtered.append(item)
+        if review_queue:
+            filtered.sort(key=review_priority)
         return {"items": filtered[offset:offset + limit], "filtered": len(filtered),
                 "total": len(project.items), "counts": counts, "offset": offset, "limit": limit}
 
-    def image_info(self, project, item):
+    def image_info(self, project, item, *, verify_image=False):
         path = Path(item["path"])
         if not path.is_file() or not path.resolve().is_relative_to(project.root):
             raise Problem("原图不存在或路径已改变", 409)
@@ -340,6 +369,8 @@ class Store:
             width, height = image.size
             if image.getexif().get(274, 1) != 1:
                 raise Problem("此图含 EXIF 旋转，需先生成方向归一化的独立数据副本，避免标注错位", 422)
+            if verify_image:
+                image.load()
         if item["width"] and (width, height) != (item["width"], item["height"]):
             raise Problem("原图尺寸与任务清单不符", 409)
         image_digest = digest(path)
@@ -347,12 +378,12 @@ class Store:
             raise Problem("原图 SHA-256 与任务清单不符；已阻止编辑", 409)
         return width, height, image_digest
 
-    def detail(self, project_id, item_id):
+    def detail(self, project_id, item_id, *, verify_image=False):
         project = self.project(project_id)
         item = project.item(item_id)
         if item.get("error"):
             raise Problem(item["error"], 422)
-        width, height, image_digest = self.image_info(project, item)
+        width, height, image_digest = self.image_info(project, item, verify_image=verify_image)
         source_digest = None
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM annotations WHERE project=? AND item=?", (project_id, item_id)).fetchone()
