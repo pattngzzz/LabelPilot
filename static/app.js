@@ -11,6 +11,7 @@ const canvas = element("canvas");
 const context = canvas.getContext("2d");
 const sessionToken = document.querySelector('meta[name="labelpilot-token"]').content;
 const modelBrowser = {mode:"file",listing:null,loading:false,sequence:0};
+const exportAugmentation = {presets:[],maxCopies:3,loaded:false};
 let searchTimer;
 let jobTimer;
 
@@ -775,6 +776,35 @@ function exportSplitOptions() {
   if(!Number.isInteger(seed) || seed<0 || seed>4294967295)throw new Error("随机种子必须为 0 到 4294967295 的整数");
   return {...ratios,seed};
 }
+function exportAugmentationOptions() {
+  const preset=element("augmentationPreset").value;
+  if(preset==="none")return null;
+  if(!exportAugmentation.presets.some(item=>item.id===preset))throw new Error("请选择有效的数据增强方案");
+  if(!element("splitDataset").checked)throw new Error("增强需先划分数据集；仅训练可设为 100 / 0 / 0");
+  if(!element("includeImages").checked)throw new Error("数据增强必须勾选包含图片");
+  if(!element("reviewedOnly").checked)throw new Error("数据增强仅支持已人工确认的标注");
+  const copies=element("augmentationCopies").valueAsNumber;
+  if(!Number.isInteger(copies) || copies<1 || copies>exportAugmentation.maxCopies)throw new Error(`额外生成数量必须为 1 到 ${exportAugmentation.maxCopies} 的整数`);
+  const seed=element("augmentationSeed").valueAsNumber;
+  if(!Number.isInteger(seed) || seed<0 || seed>4294967295)throw new Error("增强随机种子必须为 0 到 4294967295 的整数");
+  return {preset,copies,seed};
+}
+async function openExportDialog() {
+  if(!state.project)return;
+  updateExportSplit();
+  element("exportDialog").showModal();
+  if(exportAugmentation.loaded)return;
+  try{
+    const catalog=await api("/api/augmentation-presets");
+    exportAugmentation.presets=catalog.presets;
+    exportAugmentation.maxCopies=catalog.max_copies;
+    exportAugmentation.loaded=true;
+    element("augmentationPreset").innerHTML='<option value="none">不增强 · 保留原样（默认）</option>'+catalog.presets.map(item=>`<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join("");
+    element("augmentationCopies").max=catalog.max_copies;
+    element("augmentationPreset").disabled=false;
+    updateExportSplit();
+  }catch(error){element("augmentationDescription").textContent=`增强方案加载失败：${error.message}。请重启工具并刷新，仍可不增强导出。`;}
+}
 function updateExportSplit() {
   element("exportSplitSettings").disabled=!element("splitDataset").checked;
   let invalid=false;
@@ -785,23 +815,37 @@ function updateExportSplit() {
   }catch(error){invalid=true;message=error.message;}
   element("exportSplitSummary").textContent=message;
   element("exportSplitSummary").dataset.invalid=String(invalid);
+  const enabled=element("augmentationPreset").value!=="none";
+  for(const id of ["augmentationCopies","augmentationSeed"])element(id).disabled=!enabled;
+  const preset=exportAugmentation.presets.find(item=>item.id===element("augmentationPreset").value);
+  element("augmentationDescription").textContent=preset?.description || "不生成额外图片。";
+  let augmentationInvalid=false;
+  let augmentationMessage="原图和已有标注只读，默认不增强。";
+  try{
+    const augmentation=exportAugmentationOptions();
+    if(augmentation)augmentationMessage=`保留全部原图，每张训练图片额外生成 ${augmentation.copies} 张，训练集最终为原来的 ${augmentation.copies+1} 倍；验证 / 测试张数不变。增强文件是派生标注，未单独人工审核。`;
+  }catch(error){augmentationInvalid=true;augmentationMessage=error.message;}
+  element("augmentationSummary").textContent=augmentationMessage;
+  element("augmentationSummary").dataset.invalid=String(augmentationInvalid);
+  invalid=invalid || augmentationInvalid;
   element("createExport").disabled=invalid || element("createExport").dataset.exporting==="true";
 }
 async function exportDataset() {
   if(!state.project)return;
   if(element("createExport").dataset.exporting==="true")return;
-  let split;
-  try{split=exportSplitOptions();}catch(error){updateExportSplit();toast(error.message);return;}
+  let split,augmentation;
+  try{split=exportSplitOptions();augmentation=exportAugmentationOptions();}catch(error){updateExportSplit();toast(error.message);return;}
   if(!element("reviewedOnly").checked && !window.confirm("你正在导出未审核标注（可能包含模型错误）。确认仅作为待审数据使用，不直接视为真值？"))return;
   element("createExport").dataset.exporting="true";
   element("createExport").disabled=true;
-  element("exportResult").textContent="正在校验图片指纹并生成 ZIP，请稍候…";
+  element("exportResult").textContent=augmentation ? "正在校验图片并生成训练集增强副本和 ZIP，请勿关闭服务…" : "正在校验图片指纹并生成 ZIP，请稍候…";
   try{
     const result=await api(projectUrl("/export"),"POST",{format:element("exportFormat").value,batch:element("exportBatch").value,
-      reviewed_only:element("reviewedOnly").checked,include_images:element("includeImages").checked,split});
+      reviewed_only:element("reviewedOnly").checked,include_images:element("includeImages").checked,split,augmentation});
     const counts=result.split_counts;
     const summary=counts ? `训练 ${counts.train} 张 / 验证 ${counts.val} 张 / 测试 ${counts.test} 张。` : "未划分数据集。";
-    element("exportResult").innerHTML=`<p class="muted">已导出 ${result.images} 张。${summary}<a href="${escapeHtml(result.url)}" download>再次下载 ZIP</a></p>`;
+    const augmentationSummary=result.augmented_images ? `其中原图 ${result.original_images} 张，训练增强 ${result.augmented_images} 张（未单独人工审核）。` : "";
+    element("exportResult").innerHTML=`<p class="muted">已导出 ${result.images} 张。${summary}${augmentationSummary}<a href="${escapeHtml(result.url)}" download>再次下载 ZIP</a></p>`;
     const link=document.createElement("a");link.href=result.url;link.download=result.filename;document.body.append(link);link.click();link.remove();
     toast(`已生成 ${result.images} 张数据的导出包`);
   }catch(error){element("exportResult").textContent=error.message;throw error;}
@@ -906,9 +950,11 @@ listen("iou","input",event=>{element("iouValue").value=Number(event.target.value
 listen("discardPrediction","click",()=>{state.prediction=null;element("predictionDialog").close();});
 listen("appendPrediction","click",()=>applyPrediction(true));listen("replacePrediction","click",()=>applyPrediction(false));
 listen("jobsList","click",async event=>{const button=event.target.closest("[data-cancel-job]");if(button){await api(`/api/jobs/${button.dataset.cancelJob}/cancel`,"POST",{});toast("已请求取消；当前推理结束后停止，不会写入该张结果");}});
-for(const id of ["railExport","exportButton"])listen(id,"click",()=>{if(state.project){updateExportSplit();element("exportDialog").showModal();}});
+for(const id of ["railExport","exportButton"])listen(id,"click",openExportDialog);
 listen("splitDataset","change",updateExportSplit);
 for(const id of ["splitTrain","splitVal","splitTest","splitSeed"])listen(id,"input",updateExportSplit);
+for(const id of ["augmentationPreset","includeImages","reviewedOnly"])listen(id,"change",updateExportSplit);
+for(const id of ["augmentationCopies","augmentationSeed"])listen(id,"input",updateExportSplit);
 listen("createExport","click",exportDataset);
 listen("newProjectButton","click",()=>element("projectDialog").showModal());listen("createProject","click",createProject);
 listen("historyButton","click",showHistory);listen("historyList","click",event=>{const button=event.target.closest("[data-restore]");if(button)return restoreRevision(Number(button.dataset.restore));});

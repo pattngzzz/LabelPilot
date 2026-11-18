@@ -113,5 +113,5 @@ body.focus-mode .canvas-hint { bottom: 5px; opacity: .65; }
 .export-ratios { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 .export-split:disabled { opacity: .5; }
 .export-split p { margin-top: 10px; }
-#exportSplitSummary[data-invalid="true"] { color: var(--red, #f4949a); }
+#exportSplitSummary[data-invalid="true"], #augmentationSummary[data-invalid="true"] { color: var(--red, #f4949a); }
 @media (max-width: 480px) { .export-ratios { grid-template-columns: 1fr; } }

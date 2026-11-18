@@ -85,6 +85,13 @@
       <p id="exportSplitSummary" class="muted" aria-live="polite"></p>
       <p class="muted">相同图片集合、比例和种子可复现划分。小样本按张数取整，每个非零集合至少 1 张；验证 / 测试集可设为 0。验证集为 0 时，YOLO 训练前需另行配置验证数据。</p>
     </fieldset>
+    <fieldset class="export-split"><legend>导出时数据增强（仅训练集）</legend>
+      <label>增强方案<select id="augmentationPreset" disabled><option value="none">不增强 · 保留原样（默认）</option></select></label>
+      <p id="augmentationDescription" class="muted">不生成额外图片。</p>
+      <div class="form-row"><label>每张训练图片额外生成<input id="augmentationCopies" type="number" min="1" max="3" step="1" value="1" disabled></label><label>增强随机种子<input id="augmentationSeed" type="number" min="0" max="4294967295" step="1" value="42" disabled></label></div>
+      <p id="augmentationSummary" class="muted" aria-live="polite"></p>
+      <p class="muted">先按原图划分，再仅给训练集追加增强副本；验证 / 测试集保留原样。仅支持已审核、包含图片的导出。标签名称和 ID 不变，不修改原图或数据库。增强不是新采集数据，也不保证提升效果。</p>
+    </fieldset>
     <p class="muted">按图片随机划分，不保证同源隔离；同视频连续帧、近似或重复图片请检查是否跨集。划分仅作用于导出副本，不修改原图或数据库标注。YOLO 分组导出会生成对应目录和 dataset.yaml；训练时需包含图片。</p>
     <div id="exportResult" aria-live="polite"></div></div><div class="dialog-actions"><button class="button primary" id="createExport">生成 ZIP 并下载</button></div></dialog>
   <dialog id="projectDialog" class="wide-dialog"><form method="dialog" class="dialog-heading"><div><div class="eyebrow">NEW WORKSPACE</div><h2>接入另一个本地数据集</h2></div><button class="icon-button" aria-label="关闭">×</button></form><div class="dialog-body"><p class="muted">原图和原生标注只读引用，新修改写入本工具数据库。支持直接复用，不需要复制整个数据集。</p><label>项目名称<input id="newProjectName" placeholder="例如：产线设备检测"></label><label>图片目录<input id="newImageRoot" placeholder="D:\datasets\images"></label><div class="form-row"><label>原生 Labelme 标注目录（选填）<input id="newAnnotationRoot"></label><label>模型预标注目录（选填）<input id="newPreannotationRoot"></label></div><label>有序类别（每行一个，顺序即 ID）<textarea id="newClasses" rows="4" placeholder="class_a&#10;class_b"></textarea></label><label>或类别映射文件（优先）<input id="newClassMap" placeholder="class_map.json 的 names 字典，或 classes.txt"></label><label>本地检测模型（选填）<input id="newModelPath" placeholder="D:\models\best.pt"></label><label>华聚式 task_manifest.json（选填）<input id="newManifest"></label></div><div class="dialog-actions"><button class="button primary" id="createProject">建立项目</button></div></dialog>

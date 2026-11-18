@@ -115,7 +115,7 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
       await cdp("Input.dispatchMouseEvent", {type:"mousePressed", button:"left", clickCount:1, ...position});
       await cdp("Input.dispatchMouseEvent", {type:"mouseReleased", button:"left", clickCount:1, ...position});
     };
-    const click = async selector => mouseClick(await evaluate(`(()=>{const rect=document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();return {x:rect.x+rect.width/2,y:rect.y+rect.height/2};})()`));
+    const click = async selector => mouseClick(await evaluate(`(()=>{const node=document.querySelector(${JSON.stringify(selector)});node.scrollIntoView({block:"center"});const rect=node.getBoundingClientRect();return {x:rect.x+rect.width/2,y:rect.y+rect.height/2};})()`));
     const point = coordinates => evaluate(`(()=>{const position=screenPoint(${JSON.stringify(coordinates)});const rect=canvas.getBoundingClientRect();return {x:rect.left+position[0],y:rect.top+position[1]};})()`);
     const checkCrosshair = async (position, message) => check(`(()=>{
       const guide=element("canvasCrosshair"),rect=guide.getBoundingClientRect(),bounds=canvas.getBoundingClientRect();
@@ -371,6 +371,8 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await cdp("Browser.setDownloadBehavior", {behavior:"allow", downloadPath:downloads});
     await click("#exportButton");
     await waitFor('element("exportDialog").open');
+    await waitFor('exportAugmentation.loaded');
+    await check('element("augmentationPreset").value==="none" && element("augmentationPreset").options.length===5 && element("augmentationCopies").disabled', "Export defaults to no augmentation and offers four server-provided presets");
     await check('element("splitDataset").checked && element("splitTrain").value==="80" && element("splitVal").value==="10" && element("splitTest").value==="10" && !element("createExport").disabled', "Export defaults to an editable 80/10/10 split");
     const setExportValue = (id, value) => evaluate(`element(${JSON.stringify(id)}).value=${JSON.stringify(String(value))};element(${JSON.stringify(id)}).dispatchEvent(new Event("input",{bubbles:true}));`);
     await evaluate('window.exportApi=api;window.exportRequests=[];api=async(path,method,body)=>{if(path.endsWith("/export"))exportRequests.push(body);const result=await exportApi(path,method,body);if(path.endsWith("/export"))window.lastExportResult=result;return result;};');
@@ -413,6 +415,50 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await check(`exportRequests.at(-1).split===null && JSON.stringify(state.current)===${JSON.stringify(beforeExport)}`, "Exports never change current annotations or their review state");
     await eventually(() => fs.readdirSync(downloads).filter(name => name.endsWith(".zip")).length === 2);
     context.diagnostic("Custom ratios, validation, actual ZIP download and unsplit export passed");
+    await setExportValue("augmentationPreset", "gentle");
+    await evaluate('element("augmentationPreset").dispatchEvent(new Event("change",{bubbles:true}));');
+    await check('element("createExport").disabled && element("augmentationSummary").textContent.includes("先划分")', "Augmentation cannot export an unsplit dataset");
+    const requestsBeforeInvalidAugmentation = await evaluate('exportRequests.length');
+    await evaluate('exportDataset()');
+    await check(`exportRequests.length===${requestsBeforeInvalidAugmentation}`, "Invalid augmentation settings never reach the export API");
+    await click("#splitDataset");
+    await click("#includeImages");
+    await check('element("createExport").disabled && element("augmentationSummary").textContent.includes("包含图片")', "Augmentation requires matching image files");
+    await click("#includeImages");
+    await click("#reviewedOnly");
+    await check('element("createExport").disabled && element("augmentationSummary").textContent.includes("已人工确认")', "Augmentation cannot amplify unreviewed annotations");
+    await click("#reviewedOnly");
+    for (const value of ["",0,4,1.5]) {
+      await setExportValue("augmentationCopies", value);
+      await check('element("createExport").disabled', `Invalid augmentation copy count ${JSON.stringify(value)} disables export`);
+    }
+    await setExportValue("augmentationCopies", 2);
+    await setExportValue("augmentationSeed", 1.5);
+    await check('element("createExport").disabled', "Fractional augmentation seed disables export");
+    await setExportValue("augmentationSeed", 43);
+    for (const preset of ["gentle","lighting","quality","horizontal"]) {
+      await setExportValue("augmentationPreset", preset);
+      await evaluate('element("augmentationPreset").dispatchEvent(new Event("change",{bubbles:true}));');
+      await check('!element("createExport").disabled && element("augmentationDescription").textContent.length>20 && element("augmentationSummary").textContent.includes("3 倍")', `${preset} displays its limitations and added-copy summary`);
+    }
+    const previousDownloads = fs.readdirSync(downloads).filter(name => name.endsWith(".zip"));
+    await click("#createExport");
+    await waitFor('element("exportResult").textContent.includes("训练增强 4 张") && !element("createExport").disabled');
+    await check('lastExportResult.images===8 && lastExportResult.original_images===4 && lastExportResult.augmented_images===4 && JSON.stringify(exportRequests.at(-1).augmentation)===JSON.stringify({preset:"horizontal",copies:2,seed:43})', "Chosen augmentation reaches the backend and reports original plus augmented counts");
+    await eventually(() => fs.readdirSync(downloads).filter(name => name.endsWith(".zip")).length === 3);
+    const augmentedExport = path.join(downloads, fs.readdirSync(downloads).find(name => name.endsWith(".zip") && !previousDownloads.includes(name)));
+    const augmentationCheck = spawnSync(python, ["-c", "import io,json,sys,zipfile; from PIL import Image; archive=zipfile.ZipFile(sys.argv[1]); manifest=json.loads(archive.read('export_manifest.json')); assert manifest['split_counts']=={'train':6,'val':1,'test':1}; originals={item['id']:item for item in manifest['items'] if 'augmentation' not in item}; variants=[item for item in manifest['items'] if 'augmentation' in item]; assert len(originals)==len(variants)==4; assert len({item['image'] for item in manifest['items']})==8; assert all(item['split']==originals[item['source_id']]['split']=='train' for item in variants); assert all(not item['human_reviewed'] for item in variants); [Image.open(io.BytesIO(archive.read(item['image']))).load() for item in variants]; assert all(item['image'].replace('images/','labels/',1).rsplit('.',1)[0]+'.txt' in archive.namelist() for item in manifest['items']); print('Augmented YOLO ZIP decoded and image-label pairing verified')", augmentedExport], {windowsHide:true, encoding:"utf8"});
+    assert.equal(augmentationCheck.status, 0, augmentationCheck.stderr || augmentationCheck.error?.message);
+    await check(`JSON.stringify(state.current)===${JSON.stringify(beforeExport)}`, "Augmented export never alters the current annotation or review state");
+    for (const width of [1600,760,480]) {
+      await cdp("Emulation.setDeviceMetricsOverride", {width,height:1000,deviceScaleFactor:1,mobile:false});
+      await sleep(100);
+      await evaluate('element("augmentationPreset").scrollIntoView({block:"center"});');
+      await check('(()=>{const dialog=element("exportDialog");const rect=dialog.getBoundingClientRect();return rect.left>=0 && rect.right<=innerWidth && rect.top>=0 && rect.bottom<=innerHeight && dialog.scrollWidth<=dialog.clientWidth && element("augmentationPreset").clientWidth>100;})()', `Augmentation controls fit and remain scroll-accessible at width ${width}`);
+    }
+    const augmentationScreenshot = await cdp("Page.captureScreenshot", {format:"png"});
+    fs.writeFileSync(path.join(home,"augmentation-export.png"), Buffer.from(augmentationScreenshot.data,"base64"));
+    context.diagnostic("Four augmentation presets, safety validation, real YOLO ZIP and original annotation preservation passed");
     await evaluate('api=exportApi;');
     assert.deepEqual(errors, [], "No browser runtime errors");
   } finally {
