@@ -1,3 +1,4 @@
+import hashlib
 import io
 import os
 import re
@@ -47,7 +48,7 @@ def create_app(home=None):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
-        if request.url.path == "/" or request.url.path.startswith("/api"):
+        if request.url.path == "/" or request.url.path.startswith(("/api", "/static/")):
             response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -57,7 +58,10 @@ def create_app(home=None):
 
     @app.get("/", response_class=HTMLResponse)
     def index():
-        return (ASSETS / "index.html").read_text(encoding="utf-8").replace("__SESSION_TOKEN__", app.state.token)
+        version = hashlib.sha256(b"".join((ASSETS / name).read_bytes() for name in
+                                         ("index.html", "app.js", "style.css"))).hexdigest()[:16]
+        return (ASSETS / "index.html").read_text(encoding="utf-8").replace(
+            "__SESSION_TOKEN__", app.state.token).replace("__ASSET_VERSION__", version)
 
     @app.get("/api/health")
     def health():

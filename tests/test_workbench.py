@@ -13,6 +13,7 @@ from PIL import Image
 
 from labelpilot.exporting import export_project, plan_splits
 from labelpilot import model_files
+from labelpilot import server
 from labelpilot.inference import Inference, Jobs, model_class_names
 from labelpilot.server import create_app
 from labelpilot.store import Problem, Store, digest
@@ -358,6 +359,33 @@ def test_model_allows_append_only_custom_labels():
     for project_names in (["panel", "object"], ["object"], ["renamed", "panel"]):
         with pytest.raises(Problem, match="ID"):
             model_class_names({0: "object", 1: "panel"}, project_names)
+
+
+def test_asset_versions_change_with_frontend_content(dataset, tmp_path, monkeypatch):
+    assets = tmp_path / "frontend"
+    assets.mkdir()
+    for name in ("index.html", "app.js", "style.css"):
+        (assets / name).write_bytes((server.ASSETS / name).read_bytes())
+    monkeypatch.setattr(server, "ASSETS", assets)
+    with TestClient(create_app(dataset[0])) as client:
+        page = client.get("/")
+        assert page.headers["cache-control"] == "no-store"
+        assert "__ASSET_VERSION__" not in page.text
+        version = re.search(r'/static/app.js\?v=([a-f0-9]{16})', page.text).group(1)
+        assert f'/static/style.css?v={version}' in page.text
+        assert version in client.get("/").text
+        for name in ("app.js", "style.css"):
+            for suffix in ("", f"?v={version}"):
+                response = client.get(f"/static/{name}{suffix}")
+                assert response.status_code == 200
+                assert response.headers["cache-control"] == "no-store"
+            with (assets / name).open("a", encoding="utf-8") as stream:
+                stream.write("\n ")
+            updated = client.get("/").text
+            new_version = re.search(r'/static/app.js\?v=([a-f0-9]{16})', updated).group(1)
+            assert new_version != version
+            assert f'/static/style.css?v={new_version}' in updated
+            version = new_version
 
 
 def test_http_local_security_and_save(dataset):

@@ -43,7 +43,25 @@ test("crosshair guides, annotation, model selection and dataset split export", {
   const port = listener.address().port;
   await new Promise(resolve => listener.close(resolve));
   const url = `http://127.0.0.1:${port}`;
-  const server = spawn(python, ["-m", "uvicorn", "labelpilot.server:create_app", "--factory", "--host", "127.0.0.1", "--port", String(port), "--log-level", "warning"], {
+  const serverCode = `
+import sys
+import uvicorn
+from fastapi.responses import HTMLResponse, Response
+from labelpilot.server import create_app
+app = create_app()
+@app.middleware("http")
+async def legacy_assets(request, call_next):
+    if request.url.path == "/__legacy_cache_test":
+        return HTMLResponse('<link rel="stylesheet" href="/static/style.css"><script src="/static/app.js" defer></script><body>Legacy assets</body>', headers={"Cache-Control": "no-store"})
+    if not request.url.query and request.url.path in ("/static/app.js", "/static/style.css"):
+        script = request.url.path.endswith(".js")
+        return Response("window.legacyAssetLoaded=true;" if script else "body{--legacy-style-loaded:1}",
+                        media_type="application/javascript" if script else "text/css",
+                        headers={"Cache-Control": "public, max-age=31536000, immutable"})
+    return await call_next(request)
+uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
+`;
+  const server = spawn(python, ["-c", serverCode, String(port)], {
     cwd:root, windowsHide:true, env:{...process.env, LABELPILOT_HOME:home, YOLO_CONFIG_DIR:path.join(home,"ultralytics"), MPLCONFIGDIR:path.join(home,"matplotlib")}, stdio:"ignore"
   });
   let browser;
@@ -52,7 +70,7 @@ test("crosshair guides, annotation, model selection and dataset split export", {
   const errors = [];
   try {
     await eventually(async () => {try {return (await fetch(`${url}/api/health`)).ok;} catch {return false;}});
-    browser = spawn(chrome, ["--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "--window-size=1600,1000", url], {windowsHide:true, stdio:"ignore"});
+    browser = spawn(chrome, ["--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "--window-size=1600,1000", `${url}/__legacy_cache_test`], {windowsHide:true, stdio:"ignore"});
     const activePort = path.join(profile, "DevToolsActivePort");
     await eventually(() => fs.existsSync(activePort));
     const debugPort = fs.readFileSync(activePort, "utf8").split("\n")[0];
@@ -121,8 +139,12 @@ test("crosshair guides, annotation, model selection and dataset split export", {
     };
     await cdp("Page.enable");
     await cdp("Runtime.enable");
+    await eventually(()=>evaluate('window.legacyAssetLoaded===true && getComputedStyle(document.body).getPropertyValue("--legacy-style-loaded").trim()==="1"'));
+    context.diagnostic("Browser starts with long-lived cached legacy JavaScript and CSS on the same origin");
+    await cdp("Page.navigate", {url});
     await cdp("Emulation.setDeviceMetricsOverride", {width:1600, height:1000, deviceScaleFactor:1, mobile:false});
     await waitFor('typeof state!=="undefined" && state.current && !state.busy');
+    await check('window.legacyAssetLoaded!==true && getComputedStyle(document.body).getPropertyValue("--legacy-style-loaded").trim()!=="1" && /[?&]v=[a-f0-9]{16}/.test(document.querySelector("script[src]").src) && /[?&]v=[a-f0-9]{16}/.test(document.querySelector("link[rel=stylesheet]").href)', "A normal navigation bypasses cached legacy assets and loads a matching versioned script and stylesheet");
     let cursor=await point([320,240]);
     await cdp("Input.dispatchMouseEvent", {type:"mouseMoved", buttons:0, ...cursor});
     await check('element("canvasCrosshair").hidden', "Selection mode does not show rectangle crosshair guides");
