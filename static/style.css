@@ -10,6 +10,9 @@
 .label-composer input { padding: 7px 8px; font-size: 11px; }
 .label-composer .button { padding: 5px 9px; font-size: 17px; }
 .label-composer small { display: block; margin-top: 6px; color: var(--muted); font-size: 9px; }
+.label-export { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 8px 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.label-export .button { padding: 6px 9px; font-size: 11px; }
+.label-export small { color: var(--muted); font-size: 10px; }
 .focus-toggle { padding: 6px 9px; margin-left: 4px; font-size: 10px; }
 .focus-toggle[aria-pressed="true"] { background: #9770ff24; color: #cbb8ff; border-color: #9770ff66; }
 .class-row > span:nth-child(2) { overflow-wrap: anywhere; }

@@ -44,6 +44,7 @@ function filters() { return {query:element("searchInput").value.trim(),batch:ele
 function setBusy(value, message="") {
   state.busy = value;
   for (const id of ["predictButton","singlePredict","batchPredict","saveModel","saveButton","reviewButton","skipButton","previousImage","nextImage","projectSelect","deleteShape","shapeClass","shapeDescription","shapeDifficult","newLabelInput","addLabelButton"]) element(id).disabled = value;
+  element("exportLabelsButton").disabled = value || !state.project?.classes.length;
   element("connectionStatus").textContent = value ? message || "正在处理…" : "本地工作区 · 仅本机可访问";
   updateCrosshair();
 }
@@ -247,6 +248,7 @@ function undo(redo=false) {
 
 function classInfo(label) { return state.project.classes.find(item => item.name === label) || {name:label,display:label,color:"#f87171"}; }
 function renderClasses() {
+  element("exportLabelsButton").disabled = state.busy || element("addLabelButton").disabled;
   element("classList").innerHTML = state.project.classes.map((item,index) => `<button class="class-row ${state.activeClass === index ? "selected" : ""}" data-class="${index}" title="${escapeHtml(item.name)}"><span class="class-swatch" style="background:${item.color}"></span><span>${escapeHtml(item.name)}<small>ID ${item.id}</small></span>${index < 9 ? `<kbd>${index + 1}</kbd>` : ""}</button>`).join("");
   const previousLabel = element("shapeClass").value;
   element("shapeClass").innerHTML = state.project.classes.map(item => `<option value="${escapeHtml(item.name)}">${item.id} · ${escapeHtml(item.name)}</option>`).join("");
@@ -255,12 +257,30 @@ function renderClasses() {
   element("activeClassText").textContent = `绘制标签：${state.project.classes[state.activeClass].name}`;
 }
 
+function exportLabels() {
+  if (!state.project || state.busy || state.labelPickerSaving || element("addLabelButton").disabled) return;
+  const names = state.project.classes.map(item => item.name);
+  const url = URL.createObjectURL(new Blob([names.join("\n") + "\n"], {type:"text/plain;charset=utf-8"}));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "classes.txt";
+  document.body.append(link);
+  try {
+    link.click();
+    toast(`已发起下载 classes.txt · ${names.length} 个标签 · 保留原始名称与 ID 顺序`);
+  } finally {
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
+}
+
 async function addCustomLabel() {
   if (!state.project || state.busy) return;
   const name = element("newLabelInput").value.trim();
   if (!name) return toast("请输入标签名称", true);
   const projectId = state.project.id;
   element("addLabelButton").disabled = true;
+  element("exportLabelsButton").disabled = true;
   element("newLabelInput").disabled = true;
   try {
     const project = await api(projectUrl("/labels"), "POST", {name});
@@ -282,6 +302,7 @@ async function addCustomLabel() {
   } finally {
     element("addLabelButton").disabled = false;
     element("newLabelInput").disabled = false;
+    element("exportLabelsButton").disabled = state.busy || !state.project?.classes.length;
   }
 }
 
@@ -936,6 +957,7 @@ listen("undoButton","click",()=>undo());listen("redoButton","click",()=>undo(tru
 listen("zoomOut","click",()=>zoom(.8));listen("zoomIn","click",()=>zoom(1.25));listen("fitButton","click",fitImage);
 listen("focusButton","click",()=>toggleFocusMode());
 element("labelForm").addEventListener("submit",event=>{event.preventDefault();addCustomLabel().catch(error=>toast(error.message,true));});
+listen("exportLabelsButton","click",exportLabels);
 element("pickerLabelForm").addEventListener("submit",event=>{event.preventDefault();applyPickedLabel().catch(error=>toast(error.message,true));});
 element("labelPicker").addEventListener("keydown",event=>{
   if(event.key.toLowerCase()!=="q" || event.ctrlKey || event.metaKey || event.altKey || event.isComposing)return;
