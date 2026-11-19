@@ -176,19 +176,30 @@ def test_augmentation_export_train_only_and_preservation(reviewed_store, dataset
             assert entry["split"] == source["split"] == "train"
             assert not entry["human_reviewed"] and entry["status"] == "augmented"
             contents = archive.read(entry["image"])
+            angle = entry["augmentation"]["operations"].get("rotation_degrees", 0)
+            width, height = (120, 240) if angle in (90, 270) else (240, 120)
             assert hashlib.sha256(contents).hexdigest() == entry["sha256"]
             with Image.open(io.BytesIO(contents)) as image:
                 image.load()
-                assert image.size == (240, 120) and image.format == "JPEG"
+                assert image.size == (width, height) and image.format == "JPEG"
             original = store.detail("test", entry["source_id"])["document"]
             expected = copy.deepcopy(original["shapes"])
             if entry["augmentation"]["preset"] == "horizontal":
                 for shape in expected:
                     shape["points"] = [[240 - point[0], point[1]] for point in shape["points"]]
+            elif angle:
+                for shape in expected:
+                    if angle == 90:
+                        shape["points"] = [[point[1], 240 - point[0]] for point in shape["points"]]
+                    elif angle == 180:
+                        shape["points"] = [[240 - point[0], 120 - point[1]] for point in shape["points"]]
+                    else:
+                        shape["points"] = [[120 - point[1], point[0]] for point in shape["points"]]
             stem = Path(entry["image"]).stem
             if format_name == "labelme":
                 document = json.loads(archive.read(f"annotations/train/{stem}.json"))
                 assert document["shapes"] == expected
+                assert (document["imageWidth"], document["imageHeight"]) == (width, height)
                 assert document["flags"] == original["flags"]
                 if "custom_top_level" in original:
                     assert document["custom_top_level"] == original["custom_top_level"]
@@ -204,11 +215,13 @@ def test_augmentation_export_train_only_and_preservation(reviewed_store, dataset
                     xs, ys = zip(*shape["points"])
                     assert values[0] == "0"
                     assert list(map(float, values[1:])) == pytest.approx([
-                        (min(xs) + max(xs)) / 480, (min(ys) + max(ys)) / 240,
-                        (max(xs) - min(xs)) / 240, (max(ys) - min(ys)) / 120])
+                        (min(xs) + max(xs)) / (2 * width), (min(ys) + max(ys)) / (2 * height),
+                        (max(xs) - min(xs)) / width, (max(ys) - min(ys)) / height])
             else:
                 document = json.loads(archive.read("annotations/train.json"))
                 image_id = next(image["id"] for image in document["images"] if image["file_name"] == entry["image"])
+                metadata = next(image for image in document["images"] if image["id"] == image_id)
+                assert (metadata["width"], metadata["height"]) == (width, height)
                 shapes = [shape for shape in document["annotations"] if shape["image_id"] == image_id]
                 assert len(shapes) == len(expected)
                 for annotation, shape in zip(shapes, expected):
@@ -251,7 +264,7 @@ def test_all_augmentation_matches_independent_presets_and_seeded_split(reviewed_
             assert {entry["id"]: entry["split"] for entry in changed_manifest["items"]} == {
                 entry["id"]: entry["split"] for entry in manifest["items"]}
             for entry in changed_manifest["items"]:
-                if "augmentation" in entry:
+                if "augmentation" in entry and entry["augmentation"]["preset"] != "rotation":
                     assert entry["augmentation"]["operations"] != variants[entry["id"]]["augmentation"]["operations"]
 
 
@@ -292,6 +305,96 @@ def test_augmentation_flip_geometry_and_pixels(store, format_name):
             assert list(map(float, lines[-1].split()[1:])) == [0.5, 0.5, 1.0, 1.0]
 
 
+@pytest.mark.parametrize("format_name", ["labelme", "coco", "yolo"])
+def test_rotation_all_angles_geometry_pixels_and_export_dimensions(store, format_name):
+    source = Path(store.project("test").item(item(store, "human")["id"])["path"])
+    with Image.new("RGB", (240, 120), "red") as image:
+        image.paste("#00ff00", (120, 0, 240, 60))
+        image.paste("blue", (0, 60, 120, 120))
+        image.paste("yellow", (120, 60, 240, 120))
+        image.save(source)
+    data = payload(store, "human", "reviewed")
+    data["document"]["shapes"].append({"label": "object", "shape_type": "rectangle",
+                                         "points": [[0, 0], [240, 0], [240, 120], [0, 120]]})
+    if format_name != "yolo":
+        data["document"]["shapes"].append({"label": "object", "shape_type": "polygon",
+                                             "points": [[10, 10], [80, 10], [80, 50]]})
+    store.save("test", item(store, "human")["id"], data)
+    saved = store.detail("test", item(store, "human")["id"])
+    fingerprint = digest(source)
+    expected_points = {90: [[10, 227.5], [70, 130]], 180: [[227.5, 110], [130, 50]],
+                       270: [[110, 12.5], [50, 110]]}
+    expected_polygons = {90: [[10, 230], [10, 160], [50, 160]],
+                         180: [[230, 110], [160, 110], [160, 70]],
+                         270: [[110, 10], [110, 80], [70, 80]]}
+    expected_colors = {90: (0, 255, 0), 180: (255, 255, 0), 270: (0, 0, 255)}
+    result = export_project(store, "test", {"format": format_name, "split": {"train": 100, "val": 0, "test": 0},
+                                            "augmentation": {"preset": "rotation", "copies": 3}})
+    assert result["images"] == 4 and result["integrity_check"]["augmented_images_checked"] == 3
+    with zipfile.ZipFile(store.home / "exports" / result["filename"]) as archive:
+        variants = [entry for entry in json.loads(archive.read("export_manifest.json"))["items"] if "augmentation" in entry]
+        assert {entry["augmentation"]["operations"]["rotation_degrees"] for entry in variants} == {90, 180, 270}
+        for entry in variants:
+            angle = entry["augmentation"]["operations"]["rotation_degrees"]
+            width, height = (120, 240) if angle != 180 else (240, 120)
+            with Image.open(io.BytesIO(archive.read(entry["image"]))) as image:
+                assert image.size == (width, height)
+                assert max(abs(actual - expected) for actual, expected in zip(image.getpixel((20, 20)), expected_colors[angle])) < 15
+            xs, ys = zip(*expected_points[angle])
+            bounds = [min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)]
+            if format_name == "labelme":
+                document = json.loads(archive.read("annotations/train/" + Path(entry["image"]).stem + ".json"))
+                assert (document["imageWidth"], document["imageHeight"]) == (width, height)
+                assert document["shapes"][0] == {**data["document"]["shapes"][0], "points": expected_points[angle]}
+                assert document["shapes"][-1]["points"] == expected_polygons[angle]
+                border = document["shapes"][1]["points"]
+                assert {tuple(point) for point in border} == {(0, 0), (width, 0), (width, height), (0, height)}
+            elif format_name == "coco":
+                document = json.loads(archive.read("annotations/train.json"))
+                image = next(image for image in document["images"] if image["file_name"] == entry["image"])
+                assert (image["width"], image["height"]) == (width, height)
+                annotations = [shape for shape in document["annotations"] if shape["image_id"] == image["id"]]
+                assert annotations[0]["bbox"] == bounds
+                assert annotations[1]["bbox"] == [0, 0, width, height]
+                assert annotations[-1]["segmentation"] == [[coordinate for point in expected_polygons[angle] for coordinate in point]]
+                assert annotations[-1]["area"] == 1400
+            else:
+                lines = archive.read("labels/train/" + Path(entry["image"]).stem + ".txt").decode().splitlines()
+                assert len(lines) == 2
+                assert list(map(float, lines[0].split()[1:])) == pytest.approx([
+                    (min(xs) + max(xs)) / (2 * width), (min(ys) + max(ys)) / (2 * height),
+                    bounds[2] / width, bounds[3] / height])
+                assert list(map(float, lines[-1].split()[1:])) == [0.5, 0.5, 1.0, 1.0]
+    assert digest(source) == fingerprint
+    assert store.detail("test", item(store, "human")["id"]) == saved
+
+
+@pytest.mark.parametrize("corruption", ["angle", "missing_angle", "variant", "size", "unrotated", "missing", "shift"])
+def test_rotation_integrity_rejects_inconsistent_geometry(store, corruption):
+    current = store.detail("test", item(store, "human")["id"])
+    source = current["document"]
+    settings = plan_augmentation({"split": {}, "augmentation": {"preset": "rotation", "copies": 3}})
+    path = store.project("test").item(current["item"]["id"])["path"]
+    variants = augmented_variants(path, source, "human", current["image_sha256"], settings)
+    _, contents, augmented, provenance = next(entry for entry in variants if entry[3]["operations"]["rotation_degrees"] == 90)
+    if corruption == "angle":
+        provenance["operations"]["rotation_degrees"] = 180
+    elif corruption == "missing_angle":
+        provenance["operations"].pop("rotation_degrees")
+    elif corruption == "variant":
+        provenance["variant"] = True
+    elif corruption == "size":
+        augmented["imageWidth"], augmented["imageHeight"] = 240, 120
+    elif corruption == "unrotated":
+        augmented["shapes"] = copy.deepcopy(source["shapes"])
+    elif corruption == "missing":
+        augmented["shapes"].clear()
+    else:
+        augmented["shapes"][0]["points"][0][0] += 1
+    with pytest.raises(Problem, match="已中止导出"):
+        validate_augmented_sample(source, augmented, contents, settings, provenance)
+
+
 @pytest.mark.parametrize("settings", [False, [], {}, {"preset": "unknown"}, {"preset": []},
     *({"preset": "gentle", "copies": value} for value in (False, 0, 4, 1.5, "1")),
     *({"preset": "gentle", "seed": value} for value in (True, -1, 4294967296, 1.5, "42")),
@@ -312,18 +415,26 @@ def test_augmentation_requires_split_images_and_review(reviewed_store, extra):
     assert not (reviewed_store.home / "exports").exists()
 
 
-def test_augmentation_seed_and_copy_prefix_stability(store):
+@pytest.mark.parametrize("preset", ["gentle", "rotation"])
+def test_augmentation_seed_and_copy_prefix_stability(store, preset):
     current = store.detail("test", item(store, "human")["id"])
     source = store.project("test").item(current["item"]["id"])["path"]
-    options = {"split": {"train": 100, "val": 0, "test": 0}, "augmentation": {"preset": "gentle", "copies": 3}}
+    options = {"split": {"train": 100, "val": 0, "test": 0}, "augmentation": {"preset": preset, "copies": 3}}
     settings = plan_augmentation(options)
     before = copy.deepcopy(current["document"])
     variants = list(augmented_variants(source, before, "human", current["image_sha256"], settings))
     fewer = list(augmented_variants(source, before, "human", current["image_sha256"], {**settings, "copies": 1}))
     changed = list(augmented_variants(source, before, "human", current["image_sha256"], {**settings, "seed": 43}))
     assert before == current["document"] and variants[0] == fewer[0]
-    assert [entry[3]["operations"] for entry in variants] != [entry[3]["operations"] for entry in changed]
-    assert len({entry[1] for entry in variants}) == 3
+    if preset == "rotation":
+        assert {entry[3]["operations"]["rotation_degrees"] for entry in variants} == {90, 180, 270}
+        sequences = {tuple(entry[3]["operations"]["rotation_degrees"] for entry in
+                           augmented_variants(source, before, "human", current["image_sha256"], {**settings, "seed": seed}))
+                     for seed in range(8)}
+        assert len(sequences) > 1
+    else:
+        assert [entry[3]["operations"] for entry in variants] != [entry[3]["operations"] for entry in changed]
+        assert len({entry[1] for entry in variants}) == 3
 
 
 @pytest.mark.parametrize("preset,multiplier", [("gentle", 1500), ("all", 400)])
@@ -344,7 +455,7 @@ def test_augmentation_limit_and_failed_decode_cleanup(reviewed_store, monkeypatc
 
 
 @pytest.mark.parametrize("corruption", ["shift", "missing", "label"])
-@pytest.mark.parametrize("preset", ["horizontal", "all"])
+@pytest.mark.parametrize("preset", ["horizontal", "rotation", "all"])
 def test_augmented_box_shift_missing_or_label_change_aborts_export(store, monkeypatch, corruption, preset):
     import labelpilot.exporting as exporting
 
@@ -352,7 +463,7 @@ def test_augmented_box_shift_missing_or_label_change_aborts_export(store, monkey
     source_generator = exporting.augmented_variants
     def corrupted_variants(*args, **kwargs):
         for index, contents, augmented, provenance in source_generator(*args, **kwargs):
-            if augmented["shapes"] and provenance["preset"] == "horizontal":
+            if augmented["shapes"] and provenance["preset"] == ("rotation" if preset == "rotation" else "horizontal"):
                 if corruption == "shift":
                     augmented["shapes"][0]["points"][0][0] += 1
                 elif corruption == "missing":
@@ -453,12 +564,14 @@ def test_augmented_raster_objects_remain_aligned_with_boxes(tmp_path, preset, se
         assert [shape["label"] for shape in augmented["shapes"]] == ["Raw_Label-1", "Raw_Label-2"]
         with Image.open(io.BytesIO(contents)) as image:
             mask = image.convert("L").point(lambda value: 255 if value > 100 else 0)
-            for index, shape in enumerate(augmented["shapes"]):
+            for shape in augmented["shapes"]:
                 xs, ys = zip(*shape["points"])
-                upper, lower = ((0, 39) if index == 0 else (39, 79))
-                raster_bounds = mask.crop((0, upper, 101, lower)).getbbox()
+                left, upper = max(0, min(xs) - 4), max(0, min(ys) - 4)
+                right, lower = min(image.width, max(xs) + 4), min(image.height, max(ys) + 4)
+                raster_bounds = mask.crop((left, upper, right, lower)).getbbox()
                 assert raster_bounds is not None
-                raster_bounds = [raster_bounds[0], raster_bounds[1] + upper, raster_bounds[2], raster_bounds[3] + upper]
+                raster_bounds = [raster_bounds[0] + left, raster_bounds[1] + upper,
+                                 raster_bounds[2] + left, raster_bounds[3] + upper]
                 expected = [min(xs), min(ys), max(xs), max(ys)]
                 assert max(abs(actual - target) for actual, target in zip(raster_bounds, expected)) <= 1
     assert document == before

@@ -33,6 +33,12 @@ PRESETS = {
         "brightness": (0.85, 1.15), "contrast": (0.90, 1.10), "color": (0.90, 1.10),
         "horizontal_flip": True,
     },
+    "rotation": {
+        "name": "图片旋转（90° / 180° / 270°）",
+        "description": "逆时针旋转 90°、180° 或 270°，保留完整画面并同步框 / 多边形；90° / 270° 交换宽高。每张原图按种子确定角度顺序，生成 3 张时覆盖三个角度。仅适合方向无关场景。",
+        "brightness": (1.0, 1.0), "contrast": (1.0, 1.0), "color": (1.0, 1.0),
+        "rotation": True,
+    },
 }
 
 
@@ -40,8 +46,8 @@ def augmentation_presets():
     presets = [{"id": name, "name": preset["name"], "description": preset["description"], "preset_count": 1}
                for name, preset in PRESETS.items()]
     presets.append({"id": "all", "name": "全部方案（分别生成）", "preset_count": len(PRESETS),
-                    "description": "轻量通用、光照变化、画质扰动、水平翻转四种方案分别从原图生成，不连续叠加。"
-                                   "含镜像和模糊：文字、方向有含义或特别小的目标请谨慎，不适合时改选单一方案。"})
+                    "description": "轻量通用、光照变化、画质扰动、水平翻转、图片旋转五种方案分别从原图生成，不连续叠加。"
+                                   "含镜像、旋转和模糊：文字、方向有含义或特别小的目标请谨慎，不适合时改选单一方案。"})
     return {"presets": presets, "max_copies": MAX_COPIES}
 
 
@@ -73,13 +79,35 @@ def plan_augmentation(options):
             "output": "JPEG", "alpha_background": "white"}
 
 
+def rotation_angles(source_id, source_sha256, settings):
+    material = f"labelpilot-rotation-v1:{settings['seed']}:{source_id}:{source_sha256}"
+    angles = [90, 180, 270]
+    random.Random(int.from_bytes(hashlib.sha256(material.encode()).digest(), "big")).shuffle(angles)
+    return angles
+
+
 def validate_augmented_sample(source, augmented, contents, settings, provenance):
     def reject(reason):
         raise Problem(f"增强标注一致性校验失败：{reason}；已中止导出，不会丢弃对象或自动修框", 422)
 
-    size = (source["imageWidth"], source["imageHeight"])
+    width, height = source["imageWidth"], source["imageHeight"]
+    horizontal = PRESETS[settings["preset"]].get("horizontal_flip", False)
+    operations = provenance.get("operations", {})
+    angle = operations.get("rotation_degrees", 0)
+    if PRESETS[settings["preset"]].get("rotation"):
+        variant = provenance.get("variant")
+        if isinstance(variant, bool) or not isinstance(variant, int) or not 1 <= variant <= settings["copies"]:
+            reject("旋转副本编号无效")
+        expected_angle = rotation_angles(provenance.get("source_id"), provenance.get("source_sha256"), settings)[variant - 1]
+        if isinstance(angle, bool) or angle != expected_angle:
+            reject("旋转角度与种子及副本编号不一致")
+    elif angle != 0:
+        reject("非旋转方案出现旋转操作")
+    if provenance.get("preset") != settings["preset"] or operations.get("horizontal_flip") is not horizontal:
+        reject("增强操作与所选方案不一致")
+    size = (height, width) if angle in (90, 270) else (width, height)
     if (augmented.get("imageWidth"), augmented.get("imageHeight")) != size:
-        reject("图片尺寸被改变")
+        reject("图片尺寸与几何变换不一致")
     try:
         with Image.open(io.BytesIO(contents)) as image:
             image.load()
@@ -89,9 +117,6 @@ def validate_augmented_sample(source, augmented, contents, settings, provenance)
         raise Problem("增强图片无法完整解码，已中止导出", 422) from error
     if augmented.get("labelpilot", {}).get("image_sha256") != hashlib.sha256(contents).hexdigest():
         reject("增强图片指纹不匹配")
-    horizontal = PRESETS[settings["preset"]].get("horizontal_flip", False)
-    if provenance.get("preset") != settings["preset"] or provenance.get("operations", {}).get("horizontal_flip") is not horizontal:
-        reject("增强操作与所选方案不一致")
     shapes = augmented.get("shapes")
     if not isinstance(shapes, list) or len(shapes) != len(source["shapes"]):
         reject("标注对象数量发生变化")
@@ -100,7 +125,13 @@ def validate_augmented_sample(source, augmented, contents, settings, provenance)
             reject(f"第 {index} 个对象格式无效")
         expected = copy.deepcopy(original)
         if horizontal:
-            expected["points"] = [[size[0] - point[0], point[1]] for point in original["points"]]
+            expected["points"] = [[width - point[0], point[1]] for point in original["points"]]
+        if angle == 90:
+            expected["points"] = [[point[1], width - point[0]] for point in original["points"]]
+        elif angle == 180:
+            expected["points"] = [[width - point[0], height - point[1]] for point in original["points"]]
+        elif angle == 270:
+            expected["points"] = [[height - point[1], point[0]] for point in original["points"]]
         if actual != expected:
             reject(f"第 {index} 个对象的标签、坐标或属性不匹配")
         for point in actual["points"]:
@@ -112,6 +143,7 @@ def validate_augmented_sample(source, augmented, contents, settings, provenance)
 
 def augmented_variants(path, document, source_id, source_sha256, settings):
     preset = PRESETS[settings["preset"]]
+    angles = rotation_angles(source_id, source_sha256, settings) if preset.get("rotation") else None
     with Image.open(path) as source:
         if source.mode in ("RGBA", "LA") or "transparency" in source.info:
             rgba = source.convert("RGBA")
@@ -134,6 +166,23 @@ def augmented_variants(path, document, source_id, source_sha256, settings):
             image = ImageOps.mirror(image)
             for shape in augmented["shapes"]:
                 shape["points"] = [[image.width - point[0], point[1]] for point in shape["points"]]
+        if angles:
+            angle = angles[index - 1]
+            operations["rotation_degrees"] = angle
+            width, height = image.size
+            if angle == 90:
+                image = image.transpose(Image.Transpose.ROTATE_90)
+                for shape in augmented["shapes"]:
+                    shape["points"] = [[point[1], width - point[0]] for point in shape["points"]]
+            elif angle == 180:
+                image = image.transpose(Image.Transpose.ROTATE_180)
+                for shape in augmented["shapes"]:
+                    shape["points"] = [[width - point[0], height - point[1]] for point in shape["points"]]
+            else:
+                image = image.transpose(Image.Transpose.ROTATE_270)
+                for shape in augmented["shapes"]:
+                    shape["points"] = [[height - point[1], point[0]] for point in shape["points"]]
+            augmented["imageWidth"], augmented["imageHeight"] = image.size
         if operations["blur_radius"]:
             image = image.filter(ImageFilter.GaussianBlur(operations["blur_radius"]))
         with io.BytesIO() as buffer:

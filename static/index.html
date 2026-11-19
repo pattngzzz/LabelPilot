@@ -91,7 +91,7 @@
       <p id="augmentationDescription" class="muted">不生成额外图片。</p>
       <div class="form-row"><label><span id="augmentationCopiesLabel">每张训练图片额外生成</span><input id="augmentationCopies" type="number" min="1" max="3" step="1" value="1" disabled></label><label>增强随机种子<input id="augmentationSeed" type="number" min="0" max="4294967295" step="1" value="42" disabled></label></div>
       <p id="augmentationSummary" class="muted" aria-live="polite"></p>
-      <p class="muted">数量建议：先用轻量方案额外 1 张；选“全部方案”建议每方案 1 张，即每张原图增加 4 张、共 5 张。增强随机种子用于复现随机参数，默认 42 即可；它不是增强强度，与划分种子独立。</p>
+      <p class="muted">数量建议：先用轻量方案额外 1 张；选“全部方案”建议每方案 1 张，即每张原图增加 5 张、共 6 张。旋转方案支持 90° / 180° / 270°，生成 3 张时覆盖三个角度，不裁剪画面。增强随机种子用于复现随机参数，默认 42 即可；它不是增强强度，与划分种子独立。</p>
       <p class="muted">先按原图划分，再仅给训练集追加增强副本；验证 / 测试集保留原样。仅支持已审核、包含图片的导出。标签名称和 ID 不变，不修改原图或数据库。增强不是新采集数据，也不保证提升效果。</p>
     </fieldset>
     <p class="muted">按图片随机划分，不保证同源隔离；同视频连续帧、近似或重复图片请检查是否跨集。划分仅作用于导出副本，不修改原图或数据库标注。YOLO 分组导出会生成对应目录和 dataset.yaml；训练时需包含图片。</p>

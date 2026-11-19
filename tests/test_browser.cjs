@@ -378,7 +378,7 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await click("#exportButton");
     await waitFor('element("exportDialog").open');
     await waitFor('exportAugmentation.loaded');
-    await check('element("augmentationPreset").value==="none" && element("augmentationPreset").options.length===6 && element("augmentationCopies").disabled', "Export defaults to no augmentation and offers four presets plus all-presets mode");
+    await check('element("augmentationPreset").value==="none" && element("augmentationPreset").options.length===7 && element("augmentationCopies").disabled', "Export defaults to no augmentation and offers five presets plus all-presets mode");
     await check('element("splitDataset").checked && element("splitTrain").value==="80" && element("splitVal").value==="10" && element("splitTest").value==="10" && !element("createExport").disabled', "Export defaults to an editable 80/10/10 split");
     const setExportValue = (id, value) => evaluate(`element(${JSON.stringify(id)}).value=${JSON.stringify(String(value))};element(${JSON.stringify(id)}).dispatchEvent(new Event(element(${JSON.stringify(id)}).tagName==="SELECT" ? "change" : "input",{bubbles:true}));`);
     await evaluate('window.exportApi=api;window.exportRequests=[];api=async(path,method,body)=>{if(path.endsWith("/export"))exportRequests.push(body);const result=await exportApi(path,method,body);if(path.endsWith("/export"))window.lastExportResult=result;return result;};');
@@ -442,7 +442,7 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await setExportValue("augmentationSeed", 1.5);
     await check('element("createExport").disabled', "Fractional augmentation seed disables export");
     await setExportValue("augmentationSeed", 43);
-    for (const preset of ["gentle","lighting","quality","horizontal"]) {
+    for (const preset of ["gentle","lighting","quality","rotation","horizontal"]) {
       await setExportValue("augmentationPreset", preset);
       await evaluate('element("augmentationPreset").dispatchEvent(new Event("change",{bubbles:true}));');
       await check('!element("createExport").disabled && element("augmentationDescription").textContent.length>20 && element("augmentationSummary").textContent.includes("3 倍")', `${preset} displays its limitations and added-copy summary`);
@@ -458,20 +458,64 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await check('element("exportResult").textContent.includes("标注完整性校验通过")', "Export displays the completed runtime image and object integrity checks");
     await check(`JSON.stringify(state.current)===${JSON.stringify(beforeExport)}`, "Augmented export never alters the current annotation or review state");
     await setExportValue("augmentationPreset", "all");
-    await check('element("augmentationCopiesLabel").textContent.includes("每种方案") && element("augmentationSummary").textContent.includes("额外生成 8 张") && element("augmentationSummary").textContent.includes("9 倍")', "All-presets mode counts copies per preset and displays the true total");
+    await check('element("augmentationCopiesLabel").textContent.includes("每种方案") && element("augmentationSummary").textContent.includes("额外生成 10 张") && element("augmentationSummary").textContent.includes("11 倍")', "All-presets mode counts copies per preset and displays the true total");
     await setExportValue("augmentationCopies", 3);
-    await check('element("augmentationSummary").textContent.includes("额外生成 12 张") && element("augmentationSummary").textContent.includes("13 倍")', "All-presets mode correctly counts the maximum copy setting");
+    await check('element("augmentationSummary").textContent.includes("额外生成 15 张") && element("augmentationSummary").textContent.includes("16 倍")', "All-presets mode correctly counts the maximum copy setting");
     await setExportValue("augmentationCopies", 1);
-    await check('element("augmentationSummary").textContent.includes("每方案 1 张") && element("augmentationSummary").textContent.includes("含原图共 5 张") && element("augmentationDescription").textContent.includes("不连续叠加")', "All-presets mode explains independent generation and the recommended count");
+    await check('element("augmentationSummary").textContent.includes("每方案 1 张") && element("augmentationSummary").textContent.includes("含原图共 6 张") && element("augmentationDescription").textContent.includes("不连续叠加")', "All-presets mode explains independent generation and the recommended count");
     const downloadsBeforeAll = fs.readdirSync(downloads).filter(name => name.endsWith(".zip"));
     await click("#createExport");
-    await waitFor('element("exportResult").textContent.includes("训练增强 8 张") && !element("createExport").disabled');
-    await check('lastExportResult.images===12 && lastExportResult.augmented_images===8 && lastExportResult.split_counts.train===10 && JSON.stringify(exportRequests.at(-1).augmentation)===JSON.stringify({preset:"all",copies:1,seed:43})', "All-presets selection reaches the backend with correct train-only totals");
+    await waitFor('element("exportResult").textContent.includes("训练增强 10 张") && !element("createExport").disabled');
+    await check('lastExportResult.images===14 && lastExportResult.augmented_images===10 && lastExportResult.split_counts.train===12 && JSON.stringify(exportRequests.at(-1).augmentation)===JSON.stringify({preset:"all",copies:1,seed:43})', "All-presets selection reaches the backend with correct train-only totals");
     await eventually(() => fs.readdirSync(downloads).filter(name => name.endsWith(".zip")).length === 4);
     const allExport = path.join(downloads, fs.readdirSync(downloads).find(name => name.endsWith(".zip") && !downloadsBeforeAll.includes(name)));
-    const allCheck = spawnSync(python, ["-c", "import io,json,sys,zipfile; from PIL import Image; archive=zipfile.ZipFile(sys.argv[1]); manifest=json.loads(archive.read('export_manifest.json')); assert manifest['split_counts']=={'train':10,'val':1,'test':1}; assert manifest['augmentation']['preset']=='all' and manifest['augmentation']['variants_per_image']==4; assert manifest['integrity_check']['passed'] and manifest['integrity_check']['augmented_images_checked']==8; originals={item['id']:item for item in manifest['items'] if 'augmentation' not in item}; variants=[item for item in manifest['items'] if 'augmentation' in item]; assert len(originals)==4 and len(variants)==8; assert len({item['image'] for item in manifest['items']})==12; assert len(archive.namelist())==len(set(archive.namelist())); assert all({entry['augmentation']['preset'] for entry in variants if entry['source_id']==item['id']}==({'gentle','lighting','quality','horizontal'} if item['split']=='train' else set()) for item in originals.values()); assert all(item['split']==originals[item['source_id']]['split']=='train' and item['annotation_count']==originals[item['source_id']]['annotation_count'] for item in variants); [Image.open(io.BytesIO(archive.read(item['image']))).load() for item in variants]; assert all(len(archive.read(item['image'].replace('images/','labels/',1).rsplit('.',1)[0]+'.txt').decode().splitlines())==item['annotation_count'] for item in manifest['items']); print('All four presets independently downloaded with matching boxes and unique paths')", allExport], {windowsHide:true, encoding:"utf8"});
+    const allCheck = spawnSync(python, ["-c", "import io,json,sys,zipfile; from PIL import Image; archive=zipfile.ZipFile(sys.argv[1]); manifest=json.loads(archive.read('export_manifest.json')); assert manifest['split_counts']=={'train':12,'val':1,'test':1}; assert manifest['augmentation']['preset']=='all' and manifest['augmentation']['variants_per_image']==5; assert manifest['integrity_check']['passed'] and manifest['integrity_check']['augmented_images_checked']==10; originals={item['id']:item for item in manifest['items'] if 'augmentation' not in item}; variants=[item for item in manifest['items'] if 'augmentation' in item]; assert len(originals)==4 and len(variants)==10; assert len({item['image'] for item in manifest['items']})==14; assert len(archive.namelist())==len(set(archive.namelist())); assert all({entry['augmentation']['preset'] for entry in variants if entry['source_id']==item['id']}==({'gentle','lighting','quality','horizontal','rotation'} if item['split']=='train' else set()) for item in originals.values()); assert all(item['split']==originals[item['source_id']]['split']=='train' and item['annotation_count']==originals[item['source_id']]['annotation_count'] for item in variants); [Image.open(io.BytesIO(archive.read(item['image']))).load() for item in variants]; assert all(len(archive.read(item['image'].replace('images/','labels/',1).rsplit('.',1)[0]+'.txt').decode().splitlines())==item['annotation_count'] for item in manifest['items']); print('All five presets independently downloaded with matching boxes and unique paths')", allExport], {windowsHide:true, encoding:"utf8"});
     assert.equal(allCheck.status, 0, allCheck.stderr || allCheck.error?.message);
     await check(`JSON.stringify(state.current)===${JSON.stringify(beforeExport)}`, "All-presets export preserves the current annotation and review state");
+    await setExportValue("augmentationPreset", "rotation");
+    await setExportValue("augmentationCopies", 3);
+    await check('element("augmentationDescription").textContent.includes("90°") && element("augmentationDescription").textContent.includes("交换宽高") && element("augmentationSummary").textContent.includes("含原图共 4 张")', "Rotation explains its three angles, changed dimensions and independent copy count");
+    const downloadsBeforeRotation = fs.readdirSync(downloads).filter(name => name.endsWith(".zip"));
+    await click("#createExport");
+    await waitFor('element("exportResult").textContent.includes("训练增强 6 张") && !element("createExport").disabled');
+    await check('lastExportResult.images===10 && lastExportResult.split_counts.train===8 && JSON.stringify(exportRequests.at(-1).augmentation)===JSON.stringify({preset:"rotation",copies:3,seed:43})', "Rotation exports three different angles for every training original without changing validation or test images");
+    await eventually(() => fs.readdirSync(downloads).filter(name => name.endsWith(".zip")).length === 5);
+    const rotationExport = path.join(downloads, fs.readdirSync(downloads).find(name => name.endsWith(".zip") && !downloadsBeforeRotation.includes(name)));
+    const rotationCheck = spawnSync(python, ["-c", `
+import io,json,math,sys,zipfile
+from PIL import Image
+archive=zipfile.ZipFile(sys.argv[1])
+manifest=json.loads(archive.read('export_manifest.json'))
+assert manifest['split_counts']=={'train':8,'val':1,'test':1}
+assert manifest['integrity_check']['passed'] and manifest['integrity_check']['augmented_images_checked']==6
+originals={entry['id']:entry for entry in manifest['items'] if 'augmentation' not in entry}
+variants=[entry for entry in manifest['items'] if 'augmentation' in entry]
+assert len(variants)==6 and all(entry['split']=='train' for entry in variants)
+def labels(entry):
+    name=entry['image'].replace('images/','labels/',1).rsplit('.',1)[0]+'.txt'
+    return [line.split() for line in archive.read(name).decode().splitlines()]
+for original in originals.values():
+    angles={entry['augmentation']['operations']['rotation_degrees'] for entry in variants if entry['source_id']==original['id']}
+    assert angles==({90,180,270} if original['split']=='train' else set())
+for entry in variants:
+    original=originals[entry['source_id']]
+    angle=entry['augmentation']['operations']['rotation_degrees']
+    with Image.open(io.BytesIO(archive.read(entry['image']))) as image:
+        image.load()
+        assert image.size==((480,640) if angle in (90,270) else (640,480))
+    old,new=labels(original),labels(entry)
+    assert len(old)==len(new)==entry['annotation_count']==original['annotation_count']
+    for source,target in zip(old,new):
+        assert source[0]==target[0]
+        center_x,center_y,width,height=map(float,source[1:])
+        expected=([center_y,1-center_x,height,width] if angle==90 else
+                  [1-center_x,1-center_y,width,height] if angle==180 else [1-center_y,center_x,height,width])
+        assert all(math.isclose(actual,wanted,abs_tol=1e-10) for actual,wanted in zip(map(float,target[1:]),expected))
+print('Rotation ZIP: all angles, dimensions, exact normalized boxes and train-only scope verified')
+`, rotationExport], {windowsHide:true, encoding:"utf8"});
+    assert.equal(rotationCheck.status, 0, rotationCheck.stderr || rotationCheck.error?.message);
+    await check(`JSON.stringify(state.current)===${JSON.stringify(beforeExport)}`, "Rotating export copies never edits the original image annotations or review state");
+    await setExportValue("augmentationCopies", 1);
     await setExportValue("augmentationPreset", "gentle");
     await check('!element("augmentationCopiesLabel").textContent.includes("每种方案") && element("augmentationSummary").textContent.includes("含原图共 2 张")', "Returning to a single preset restores its original count unit");
     await setExportValue("augmentationPreset", "all");
@@ -483,7 +527,7 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     }
     const augmentationScreenshot = await cdp("Page.captureScreenshot", {format:"png"});
     fs.writeFileSync(path.join(home,"augmentation-export.png"), Buffer.from(augmentationScreenshot.data,"base64"));
-    context.diagnostic("Four augmentation presets and all-presets mode, copy totals, safety validation, downloaded YOLO ZIPs and annotation preservation passed");
+    context.diagnostic("Five augmentation presets and all-presets mode, copy totals, safety validation, downloaded YOLO ZIPs and annotation preservation passed");
     await evaluate('api=exportApi;');
     await evaluate('element("exportDialog").close();');
     await cdp("Emulation.setDeviceMetricsOverride", {width:1600,height:1000,deviceScaleFactor:1,mobile:false});
