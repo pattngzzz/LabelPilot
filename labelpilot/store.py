@@ -4,6 +4,7 @@ import json
 import math
 import sqlite3
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -11,8 +12,14 @@ from pathlib import Path
 
 from PIL import Image
 
+from .tasks import BACKGROUND, HAND_KEYPOINTS, HAND_SKELETON, MAX_MASK_PIXELS, SHAPE_TYPES, polygon_area, read_mask, semantic_mask, validate_hand
+
 
 STATUSES = ("unstarted", "imported", "predicted", "draft", "reviewed", "skipped", "error")
+PENDING_REVIEW = ("imported", "predicted", "draft")
+AUDITABLE = ("imported", "draft", "reviewed")
+REVIEW_FILTERS = {"review": None, "review_empty": "empty", "review_difficult": "difficult", "review_low": "low_confidence"}
+REVIEW_CONFIDENCE = 0.5
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 COLORS = ["#a78bfa", "#38bdf8", "#fb923c", "#f472b6", "#34d399", "#facc15",
           "#60a5fa", "#e879f9", "#2dd4bf", "#f87171", "#a3e635", "#fbbf24", "#22d3ee"]
@@ -32,6 +39,35 @@ def read_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
 
 
+def read_annotation_snapshot(path):
+    contents = Path(path).read_bytes()
+    return json.loads(contents.decode("utf-8-sig")), hashlib.sha256(contents).hexdigest()
+
+
+def review_info(document):
+    shapes = document["shapes"]
+    objects = [shape for shape in shapes if isinstance(shape, dict)]
+    scores = [shape.get("score") for shape in objects]
+    confidence = min((score for score in scores if type(score) in (int, float) and 0 <= score < REVIEW_CONFIDENCE), default=None)
+    metadata = document.get("labelpilot")
+    empty = not shapes or (isinstance(metadata, dict) and metadata.get("semantic_empty") is True)
+    return {"empty": empty, "difficult": any(shape.get("difficult") is True for shape in objects),
+            "low_confidence": confidence is not None, "confidence": confidence}
+
+
+def review_priority(item):
+    info = item["review"]
+    return (not info["empty"], not info["difficult"], info["confidence"] if info["low_confidence"] else 1)
+
+
+def source_group(value):
+    if isinstance(value, str):
+        name = value.strip()
+        if name and name.casefold() != "unassigned":
+            return name
+    return None
+
+
 def digest(path):
     hasher = hashlib.sha256()
     with Path(path).open("rb") as stream:
@@ -46,7 +82,15 @@ def atomic_json(path, value):
     temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
     try:
         temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(path)
+        for attempt in range(6):
+            try:
+                temporary.replace(path)
+                break
+            except PermissionError as exc:
+                # Windows readers briefly hold a sharing lock during progress polling.
+                if getattr(exc, "winerror", None) not in (5, 32, 33) or attempt == 5:
+                    raise
+                time.sleep(.02 * (attempt + 1))
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -77,10 +121,13 @@ def load_classes(config):
 
 
 class Project:
-    def __init__(self, config):
+    def __init__(self, config, intake=None):
         self.config = copy.deepcopy(config)
         self.id = config["id"]
         self.root = Path(config["image_root"]).resolve()
+        self.task_type = config.get("task_type", "detect")
+        if not isinstance(self.task_type, str) or self.task_type not in SHAPE_TYPES:
+            raise Problem("请选择有效的项目任务类型", 422)
         self.names = load_classes(config)
         self.label_aliases = copy.deepcopy(config.get("label_aliases", {}))
         if not isinstance(self.label_aliases, dict) or any(
@@ -88,6 +135,9 @@ class Project:
                 not isinstance(target, str) or target not in self.names
                 for alias, target in self.label_aliases.items()):
             raise Problem("标签别名必须从旧名称直接映射到现有类别，且不能覆盖现有类别", 422)
+        if self.task_type == "semantic" and (BACKGROUND in self.names or len(self.names) > 254):
+            raise Problem("语义分割最多支持 254 个前景类别，background 为保留类别", 422)
+        self.intake = intake or {}
         self.items = []
         self.by_id = {}
         self.warnings = []
@@ -144,6 +194,11 @@ class Project:
             for path in sorted(self.root.rglob("*")):
                 if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES:
                     self.add_item(path.resolve(), {})
+        registered = {item["relative"] for item in self.items}
+        for relative in self.intake.keys() - registered:
+            path = (self.root / relative).resolve()
+            if path.is_file() and path.is_relative_to(self.root) and path.relative_to(self.root).as_posix() == relative:
+                self.add_item(path, {})
         self.photo_ids = {item["photo_id"] for item in self.items}
         native = self.source_map(self.config.get("annotation_root"))
         predicted = self.source_map(self.config.get("preannotation_root"))
@@ -159,11 +214,12 @@ class Project:
             if source:
                 try:
                     document = read_json(source)
-                    if not isinstance(document.get("shapes"), list):
+                    if not isinstance(document, dict) or not isinstance(document.get("shapes"), list):
                         raise ValueError("缺少 shapes 数组")
                     is_prediction = bool(document.get("preannotation")) or photo_id not in native
                     item.update(source=str(source), status="predicted" if is_prediction else "imported",
-                                count=len(document["shapes"]), source_kind="model" if is_prediction else "human")
+                                count=len(document["shapes"]), source_kind="model" if is_prediction else "human",
+                                review=review_info(document))
                 except (ValueError, OSError, TypeError) as exc:
                     item.update(status="error", error=f"标注读取失败：{exc}")
         self.items.sort(key=lambda item: (item["batch"], item["photo_id"], item["relative"]))
@@ -183,16 +239,22 @@ class Project:
         if not path.is_relative_to(self.root):
             raise Problem("图片链接指向项目目录之外")
         relative = path.relative_to(self.root).as_posix()
+        receipt = self.intake.get(relative)
+        if receipt:
+            task = {**task, "batch": receipt["batch"], "sha256": receipt["sha256"],
+                    "width": receipt["width"], "height": receipt["height"]}
         item_id = hashlib.sha256(relative.encode("utf-8")).hexdigest()[:24]
         if item_id in self.by_id:
             raise Problem(f"图片清单重复：{relative}")
         self.by_id[item_id] = True
+        frame_index = task.get("frame_index")
         self.items.append({
             "id": item_id, "photo_id": task.get("photo_id", path.stem), "path": str(path),
             "relative": relative, "width": task.get("width"), "height": task.get("height"),
             "image_sha256": task.get("sha256"), "batch": task.get("batch") or path.parent.name,
-            "source_group": task.get("source_group", "unassigned"),
+            "source_group": source_group(task.get("source_group")) or "unassigned",
             "source_id": task.get("source_id", ""), "note": task.get("visual_note", ""),
+            "frame_index": frame_index if type(frame_index) is int and frame_index >= 0 else None,
             "status": "unstarted", "count": 0, "source": None, "source_kind": None,
         })
 
@@ -203,11 +265,17 @@ class Project:
             raise Problem("图片不存在", 404)
 
     def summary(self):
-        return {"id": self.id, "name": self.config["name"], "image_root": str(self.root),
+        result = {"id": self.id, "name": self.config["name"], "image_root": str(self.root), "task_type": self.task_type,
                 "classes": [{"id": index, "name": name, "display": name,
                              "color": COLORS[index % len(COLORS)]} for index, name in enumerate(self.names)],
                 "model_path": self.config.get("model_path", ""), "total": len(self.items),
-                "batches": sorted({item["batch"] for item in self.items}), "warnings": self.warnings}
+                "batches": sorted({item["batch"] for item in self.items}),
+                "has_source_groups": any(item["source_group"] != "unassigned" for item in self.items),
+                "warnings": self.warnings}
+        if self.task_type == "hand_pose":
+            result["keypoints"] = [{"name": name, "label": label} for name, label in HAND_KEYPOINTS]
+            result["skeleton"] = HAND_SKELETON
+        return result
 
 
 class Store:
@@ -230,12 +298,31 @@ class Store:
                     status TEXT NOT NULL, document TEXT NOT NULL, updated TEXT NOT NULL,
                     PRIMARY KEY (project, item, version)
                 );
+                CREATE TABLE IF NOT EXISTS similarity_selection (
+                    project TEXT NOT NULL, batch TEXT NOT NULL, excluded TEXT NOT NULL,
+                    PRIMARY KEY (project, batch)
+                );
+                CREATE TABLE IF NOT EXISTS annotation_audits (
+                    project TEXT NOT NULL, item TEXT NOT NULL, version INTEGER NOT NULL,
+                    summary TEXT NOT NULL, evidence TEXT NOT NULL,
+                    PRIMARY KEY (project, item)
+                );
+                CREATE TABLE IF NOT EXISTS intake_receipts (
+                    project TEXT NOT NULL, relative TEXT NOT NULL, batch TEXT NOT NULL,
+                    sha256 TEXT NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL, included INTEGER NOT NULL,
+                    PRIMARY KEY (project, relative)
+                );
+                CREATE TABLE IF NOT EXISTS review_routes (
+                    project TEXT NOT NULL, item TEXT NOT NULL, version INTEGER NOT NULL,
+                    result TEXT NOT NULL, sample INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (project, item)
+                );
             """)
         self.configs = read_json(self.registry_path) if self.registry_path.exists() else []
         self.project_errors = []
         for config in self.configs:
             try:
-                self.projects[config["id"]] = Project(config)
+                self.projects[config["id"]] = self.build_project(config)
             except (Problem, OSError, ValueError, KeyError) as exc:
                 self.project_errors.append({"name": config.get("name"), "error": str(getattr(exc, "message", exc))})
 
@@ -256,9 +343,51 @@ class Store:
             raise Problem("项目不存在", 404)
         return self.projects[project_id]
 
+    def intake_receipts(self, project_id):
+        with self.connect() as connection:
+            return {row["relative"]: dict(row) for row in connection.execute(
+                "SELECT relative, batch, sha256, width, height, included FROM intake_receipts WHERE project=?", (project_id,)
+            )}
+
+    def build_project(self, config):
+        intake = self.intake_receipts(config["id"])
+        return Project(config, {relative: row for relative, row in intake.items() if row["included"]})
+
+    def import_batch(self, project_id, batch, images):
+        with self.lock:
+            project = self.project(project_id)
+            receipts = self.intake_receipts(project_id)
+            overlay = self.overlay(project_id, include_documents=True)
+            known = {row["sha256"] for row in receipts.values()}
+            known.update(item["image_sha256"] for item in project.items
+                         if item["status"] != "unstarted" and item["image_sha256"])
+            known.update(row["document"].get("labelpilot", {}).get("image_sha256") for row in overlay.values())
+            existing = {item["relative"] for item in project.items
+                        if overlay.get(item["id"], item)["status"] != "unstarted"}
+            new = {}
+            for image in images:
+                relative, sha256 = image["relative"], image["sha256"]
+                if relative in receipts or relative in existing:
+                    continue
+                new[relative] = {**image, "batch": batch, "included": sha256 not in known}
+                known.add(sha256)
+            if new:
+                combined = {**receipts, **new}
+                replacement = Project(project.config, {relative: row for relative, row in combined.items() if row["included"]})
+                with self.connect() as connection:
+                    connection.executemany("INSERT OR IGNORE INTO intake_receipts VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                           ((project_id, relative, batch, row["sha256"], row["width"], row["height"], row["included"])
+                                            for relative, row in new.items()))
+                self.projects[project_id] = replacement
+                receipts = combined
+        imported = [row for row in receipts.values() if row["batch"] == batch]
+        return {"included": sum(row["included"] for row in imported), "duplicates": sum(not row["included"] for row in imported)}
+
     def register(self, config):
         config = copy.deepcopy(config)
         config["id"] = uuid.uuid4().hex[:12]
+        if config.get("task_type") == "hand_pose" and not (config.get("classes") or config.get("class_map_path")):
+            config["classes"] = ["hand"]
         if not isinstance(config.get("name"), str) or not config["name"].strip():
             raise Problem("请填写项目名称")
         root = Path(config.get("image_root", "")).resolve()
@@ -295,7 +424,7 @@ class Store:
     def rescan(self, project_id):
         with self.lock:
             project = self.project(project_id)
-            replacement = Project(project.config)
+            replacement = self.build_project(project.config)
             self.projects[project_id] = replacement
         return replacement.summary()
 
@@ -311,6 +440,8 @@ class Store:
                 raise Problem(f"该标签已更名为 {project.label_aliases[name]}，请使用新名称", 422)
             if name in project.names:
                 return project.summary()
+            if project.task_type == "semantic" and (name == BACKGROUND or len(project.names) >= 254):
+                raise Problem("语义分割最多支持 254 个前景类别，background 为保留类别", 422)
             names = project.names + [name]
             configs = copy.deepcopy(self.configs)
             config = next(config for config in configs if config["id"] == project_id)
@@ -323,15 +454,30 @@ class Store:
             project.names = names
         return project.summary()
 
-    def overlay(self, project_id):
+    def overlay(self, project_id, include_documents=False, include_review=False):
+        overlays = {}
         with self.connect() as connection:
-            rows = connection.execute("SELECT item, version, status, document, updated FROM annotations WHERE project=?", (project_id,)).fetchall()
-        return {row["item"]: {"version": row["version"], "status": row["status"],
-                               "count": len(json.loads(row["document"])["shapes"]), "updated": row["updated"]} for row in rows}
+            rows = connection.execute("SELECT item, version, status, document, updated FROM annotations WHERE project=?", (project_id,))
+            for row in rows:
+                document = self.project(project_id).normalize_labels(json.loads(row["document"]))
+                item = {"version": row["version"], "status": row["status"],
+                        "count": len(document["shapes"]), "updated": row["updated"]}
+                if include_documents:
+                    item["document"] = document
+                if include_review and row["status"] in PENDING_REVIEW:
+                    item["review"] = review_info(document)
+                overlays[row["item"]] = item
+        return overlays
 
-    def listing(self, project_id, query="", batch="", status="", offset=0, limit=80):
+    def listing(self, project_id, query="", batch="", status="", offset=0, limit=80, *, include_documents=False):
         project = self.project(project_id)
-        overlays = self.overlay(project_id)
+        review_queue = status in REVIEW_FILTERS
+        reason = REVIEW_FILTERS.get(status)
+        overlays = self.overlay(project_id, include_documents=include_documents, include_review=review_queue)
+        excluded = self.similarity_exclusions(project_id, batch) if status == "curated" else set()
+        audits = self.audit_summaries(project_id) if status == "audit" else {}
+        routed_queue = status in ("triage", "spot_review", "routable")
+        routes = self.review_routes(project_id) if routed_queue else {}
         counts = dict.fromkeys(STATUSES, 0)
         filtered = []
         for original in project.items:
@@ -342,13 +488,121 @@ class Store:
                 continue
             if batch and item["batch"] != batch:
                 continue
-            if status and item["status"] != status:
-                continue
+            if review_queue:
+                if item["status"] not in PENDING_REVIEW or (reason and not item["review"][reason]):
+                    continue
+            else:
+                item.pop("review", None)
+                if status == "curated":
+                    if item["status"] != "unstarted" or item["id"] in excluded:
+                        continue
+                elif status == "audit":
+                    finding = audits.get(item["id"])
+                    if not finding or item["status"] not in AUDITABLE or finding["version"] != item.get("version", 0):
+                        continue
+                    item["audit"] = finding
+                elif status == "auditable":
+                    if item["status"] not in AUDITABLE:
+                        continue
+                elif routed_queue:
+                    route = routes.get(item["id"])
+                    if item["status"] not in PENDING_REVIEW:
+                        continue
+                    if status == "routable":
+                        if route and route["version"] == item.get("version", 0):
+                            continue
+                    elif not route or (status == "spot_review" and not route["sample"]):
+                        continue
+                    if route:
+                        item["route"] = route
+                elif status and item["status"] != status:
+                    continue
             filtered.append(item)
+        if review_queue:
+            filtered.sort(key=review_priority)
+        if status == "audit":
+            filtered.sort(key=lambda item: (-item["audit"]["confidence"], -item["audit"]["count"]))
+        if status == "triage":
+            filtered.sort(key=lambda item: -item["route"]["priority"])
         return {"items": filtered[offset:offset + limit], "filtered": len(filtered),
                 "total": len(project.items), "counts": counts, "offset": offset, "limit": limit}
 
-    def image_info(self, project, item):
+    def review_routes(self, project_id):
+        with self.connect() as connection:
+            return {row["item"]: {"version": row["version"], "sample": bool(row["sample"]), **json.loads(row["result"])}
+                    for row in connection.execute("SELECT item, version, result, sample FROM review_routes WHERE project=?", (project_id,))}
+
+    def save_review_route(self, project_id, item_id, version, result):
+        with self.connect() as connection:
+            connection.execute("INSERT OR REPLACE INTO review_routes VALUES (?, ?, ?, ?, 0)",
+                               (project_id, item_id, version, json.dumps(result, ensure_ascii=False)))
+
+    def set_review_sample(self, project_id, ids, samples):
+        with self.connect() as connection:
+            connection.executemany("UPDATE review_routes SET sample=? WHERE project=? AND item=?",
+                                   ((item_id in samples, project_id, item_id) for item_id in ids))
+
+    def similarity_exclusions(self, project_id, batch):
+        with self.connect() as connection:
+            row = connection.execute("SELECT excluded FROM similarity_selection WHERE project=? AND batch=?",
+                                     (project_id, batch)).fetchone()
+        return set(json.loads(row["excluded"])) if row else set()
+
+    def save_similarity_selection(self, project_id, batch, ids):
+        project = self.project(project_id)
+        if not isinstance(batch, str) or not isinstance(ids, list) or len(ids) > 10000:
+            raise Problem("相似图筛选范围无效", 422)
+        if any(not isinstance(item_id, str) or item_id not in project.by_id or
+               (batch and project.by_id[item_id]["batch"] != batch) for item_id in ids):
+            raise Problem("相似图不在所选批次内，请重新扫描", 422)
+        excluded = sorted(set(ids))
+        with self.connect() as connection:
+            connection.execute("INSERT OR REPLACE INTO similarity_selection VALUES (?, ?, ?)",
+                               (project_id, batch, json.dumps(excluded)))
+        return {"excluded": len(excluded)}
+
+    def audit_summaries(self, project_id):
+        with self.connect() as connection:
+            return {row["item"]: {"version": row["version"], **json.loads(row["summary"])}
+                    for row in connection.execute("SELECT item, version, summary FROM annotation_audits WHERE project=?", (project_id,))}
+
+    def audit_detail(self, project_id, item_id):
+        self.project(project_id).item(item_id)
+        with self.connect() as connection:
+            row = connection.execute("SELECT version, evidence FROM annotation_audits WHERE project=? AND item=?",
+                                     (project_id, item_id)).fetchone()
+        if not row:
+            return None
+        current = self.detail(project_id, item_id)
+        evidence = json.loads(row["evidence"])
+        if (current["version"], current["image_sha256"], current["source_fingerprint"]) != (
+            row["version"], evidence["image_sha256"], evidence["source_fingerprint"]
+        ):
+            return None
+        return evidence
+
+    def save_audit(self, project_id, item_id, evidence, summary):
+        with self.connect() as connection:
+            if summary:
+                connection.execute("INSERT OR REPLACE INTO annotation_audits VALUES (?, ?, ?, ?, ?)",
+                                   (project_id, item_id, evidence["version"], json.dumps(summary), json.dumps(evidence, ensure_ascii=False)))
+            else:
+                connection.execute("DELETE FROM annotation_audits WHERE project=? AND item=?", (project_id, item_id))
+
+    def dismiss_audit(self, project_id, item_id, evidence_id):
+        self.project(project_id).item(item_id)
+        if not isinstance(evidence_id, str):
+            raise Problem("请重新载入疑点结果", 422)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT evidence FROM annotation_audits WHERE project=? AND item=?",
+                                     (project_id, item_id)).fetchone()
+            if row and json.loads(row["evidence"]).get("id") != evidence_id:
+                raise Problem("疑点已重新扫描，请刷新后复核", 409)
+            connection.execute("DELETE FROM annotation_audits WHERE project=? AND item=?", (project_id, item_id))
+        return {"dismissed": True}
+
+    def image_info(self, project, item, *, verify_image=False):
         path = Path(item["path"])
         if not path.is_file() or not path.resolve().is_relative_to(project.root):
             raise Problem("原图不存在或路径已改变", 409)
@@ -356,6 +610,8 @@ class Store:
             width, height = image.size
             if image.getexif().get(274, 1) != 1:
                 raise Problem("此图含 EXIF 旋转，需先生成方向归一化的独立数据副本，避免标注错位", 422)
+            if verify_image:
+                image.load()
         if item["width"] and (width, height) != (item["width"], item["height"]):
             raise Problem("原图尺寸与任务清单不符", 409)
         image_digest = digest(path)
@@ -363,23 +619,24 @@ class Store:
             raise Problem("原图 SHA-256 与任务清单不符；已阻止编辑", 409)
         return width, height, image_digest
 
-    def detail(self, project_id, item_id):
+    def detail(self, project_id, item_id, *, verify_image=False):
         project = self.project(project_id)
         item = project.item(item_id)
         if item.get("error"):
             raise Problem(item["error"], 422)
-        width, height, image_digest = self.image_info(project, item)
-        source_digest = digest(item["source"]) if item["source"] else None
+        width, height, image_digest = self.image_info(project, item, verify_image=verify_image)
+        source_digest = None
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM annotations WHERE project=? AND item=?", (project_id, item_id)).fetchone()
         if row:
             document = json.loads(row["document"])
+            source_digest = digest(item["source"]) if item["source"] else None
             version, status = row["version"], row["status"]
             recorded = document.get("labelpilot", {}).get("image_sha256")
             if recorded and recorded != image_digest:
                 raise Problem("原图已在上次保存后改变；已阻止旧标注套用", 409)
         elif item["source"]:
-            document = read_json(item["source"])
+            document, source_digest = read_annotation_snapshot(item["source"])
             version, status = 0, item["status"]
         else:
             document = {"version": "LabelPilot-1", "flags": {}, "shapes": [],
@@ -389,6 +646,8 @@ class Store:
         if (document.get("imageWidth"), document.get("imageHeight")) != (width, height):
             raise Problem("原生标注尺寸与原图不一致", 409)
         document = project.normalize_labels(document)
+        if not row and item["source"] and project.task_type != "detect":
+            self.validate(project, document, width, height, "draft", False)
         return {"item": {key: value for key, value in item.items() if key != "path"},
                 "document": document, "version": version, "status": status,
                 "width": width, "height": height, "image_sha256": image_digest,
@@ -402,14 +661,20 @@ class Store:
             raise Problem("shapes 必须是数组且不超过 10000 个对象", 422)
         if (document.get("imageWidth"), document.get("imageHeight")) != (width, height):
             raise Problem("不能修改图片尺寸", 422)
+        task = project.task_type
+        if task == "semantic" and width * height > MAX_MASK_PIXELS:
+            raise Problem("语义掩膜最多支持 3200 万像素", 422)
         for shape in shapes:
             if not isinstance(shape, dict) or shape.get("label") not in project.names:
                 raise Problem("存在项目字典之外的类别；不会自动改类", 422)
             kind = shape.get("shape_type")
             points = shape.get("points")
-            if kind not in ("rectangle", "polygon") or not isinstance(points, list):
-                raise Problem("仅支持矩形和多边形标注", 422)
-            if (kind == "rectangle" and len(points) not in (2, 4)) or (kind == "polygon" and len(points) < 3):
+            if kind not in SHAPE_TYPES[task] or not isinstance(points, list):
+                raise Problem("当前项目任务不支持此标注形状", 422)
+            if ((kind == "rectangle" and len(points) not in (2, 4))
+                    or (kind in ("mask", "hand") and len(points) != 2)
+                    or (kind == "polygon" and len(points) < 3)
+                    or (kind == "brush" and not 1 <= len(points) <= 4096)):
                 raise Problem("标注点数量无效", 422)
             for point in points:
                 if not isinstance(point, list) or len(point) != 2:
@@ -418,64 +683,93 @@ class Store:
                     raise Problem("坐标必须是有限数值", 422)
                 if not 0 <= point[0] <= width or not 0 <= point[1] <= height:
                     raise Problem("标注超出原图边界；不会静默裁切", 422)
-            if max(point[0] for point in points) <= min(point[0] for point in points) or max(point[1] for point in points) <= min(point[1] for point in points):
+            if kind == "brush":
+                radius = shape.get("radius")
+                if type(radius) is not int or not 1 <= radius <= 256 or type(shape.get("erase", False)) is not bool:
+                    raise Problem("笔刷半径必须为 1 到 256 像素的整数", 422)
+                continue
+            if shape.get("erase"):
+                raise Problem("橡皮仅支持笔刷图层", 422)
+            xs, ys = zip(*points)
+            left, top, right, bottom = min(xs), min(ys), max(xs), max(ys)
+            if right <= left or bottom <= top:
                 raise Problem("标注面积必须大于零", 422)
-            if kind == "polygon":
-                signed_area = sum(points[index][0] * points[(index + 1) % len(points)][1] -
-                                  points[(index + 1) % len(points)][0] * points[index][1] for index in range(len(points)))
-                if abs(signed_area) < 1e-8:
-                    raise Problem("多边形面积必须大于零", 422)
-        if status == "reviewed" and not shapes and not confirmed_empty:
+            if kind == "polygon" and polygon_area(points) < 5e-9:
+                raise Problem("多边形面积必须大于零", 422)
+            try:
+                if kind == "mask":
+                    read_mask(shape)
+                elif kind == "hand":
+                    validate_hand(shape, (left, top, right, bottom))
+            except ValueError as exc:
+                raise Problem(str(exc), 422) from exc
+        empty = not shapes
+        if task == "semantic" and any(shape.get("erase") for shape in shapes):
+            empty = semantic_mask(shapes, project.names, width, height).getbbox() is None
+        if status == "reviewed" and empty and confirmed_empty is not True:
             raise Problem("空标注不能自动作为负样本；请明确确认此图没有目标", 422)
+        return empty
 
     def save(self, project_id, item_id, payload, predicted=False):
+        return self.save_many(project_id, [(item_id, payload)], predicted=predicted)[0]
+
+    def prepare_save(self, project_id, item_id, payload, predicted):
         project = self.project(project_id)
         if payload.get("status") not in (("predicted",) if predicted else ("draft", "reviewed", "skipped")):
             raise Problem("无效的审核状态", 422)
+        current = self.detail(project_id, item_id)
+        if payload.get("expected_version") != current["version"]:
+            raise Problem("标注已在其他窗口更新，请重新载入后再编辑", 409)
+        if payload.get("image_sha256") != current["image_sha256"]:
+            raise Problem("原图指纹不一致", 409)
+        if current["version"] == 0 and payload.get("source_fingerprint") != current["source_fingerprint"]:
+            raise Problem("原生标注已被其他工具更新，请重新载入", 409)
+        if predicted and current["status"] != "unstarted":
+            raise Problem("批量预标注不能覆盖任何已有标注", 409)
+        document = project.normalize_labels(payload.get("document", {}))
+        status = payload["status"]
+        empty = self.validate(project, document, current["width"], current["height"], status, payload.get("confirmed_empty", False))
+        version = current["version"] + 1
+        timestamp = now()
+        previous_meta = current["document"].get("labelpilot", {})
+        provenance = copy.deepcopy(document.get("labelpilot", {}).get("prediction"))
+        document["labelpilot"] = {**previous_meta, "status": status, "revision": version,
+                                  "updated_at": timestamp, "image_sha256": current["image_sha256"],
+                                  "source_annotation": current["item"].get("source"),
+                                  "source_fingerprint": current["source_fingerprint"],
+                                  "negative_sample_confirmed": status == "reviewed" and empty,
+                                  "human_reviewed": status == "reviewed",
+                                  "prediction": provenance}
+        if project.task_type == "semantic":
+            document["labelpilot"]["semantic_empty"] = empty
+        document["checked"] = status == "reviewed"
+        document["imageData"] = None
+        if isinstance(document.get("preannotation"), dict):
+            document["preannotation"]["human_reviewed"] = status == "reviewed"
+            document["preannotation"]["negative_sample_confirmed"] = status == "reviewed" and empty
+            document["preannotation"]["status"] = "human_reviewed" if status == "reviewed" else "model_prediction_unreviewed"
+        result = {"version": version, "status": status, "document": document, "updated": timestamp}
+        return current, result
+
+    def save_many(self, project_id, entries, *, predicted=False):
         with self.lock:
-            current = self.detail(project_id, item_id)
-            if payload.get("expected_version") != current["version"]:
-                raise Problem("标注已在其他窗口更新，请重新载入后再编辑", 409)
-            if payload.get("image_sha256") != current["image_sha256"]:
-                raise Problem("原图指纹不一致", 409)
-            if current["version"] == 0 and payload.get("source_fingerprint") != current["source_fingerprint"]:
-                raise Problem("原生标注已被其他工具更新，请重新载入", 409)
-            if predicted and current["status"] != "unstarted":
-                raise Problem("批量预标注不能覆盖任何已有标注", 409)
-            document = project.normalize_labels(payload.get("document", {}))
-            status = payload["status"]
-            self.validate(project, document, current["width"], current["height"], status, payload.get("confirmed_empty", False))
-            version = current["version"] + 1
-            timestamp = now()
-            previous_meta = current["document"].get("labelpilot", {})
-            provenance = copy.deepcopy(document.get("labelpilot", {}).get("prediction"))
-            document["labelpilot"] = {**previous_meta, "status": status, "revision": version,
-                                      "updated_at": timestamp, "image_sha256": current["image_sha256"],
-                                      "source_annotation": current["item"].get("source"),
-                                      "source_fingerprint": current["source_fingerprint"],
-                                      "negative_sample_confirmed": status == "reviewed" and not document["shapes"],
-                                      "human_reviewed": status == "reviewed",
-                                      "prediction": provenance}
-            document["checked"] = status == "reviewed"
-            document["imageData"] = None
-            if isinstance(document.get("preannotation"), dict):
-                document["preannotation"]["human_reviewed"] = status == "reviewed"
-                document["preannotation"]["negative_sample_confirmed"] = status == "reviewed" and not document["shapes"]
-                document["preannotation"]["status"] = "human_reviewed" if status == "reviewed" else "model_prediction_unreviewed"
-            encoded = json.dumps(document, ensure_ascii=False, allow_nan=False)
+            prepared = [(item_id, *self.prepare_save(project_id, item_id, payload, predicted)) for item_id, payload in entries]
             with self.connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                row = connection.execute("SELECT version FROM annotations WHERE project=? AND item=?", (project_id, item_id)).fetchone()
-                if (row["version"] if row else 0) != current["version"]:
-                    raise Problem("标注已被另一个进程更新，请重新载入", 409)
-                if not row:
-                    baseline = json.dumps(current["document"], ensure_ascii=False, allow_nan=False)
-                    connection.execute("INSERT INTO revisions VALUES (?, ?, ?, ?, ?, ?)",
-                                       (project_id, item_id, 0, current["status"], baseline, timestamp))
-                values = (project_id, item_id, version, status, encoded, timestamp)
-                connection.execute("INSERT OR REPLACE INTO annotations VALUES (?, ?, ?, ?, ?, ?)", values)
-                connection.execute("INSERT INTO revisions VALUES (?, ?, ?, ?, ?, ?)", values)
-            return {"version": version, "status": status, "document": document, "updated": timestamp}
+                for item_id, current, result in prepared:
+                    row = connection.execute("SELECT version FROM annotations WHERE project=? AND item=?",
+                                             (project_id, item_id)).fetchone()
+                    if (row["version"] if row else 0) != current["version"]:
+                        raise Problem("标注已被另一个进程更新，请重新载入", 409)
+                    if not row:
+                        baseline = json.dumps(current["document"], ensure_ascii=False, allow_nan=False)
+                        connection.execute("INSERT INTO revisions VALUES (?, ?, ?, ?, ?, ?)",
+                                           (project_id, item_id, 0, current["status"], baseline, result["updated"]))
+                    encoded = json.dumps(result["document"], ensure_ascii=False, allow_nan=False)
+                    values = (project_id, item_id, result["version"], result["status"], encoded, result["updated"])
+                    connection.execute("INSERT OR REPLACE INTO annotations VALUES (?, ?, ?, ?, ?, ?)", values)
+                    connection.execute("INSERT INTO revisions VALUES (?, ?, ?, ?, ?, ?)", values)
+        return [result for _, _, result in prepared]
 
     def history(self, project_id, item_id):
         self.project(project_id).item(item_id)

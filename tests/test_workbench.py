@@ -13,8 +13,8 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from labelpilot.exporting import export_project, plan_splits
 from labelpilot.augmentation import PRESETS, augmented_variants, plan_augmentation, validate_augmented_sample
+from labelpilot.exporting import export_project, plan_splits, preview_export
 from labelpilot import model_files, native_picker
 from labelpilot import server
 from labelpilot.inference import Inference, Jobs, model_class_names
@@ -133,6 +133,31 @@ def test_split_is_reproducible_and_seeded():
     assert counts == {"train": 80, "val": 10, "test": 10}
     assert assignments != plan_splits(rows, {"split": {**settings["split"], "seed": 43}})[0]
 
+
+@pytest.mark.parametrize("unit", ["source_group", "directory"])
+def test_grouped_split_keeps_groups_whole_and_is_reproducible(unit):
+    groups = {"day1/camera": 6, "day2/camera": 3, "day3/camera": 1}
+    rows = [{"id": f"{group}/{index}", "source_group": group, "relative": f"{group}/{index}.jpg"}
+            for group, size in groups.items() for index in range(size)]
+    options = {"split": {"train": 60, "val": 30, "test": 10, "seed": 42, "unit": unit}}
+    assignments, config, counts = plan_splits(rows, options)
+    assert plan_splits(list(reversed(rows)), options) == (assignments, config, counts)
+    assert config["unit"] == unit
+    assert counts == {"train": 6, "val": 3, "test": 1}
+    assert all(len({assignments[row["id"]] for row in rows if row["source_group"] == group}) == 1 for group in groups)
+
+
+def test_grouped_split_requires_known_and_sufficient_groups():
+    rows = [{"id": str(index), "source_group": "video-a"} for index in range(5)]
+    options = {"split": {"train": 80, "val": 20, "test": 0, "unit": "source_group"}}
+    with pytest.raises(Problem, match="只有 1 个可用分组"):
+        plan_splits(rows, options)
+    rows[0]["source_group"] = " unassigned "
+    with pytest.raises(Problem, match="1 张图片没有来源组"):
+        plan_splits(rows, options)
+    rows[0]["source_group"] = "video-b"
+    _, _, counts = plan_splits(rows, options)
+    assert counts == {"train": 4, "val": 1, "test": 0}
 
 @pytest.mark.parametrize("preset,copies", [(preset, 2) for preset in PRESETS] + [("all", 1), ("all", 3)])
 @pytest.mark.parametrize("format_name", ["yolo", "labelme", "coco"])
@@ -293,7 +318,11 @@ def test_augmentation_flip_geometry_and_pixels(store, format_name):
         if format_name == "labelme":
             document = json.loads(archive.read("annotations/train/" + Path(variant["image"]).stem + ".json"))
             for actual, original in zip(document["shapes"], data["document"]["shapes"]):
-                assert actual["points"] == [[240 - point[0], point[1]] for point in original["points"]]
+                expected = [[240 - point[0], point[1]] for point in original["points"]]
+                if original["shape_type"] == "rectangle" and len(expected) == 4:
+                    xs, ys = zip(*expected)
+                    expected = [[min(xs), min(ys)], [max(xs), max(ys)]]
+                assert actual["points"] == expected
                 assert actual["label"] == original["label"]
         elif format_name == "coco":
             document = json.loads(archive.read("annotations/train.json"))
@@ -348,7 +377,7 @@ def test_rotation_all_angles_geometry_pixels_and_export_dimensions(store, format
                 assert document["shapes"][0] == {**data["document"]["shapes"][0], "points": expected_points[angle]}
                 assert document["shapes"][-1]["points"] == expected_polygons[angle]
                 border = document["shapes"][1]["points"]
-                assert {tuple(point) for point in border} == {(0, 0), (width, 0), (width, height), (0, height)}
+                assert border == [[0, 0], [width, height]]
             elif format_name == "coco":
                 document = json.loads(archive.read("annotations/train.json"))
                 image = next(image for image in document["images"] if image["file_name"] == entry["image"])
@@ -441,7 +470,11 @@ def test_augmentation_seed_and_copy_prefix_stability(store, preset):
 def test_augmentation_limit_and_failed_decode_cleanup(reviewed_store, monkeypatch, preset, multiplier):
     options = {"split": {"train": 100, "val": 0, "test": 0}, "augmentation": {"preset": preset, "copies": 3}}
     listing = reviewed_store.listing
-    monkeypatch.setattr(reviewed_store, "listing", lambda *args, **kwargs: {"items": listing(*args, **kwargs)["items"] * multiplier})
+    def large_listing(*args, **kwargs):
+        rows = listing(*args, **kwargs)["items"] * multiplier
+        return {"items": rows, "filtered": len(rows)}
+
+    monkeypatch.setattr(reviewed_store, "listing", large_listing)
     with pytest.raises(Problem, match="20000"):
         export_project(reviewed_store, "test", options)
     assert not (reviewed_store.home / "exports").exists()
@@ -653,6 +686,46 @@ def test_split_export_can_omit_test_set(reviewed_store):
         assert not any("/test/" in name for name in archive.namelist())
 
 
+def test_export_preview_matches_manifest_and_rejects_changed_revision(reviewed_store):
+    store = reviewed_store
+    store.add_label("test", "unused")
+    options = {"split": {"train": 50, "val": 25, "test": 25}}
+    preview = preview_export(store, "test", options)
+    assert (preview["images"], preview["annotations"], preview["confirmed_empty"]) == (4, 2, 2)
+    classes = {row["name"]: row for row in preview["class_counts"]}
+    assert classes["object"]["total"] == 2 and classes["unused"]["splits"] == {"train": 0, "val": 0, "test": 0}
+    assert not (store.home / "exports").exists()
+
+    store.save("test", item(store, "human")["id"], payload(store, "human", "reviewed"))
+    with pytest.raises(Problem, match="数据已变化") as error:
+        export_project(store, "test", {**options, "preview_token": preview["preview_token"]})
+    assert error.value.status == 409
+    assert not (store.home / "exports").exists()
+
+    preview = preview_export(store, "test", options)
+    result = export_project(store, "test", {**options, "preview_token": preview["preview_token"]})
+    with zipfile.ZipFile(store.home / "exports" / result["filename"]) as archive:
+        manifest = json.loads(archive.read("export_manifest.json"))
+        assert manifest["split_counts"] == preview["split_counts"]
+        expected_counts = dict.fromkeys(manifest["split_counts"], 0)
+        for name in archive.namelist():
+            if name.startswith("labels/"):
+                expected_counts[PurePosixPath(name).parts[1]] += len(archive.read(name).splitlines())
+        assert next(row["splits"] for row in preview["class_counts"] if row["name"] == "object") == expected_counts
+
+
+def test_export_preview_distinguishes_pending_empty_and_pins_external_annotation(store, dataset):
+    store.save("test", item(store, "empty")["id"], payload(store, "empty"))
+    options = {"reviewed_only": False}
+    preview = preview_export(store, "test", options)
+    assert (preview["images"], preview["excluded"], preview["unreviewed"]) == (3, 1, 3)
+    assert (preview["confirmed_empty"], preview["unreviewed_empty"]) == (0, 1)
+    source = dataset[2] / "human.json"
+    source.write_text(source.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with pytest.raises(Problem, match="数据已变化"):
+        export_project(store, "test", {**options, "preview_token": preview["preview_token"]})
+
+
 def test_import_is_not_independent_acceptance(store):
     counts = store.listing("test")["counts"]
     assert counts == {"unstarted": 2, "imported": 1, "predicted": 1, "draft": 0, "reviewed": 0, "skipped": 0, "error": 0}
@@ -754,26 +827,35 @@ def test_reviewed_only_export_and_numeric_roundtrip(store):
 
 @pytest.mark.parametrize("format_name", ["labelme", "coco"])
 def test_other_export_formats(store, format_name):
+    data = payload(store, "human", "reviewed")
+    points = [[110, 70], [12.5, 70], [12.5, 10], [110, 10]]
+    data["document"]["shapes"][0]["points"] = points
+    item_id = item(store, "human")["id"]
+    store.save("test", item_id, data)
     result = export_project(store, "test", {"format": format_name, "reviewed_only": False, "include_images": False})
     with zipfile.ZipFile(store.home / "exports" / result["filename"]) as archive:
         assert not any(name.startswith("images/") for name in archive.namelist())
         if format_name == "labelme":
             document = json.loads(archive.read(next(name for name in archive.namelist() if name.startswith("annotations/"))))
             assert document["shapes"][0]["group_id"] == 9
+            assert document["shapes"][0]["points"] == [[12.5, 10], [110, 70]]
             assert document["imagePath"].startswith("../images/")
         else:
             document = json.loads(archive.read("annotations.json"))
             assert len(document["images"]) == 2
             assert document["annotations"][0]["bbox"] == [12.5, 10, 97.5, 60]
+    assert store.detail("test", item_id)["document"]["shapes"][0]["points"] == points
 
 
 def test_polygon_not_silently_converted_for_yolo(store):
     data = payload(store, "human", "reviewed")
     data["document"]["shapes"][0].update(shape_type="polygon", points=[[10, 10], [100, 10], [50, 80]])
     store.save("test", item(store, "human")["id"], data)
+    assert "多边形" in preview_export(store, "test", {"format": "yolo"})["blocking_issue"]
+    assert preview_export(store, "test", {"format": "coco"})["blocking_issue"] is None
     with pytest.raises(Problem, match="多边形"):
         export_project(store, "test", {"format": "yolo"})
-    assert not list((store.home / "exports").glob("*.zip"))
+    assert not list((store.home / "exports").glob("*"))
 
 
 def test_project_registration_and_duplicate_names(store, dataset):
@@ -1121,6 +1203,22 @@ def test_label_alias_cannot_be_readded_as_new_class(renamed_store):
     assert Store(renamed_store.home).project("test").label_aliases == {"object": "object_1"}
 
 
+def test_label_alias_export_preview_and_clean_preserve_raw_rows(renamed_store):
+    store = renamed_store
+    with store.connect() as connection:
+        before = [tuple(row) for row in connection.execute("SELECT * FROM annotations")]
+    preview = preview_export(store, "test", {"format": "labelme", "reviewed_only": False})
+    assert preview["blocking_issue"] is None
+    assert preview["class_counts"][0]["name"] == "object_1"
+    assert preview["annotations"] == 2
+    clean = preview_export(store, "test", {"format": "labelme", "clean": True})
+    assert clean["blocking_issue"] is None
+    assert clean["annotations"] == 1
+    assert store.overlay("test", include_documents=True)[item(store, "human")["id"]]["document"]["shapes"][0]["label"] == "object_1"
+    with store.connect() as connection:
+        assert before == [tuple(row) for row in connection.execute("SELECT * FROM annotations")]
+
+
 @pytest.mark.parametrize("aliases", [None, [], {"object_1": "other"}, {"old": "missing"},
                                       {"old": "other_old", "other_old": "object_1"},
                                       {"": "object_1"}, {"old": []}])
@@ -1144,7 +1242,8 @@ def test_model_label_alias_keeps_strict_class_id_validation():
 def test_asset_versions_change_with_frontend_content(dataset, tmp_path, monkeypatch):
     assets = tmp_path / "frontend"
     assets.mkdir()
-    for name in ("index.html", "app.js", "style.css"):
+    for name in ("index.html", "efficiency.js", "resume.js", "automation.js", "task-tools.js",
+                 "app.js", "style.css", "realityloop.png"):
         (assets / name).write_bytes((server.ASSETS / name).read_bytes())
     monkeypatch.setattr(server, "ASSETS", assets)
     with TestClient(create_app(dataset[0])) as client:
@@ -1153,8 +1252,9 @@ def test_asset_versions_change_with_frontend_content(dataset, tmp_path, monkeypa
         assert "__ASSET_VERSION__" not in page.text
         version = re.search(r'/static/app.js\?v=([a-f0-9]{16})', page.text).group(1)
         assert f'/static/style.css?v={version}' in page.text
+        assert f'/static/efficiency.js?v={version}' in page.text
         assert version in client.get("/").text
-        for name in ("app.js", "style.css"):
+        for name in ("efficiency.js", "resume.js", "automation.js", "app.js", "style.css"):
             for suffix in ("", f"?v={version}"):
                 response = client.get(f"/static/{name}{suffix}")
                 assert response.status_code == 200
@@ -1165,6 +1265,7 @@ def test_asset_versions_change_with_frontend_content(dataset, tmp_path, monkeypa
             new_version = re.search(r'/static/app.js\?v=([a-f0-9]{16})', updated).group(1)
             assert new_version != version
             assert f'/static/style.css?v={new_version}' in updated
+            assert f'/static/efficiency.js?v={new_version}' in updated
             version = new_version
 
 
@@ -1177,6 +1278,10 @@ def test_http_local_security_and_save(dataset):
         assert client.post("/api/projects", json={}).status_code == 403
         assert client.get("/api/projects", headers={"Origin": "https://evil.example"}).status_code == 403
         assert client.get("/api/projects", headers={"Host": "evil.example"}).status_code == 400
+        preview_path = "/api/projects/test/export/preview"
+        assert client.post(preview_path, json={}).status_code == 403
+        preview = client.post(preview_path, json={"reviewed_only": False}, headers={"X-LabelPilot-Token": token})
+        assert preview.status_code == 200 and preview.json()["annotations"] == 2
         store = app.state.store
         row = item(store, "human")
         assert client.get(f"/api/projects/test/items/{row['id']}/image?thumbnail=true").headers["content-type"] == "image/jpeg"
@@ -1222,10 +1327,10 @@ def test_zero_area_polygon_rejected(store):
 
 
 def test_batch_processes_only_unstarted_images(store):
-    class FakeInference:
+    class FakeInference(Inference):
         def predict(self, project_id, item_id, options):
             return {"shapes": [], "provenance": {"human_reviewed": False}}
-    jobs = Jobs(store, FakeInference())
+    jobs = Jobs(store, FakeInference(store))
     job = jobs.start("test", {"limit": 10})
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:

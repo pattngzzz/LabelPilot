@@ -18,7 +18,7 @@ async function eventually(callback) {
   throw new Error("Browser test timed out waiting for application state");
 }
 
-test("crosshair guides, Q/Enter shortcuts, annotation, model selection and dataset split export", {timeout:120000}, async context => {
+test("annotation, review, export, training and workbench efficiency workflows", {timeout:120000}, async context => {
   const root = path.resolve(__dirname, "..");
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "labelpilot-browser-test-"));
   const images = path.join(home, "images");
@@ -35,7 +35,7 @@ test("crosshair guides, Q/Enter shortcuts, annotation, model selection and datas
   fs.writeFileSync(firstModel, "test fixture; browsing must not deserialize weights");
   fs.writeFileSync(secondModel, "nested test fixture; do not execute");
   fs.writeFileSync(path.join(modelFolder, "ignore.json"), "not a model");
-  const fixture = spawnSync(python, ["-c", "from PIL import Image; import sys; from pathlib import Path; [Image.new('RGB',(640,480),'#555577').save(Path(sys.argv[1])/f'image_{index}.png') for index in range(4)]", images], {windowsHide:true, encoding:"utf8"});
+  const fixture = spawnSync(python, ["-c", "from PIL import Image; import sys; from pathlib import Path; [Image.new('RGB',(640,480),color).save(Path(sys.argv[1])/f'image_{index}.png') for index,color in enumerate(('#555577','#555578','#555579','#555579'))]", images], {windowsHide:true, encoding:"utf8"});
   assert.equal(fixture.status, 0, fixture.stderr || fixture.error?.message);
   const selectionHome = fs.mkdtempSync(path.join(os.tmpdir(), "labelpilot-image-selection-"));
   const selectionFolder = path.join(selectionHome, "待标注图片");
@@ -43,7 +43,26 @@ test("crosshair guides, Q/Enter shortcuts, annotation, model selection and datas
   fs.mkdirSync(path.join(selectionFolder, "子目录"));
   fs.copyFileSync(path.join(images,"image_0.png"), path.join(selectionFolder,"子目录","嵌套.PNG"));
   fs.writeFileSync(path.join(selectionFolder,"ignore.txt"), "not an image");
-  fs.writeFileSync(path.join(home, "projects.json"), JSON.stringify([{id:"test", name:"Browser test", image_root:images, classes:["class_a", "class_b"], model_path:firstModel}]));
+  const efficiencyFrames = path.join(selectionHome, "连续帧");
+  fs.mkdirSync(efficiencyFrames);
+  const efficiencyFixture = spawnSync(python, ["-c", `
+from PIL import Image, ImageDraw
+from pathlib import Path
+import sys
+directory = Path(sys.argv[1])
+for index in range(6):
+    image = Image.new("RGB", (320, 220), "#13202f" if index < 4 else "#5c2178")
+    x = 35 + min(index, 4)*22
+    ImageDraw.Draw(image).rectangle((x, 50, x+79, 116), fill="#edc13b")
+    image.save(directory / f"part_{index:03}.png", "PNG" if index < 5 else "JPEG")
+`, efficiencyFrames], {windowsHide:true, encoding:"utf8"});
+  assert.equal(efficiencyFixture.status, 0, efficiencyFixture.stderr || efficiencyFixture.error?.message);
+  const manifestPath = path.join(home, "capture-manifest.json");
+  fs.writeFileSync(manifestPath, JSON.stringify({tasks:["capture-a", "capture-a", "capture-b", "capture-c"].map((group, index) => ({
+    package_image:`image_${index}.png`, source_group:group
+  }))}));
+  fs.writeFileSync(path.join(home, "projects.json"), JSON.stringify([{id:"test", name:"Browser test", image_root:images,
+    classes:["class_a", "class_b"], model_path:firstModel, manifest_path:manifestPath}]));
   const listener = net.createServer();
   await new Promise(resolve => listener.listen(0, "127.0.0.1", resolve));
   const port = listener.address().port;
@@ -53,8 +72,47 @@ test("crosshair guides, Q/Enter shortcuts, annotation, model selection and datas
 import sys
 import uvicorn
 from fastapi.responses import HTMLResponse, Response
+from labelpilot import evaluation
+from labelpilot.blindsets import read_snapshot, verified_manifest
+from labelpilot.comparison_details import record_frame, write_details
+from labelpilot.evaluation_worker import frozen_frames
 from labelpilot.server import create_app
+from labelpilot.store import atomic_json, read_json
+
+def comparison_fixture(run, stop, module, directory, copies):
+    snapshot = read_snapshot(directory)
+    manifest = verified_manifest(directory, snapshot)
+    setup = read_json(run / "compare.json")
+    frames = frozen_frames(directory, snapshot, manifest)
+    negative = next(i for i, (_, _, labels, _) in enumerate(frames) if not labels)
+    results = {}
+    with write_details(run) as detail:
+        for role in ("old", "new"):
+            counts = {name: dict.fromkeys(("ground_truth", "matched", "missed", "false_positives"), 0)
+                      for name in manifest["classes"]}
+            for i, (_, item, labels, size) in enumerate(frames):
+                raw = [(name, .85, box) for name, box in labels if (name == "class_a") == (role == "old")]
+                if role == "old" and i == negative:
+                    raw.append(("class_b", .65, (10, 10, 100, 100)))
+                predictions = evaluation.count_detections(counts, labels, raw, .5)
+                record_frame(detail, role, i, item, labels, size, predictions)
+            for row in counts.values():
+                row["recall"] = row["matched"] / row["ground_truth"] if row["ground_truth"] else None
+            results[role] = counts
+    rows = [{"name": name, "old": results["old"][name], "new": results["new"][name]} for name in manifest["classes"]]
+    atomic_json(run / "report.json", {"snapshot": snapshot, "classes": rows, "has_details": True, **setup})
+
+evaluation.has_training_dependencies = lambda: True
+evaluation.run_local_worker = comparison_fixture
 app = create_app()
+def audit_prediction_fixture(project_id, item_id, options, **kwargs):
+    current = app.state.store.detail(project_id, item_id)
+    shapes = current["document"]["shapes"]
+    predictions = [{**shapes[0], "label": "another", "score": .92}] if current["item"]["photo_id"] == "part_002" and shapes else []
+    return {"base_version": current["version"], "image_sha256": current["image_sha256"], "shapes": predictions,
+            "provenance": {"confidence": options["confidence"]}}
+
+app.state.inference.predict = audit_prediction_fixture
 @app.middleware("http")
 async def legacy_assets(request, call_next):
     if request.url.path == "/__legacy_cache_test":
@@ -150,6 +208,7 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await cdp("Page.navigate", {url});
     await cdp("Emulation.setDeviceMetricsOverride", {width:1600, height:1000, deviceScaleFactor:1, mobile:false});
     await waitFor('typeof state!=="undefined" && state.current && !state.busy');
+    await evaluate('element("autoDraft").checked=false; element("autoDraft").dispatchEvent(new Event("change"));');
     await check('window.legacyAssetLoaded!==true && getComputedStyle(document.body).getPropertyValue("--legacy-style-loaded").trim()!=="1" && /[?&]v=[a-f0-9]{16}/.test(document.querySelector("script[src]").src) && /[?&]v=[a-f0-9]{16}/.test(document.querySelector("link[rel=stylesheet]").href)', "A normal navigation bypasses cached legacy assets and loads a matching versioned script and stylesheet");
     let cursor=await point([320,240]);
     await cdp("Input.dispatchMouseEvent", {type:"mouseMoved", buttons:0, ...cursor});
@@ -372,14 +431,30 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await click("#cancelModelBrowser");
     await evaluate('element("modelDialog").close();');
     await cdp("Emulation.setDeviceMetricsOverride", {width:1600, height:1000, deviceScaleFactor:1, mobile:false});
+    await evaluate(`(async()=>{
+      for(const item of state.items.slice(0,2)){
+        const url=projectUrl("/items/"+item.id);
+        const current=await api(url);
+        await api(url,"PUT",{...current,expected_version:current.version,status:"draft"});
+      }
+    })()`);
+    await click("#reviewQueueButton");
+    await waitFor('state.current?.item.photo_id==="image_1" && !state.busy');
+    await check('state.items.length===2 && element("imageList").textContent.includes("待确认空图")', "Priority review puts an unconfirmed empty draft ahead of a populated draft");
+    await press("d", "KeyD");
+    await waitFor('state.current?.item.photo_id==="image_0" && !state.busy');
+    await press("e", "KeyE");
+    await waitFor('state.items.length===1 && state.current?.item.photo_id==="image_1" && !state.busy');
+    await click("#reviewQueueButton");
+    await waitFor('state.items.length===4 && state.current?.item.photo_id==="image_0" && !state.busy');
     const downloads = path.join(home, "downloads");
     fs.mkdirSync(downloads);
     await cdp("Browser.setDownloadBehavior", {behavior:"allow", downloadPath:downloads});
     await click("#exportButton");
-    await waitFor('element("exportDialog").open');
+    await waitFor('element("exportDialog").open && element("exportPreviewStatus").textContent.includes("可用分组")');
+    await check('element("splitDataset").checked && element("splitTrain").value==="80" && element("splitVal").value==="10" && element("splitTest").value==="10" && element("exportSplitUnit").value==="source_group"', "Projects with capture groups default to grouped 80/10/10 splitting");
     await waitFor('exportAugmentation.loaded');
     await check('element("augmentationPreset").value==="none" && element("augmentationPreset").options.length===7 && element("augmentationCopies").disabled', "Export defaults to no augmentation and offers five presets plus all-presets mode");
-    await check('element("splitDataset").checked && element("splitTrain").value==="80" && element("splitVal").value==="10" && element("splitTest").value==="10" && !element("createExport").disabled', "Export defaults to an editable 80/10/10 split");
     const setExportValue = (id, value) => evaluate(`element(${JSON.stringify(id)}).value=${JSON.stringify(String(value))};element(${JSON.stringify(id)}).dispatchEvent(new Event(element(${JSON.stringify(id)}).tagName==="SELECT" ? "change" : "input",{bubbles:true}));`);
     await evaluate('window.exportApi=api;window.exportRequests=[];api=async(path,method,body)=>{if(path.endsWith("/export"))exportRequests.push(body);const result=await exportApi(path,method,body);if(path.endsWith("/export"))window.lastExportResult=result;return result;};');
     await setExportValue("splitTrain", 70);
@@ -394,27 +469,45 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await setExportValue("splitSeed", 1.5);
     await check('element("createExport").disabled', "Fractional seeds are rejected");
     await setExportValue("splitSeed", 42);
-    await click("#createExport");
-    await waitFor('element("exportResult").textContent.includes("图片数量不足") && !element("createExport").disabled');
-    assert.equal(fs.readdirSync(downloads).length, 0, "Failed export never downloads a partial ZIP");
+    await waitFor('element("exportPreviewStatus").textContent.includes("可用分组") && element("createExport").disabled');
+    await check('exportRequests.length===0', "Too few capture groups block export before creating a ZIP");
     await evaluate('(async()=>{for(const row of state.items){const current=await api(projectUrl("/items/"+row.id));if(current.status!=="reviewed")await api(projectUrl("/items/"+row.id),"PUT",{...current,expected_version:current.version,status:"reviewed",confirmed_empty:true});}})()');
+    await click("#refreshExportPreview");
+    await waitFor('!element("createExport").disabled && element("exportImageCount").textContent==="4"');
+    await check('element("exportEmptyCount").textContent==="3" && element("exportObjectCount").textContent==="3" && element("exportClassRows").textContent.includes("qrade_customQ") && element("exportPreviewIssues").textContent.includes("训练集中没有标注")', "Preview reports confirmed negatives, class counts and missing training classes");
     const beforeExport = await evaluate('JSON.stringify(state.current)');
+    await evaluate('(async()=>{const route=projectUrl("/items/"+state.items.at(-1).id);const row=await api(route);await api(route,"PUT",{...row,expected_version:row.version,status:"reviewed",confirmed_empty:true});})()');
+    await click("#createExport");
+    await waitFor('element("exportResult").textContent.includes("数据已变化") && !element("createExport").disabled');
+    assert.equal(fs.readdirSync(downloads).length, 0, "A stale preview never downloads a ZIP");
     await click("#createExport");
     await waitFor('element("exportResult").textContent.includes("训练 2 张 / 验证 1 张 / 测试 1 张") && !element("createExport").disabled');
-    await check('JSON.stringify(exportRequests.at(-1).split)===JSON.stringify({train:50,val:25,test:25,seed:42}) && lastExportResult.images===4', "Custom split and seed reach the real backend");
+    await check('JSON.stringify(exportRequests.at(-1).split)===JSON.stringify({train:50,val:25,test:25,seed:42,unit:"source_group"}) && lastExportResult.images===4', "The refreshed preview supplies its exact grouped split to the export API");
     await eventually(() => fs.readdirSync(downloads).filter(name => name.endsWith(".zip")).length === 1);
     const splitExport = path.join(downloads, fs.readdirSync(downloads).find(name => name.endsWith(".zip")));
-    const exportCheck = spawnSync(python, ["-c", "import json,sys,zipfile; archive=zipfile.ZipFile(sys.argv[1]); manifest=json.loads(archive.read('export_manifest.json')); assert manifest['split_counts']=={'train':2,'val':1,'test':1}; assert all(entry['image'] in archive.namelist() for entry in manifest['items']); assert 'val: images/val' in archive.read('dataset.yaml').decode(); print('Downloaded YOLO split ZIP verified')", splitExport], {windowsHide:true, encoding:"utf8"});
+    const exportCheck = spawnSync(python, ["-c", `
+import json, sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    manifest = json.loads(archive.read('export_manifest.json'))
+    assert manifest['split_counts'] == {'train': 2, 'val': 1, 'test': 1}
+    assert manifest['split'] == 'grouped_by_source'
+    assert all(entry['image'] in archive.namelist() for entry in manifest['items'])
+    assert {entry['split'] for entry in manifest['items'] if entry['split_group'] == 'capture-a'} == {'train'}
+    assert 'val: images/val' in archive.read('dataset.yaml').decode()
+`, splitExport], {windowsHide:true, encoding:"utf8"});
     assert.equal(exportCheck.status, 0, exportCheck.stderr || exportCheck.error?.message);
-    for (const width of [1600,760,480]) {
-      await cdp("Emulation.setDeviceMetricsOverride", {width, height:1000, deviceScaleFactor:1, mobile:false});
+    for (const [width, height] of [[1600,1000], [760,800], [480,740], [360,640]]) {
+      await cdp("Emulation.setDeviceMetricsOverride", {width, height, deviceScaleFactor:1, mobile:false});
       await sleep(100);
-      await check('(()=>{const rect=element("exportDialog").getBoundingClientRect();return rect.left>=0 && rect.right<=innerWidth && rect.top>=0 && rect.bottom<=innerHeight && element("exportDialog").scrollWidth<=element("exportDialog").clientWidth;})()', `Split export dialog fits the viewport at width ${width}`);
+      await check('(()=>{const dialog=element("exportDialog"),rect=dialog.getBoundingClientRect(),button=element("createExport").getBoundingClientRect();return rect.left>=0 && rect.right<=innerWidth && rect.top>=0 && rect.bottom<=innerHeight && dialog.scrollWidth<=dialog.clientWidth && button.bottom<=rect.bottom;})()', `Split export dialog and download action fit the viewport at ${width} by ${height}`);
+      if (width === 1600 || width === 360) {
+        const screenshot = await cdp("Page.captureScreenshot", {format:"png"});
+        fs.writeFileSync(path.join(home, width === 1600 ? "split-export.png" : "split-export-mobile.png"), Buffer.from(screenshot.data, "base64"));
+      }
     }
-    const exportScreenshot = await cdp("Page.captureScreenshot", {format:"png"});
-    fs.writeFileSync(path.join(home,"split-export.png"), Buffer.from(exportScreenshot.data,"base64"));
     await cdp("Emulation.setDeviceMetricsOverride", {width:1600, height:1000, deviceScaleFactor:1, mobile:false});
     await click("#splitDataset");
+    await waitFor('!element("createExport").disabled');
     await check('element("exportSplitSettings").disabled && !element("createExport").disabled', "Users can keep the original unsplit export behavior");
     await click("#createExport");
     await waitFor('element("exportResult").textContent.includes("未划分数据集") && !element("createExport").disabled');
@@ -445,7 +538,8 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     for (const preset of ["gentle","lighting","quality","rotation","horizontal"]) {
       await setExportValue("augmentationPreset", preset);
       await evaluate('element("augmentationPreset").dispatchEvent(new Event("change",{bubbles:true}));');
-      await check('!element("createExport").disabled && element("augmentationDescription").textContent.length>20 && element("augmentationSummary").textContent.includes("3 倍")', `${preset} displays its limitations and added-copy summary`);
+      await waitFor('!element("createExport").disabled');
+      await check('element("augmentationDescription").textContent.length>20 && element("augmentationSummary").textContent.includes("3 倍")', `${preset} displays its limitations and added-copy summary`);
     }
     const previousDownloads = fs.readdirSync(downloads).filter(name => name.endsWith(".zip"));
     await click("#createExport");
@@ -463,6 +557,7 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await check('element("augmentationSummary").textContent.includes("额外生成 15 张") && element("augmentationSummary").textContent.includes("16 倍")', "All-presets mode correctly counts the maximum copy setting");
     await setExportValue("augmentationCopies", 1);
     await check('element("augmentationSummary").textContent.includes("每方案 1 张") && element("augmentationSummary").textContent.includes("含原图共 6 张") && element("augmentationDescription").textContent.includes("不连续叠加")', "All-presets mode explains independent generation and the recommended count");
+    await waitFor('!element("createExport").disabled');
     const downloadsBeforeAll = fs.readdirSync(downloads).filter(name => name.endsWith(".zip"));
     await click("#createExport");
     await waitFor('element("exportResult").textContent.includes("训练增强 10 张") && !element("createExport").disabled');
@@ -476,6 +571,7 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await setExportValue("augmentationCopies", 3);
     await check('element("augmentationDescription").textContent.includes("90°") && element("augmentationDescription").textContent.includes("交换宽高") && element("augmentationSummary").textContent.includes("含原图共 4 张")', "Rotation explains its three angles, changed dimensions and independent copy count");
     const downloadsBeforeRotation = fs.readdirSync(downloads).filter(name => name.endsWith(".zip"));
+    await waitFor('!element("createExport").disabled');
     await click("#createExport");
     await waitFor('element("exportResult").textContent.includes("训练增强 6 张") && !element("createExport").disabled');
     await check('lastExportResult.images===10 && lastExportResult.split_counts.train===8 && JSON.stringify(exportRequests.at(-1).augmentation)===JSON.stringify({preset:"rotation",copies:3,seed:43})', "Rotation exports three different angles for every training original without changing validation or test images");
@@ -528,9 +624,102 @@ print('Rotation ZIP: all angles, dimensions, exact normalized boxes and train-on
     const augmentationScreenshot = await cdp("Page.captureScreenshot", {format:"png"});
     fs.writeFileSync(path.join(home,"augmentation-export.png"), Buffer.from(augmentationScreenshot.data,"base64"));
     context.diagnostic("Five augmentation presets and all-presets mode, copy totals, safety validation, downloaded YOLO ZIPs and annotation preservation passed");
-    await evaluate('api=exportApi;');
-    await evaluate('element("exportDialog").close();');
     await cdp("Emulation.setDeviceMetricsOverride", {width:1600,height:1000,deviceScaleFactor:1,mobile:false});
+    await evaluate('element("exportDialog").close();');
+    await click("#cleanButton");
+    await waitFor('!element("exportCleaning").hidden && !element("createExport").disabled');
+    await check('element("exportImageCount").textContent==="3" && element("exportCleaningSummary").textContent.includes("重复副本 1 张")', "One-click cleaning previews identical duplicate removal");
+    await click("#createExport");
+    await waitFor('exportRequests.at(-1).clean===true && lastExportResult.images===3');
+    await eventually(() => fs.readdirSync(downloads).filter(name => name.endsWith(".zip")).length === 6);
+    const cleaningScreenshot = await cdp("Page.captureScreenshot", {format:"png"});
+    fs.writeFileSync(path.join(home,"cleaning.png"), Buffer.from(cleaningScreenshot.data,"base64"));
+    await evaluate('element("exportDialog").close();');
+
+    await evaluate(`window.requestedTraining=null;
+      api=async (route,method,body)=>{
+        if(!route.endsWith("/trainings"))return exportApi(route,method,body);
+        if(method==="POST"){window.requestedTraining=body;return {};}
+        return window.requestedTraining ? [{id:"demo",status:"completed",created_at:"2026-11-18T08:00:00Z",
+          progress:{epoch:1,epochs:1,device:"CPU",metrics:{map50_95:0.51,recall:0.62}},options:window.requestedTraining,
+          split_counts:{train:2,val:1},cleaned_out:1,weights:${JSON.stringify(secondModel)},has_log:true,has_dataset:true}] : [];
+      };`);
+    await click("#trainingButton");
+    await waitFor('element("trainingDialog").open && element("trainingRuns").textContent.includes("暂无")');
+    await check('element("trainingUnit").value==="source_group" && element("trainingMode").value==="fine_tune"', "Training uses capture groups and the local project model by default");
+    await evaluate('element("trainingMode").value="scratch"; element("trainingEpochs").value="1";');
+    await click("#startTraining");
+    await waitFor('element("trainingRuns").textContent.includes("mAP50–95 0.510")');
+    await check('requestedTraining.epochs===1 && requestedTraining.mode==="scratch" && !!element("trainingRuns").querySelector("a[download][href$=weights]")', "Training controls submit settings and show metrics and the checkpoint link");
+    const trainingScreenshot = await cdp("Page.captureScreenshot", {format:"png"});
+    fs.writeFileSync(path.join(home,"training.png"), Buffer.from(trainingScreenshot.data,"base64"));
+    await click('[data-use-training="demo"]');
+    await waitFor(`state.project.model_path===${JSON.stringify(secondModel)}`);
+    await evaluate('element("trainingDialog").close(); api=exportApi;');
+    await click("#comparisonButton");
+    await waitFor('element("comparisonDialog").open && element("comparisonSet").options[0]?.text==="暂无盲测集" && element("comparisonModels").options.length===1');
+    await check(`element("startComparison").disabled && element("comparisonOldPath").value===${JSON.stringify(secondModel)}`, "Model comparison suggests the current weight and waits for a frozen set");
+    await click("#openBlindset");
+    await waitFor('element("blindsetDialog").open');
+    await check('element("blindsetUnit").value==="source_group"', "The blind set defaults to the same capture grouping as training");
+    await setExportValue("blindsetName", "月度盲测");
+    await setExportValue("blindsetPercent", 100);
+    await click("#freezeBlindset");
+    await waitFor('!element("blindsetDialog").open && element("comparisonSet").options[0].text.includes("月度盲测")');
+    await check('element("comparisonSetInfo").textContent.includes("3 张图") && !element("startComparison").disabled', "A real frozen snapshot is selectable and displays the cleaned image count");
+    await click("#browseComparisonOld");
+    await waitFor('modelBrowser.listing && !modelBrowser.loading');
+    await setExportValue("modelBrowserPath", modelFolder);
+    await click("#modelBrowserGo");
+    await waitFor(`!modelBrowser.loading && modelBrowser.listing.path===${JSON.stringify(modelFolder)}`);
+    await click('[data-model-file='+JSON.stringify(firstModel)+']');
+    await check(`element("comparisonOldPath").value===${JSON.stringify(firstModel)} && element("modelPath").value===${JSON.stringify(secondModel)}`, "Selecting a comparison weight leaves the saved preannotation weight intact");
+    await setExportValue("comparisonNewPath", secondModel);
+    await click("#startComparison");
+    await waitFor('!element("comparisonReport").hidden && element("comparisonClassRows").rows.length>1');
+    await check('(()=>{const rows=[...element("comparisonClassRows").rows];return rows.some(row=>row.cells[1].textContent!=="0" && row.cells[2].textContent==="0%" && row.cells[5].textContent==="100%" && row.cells[7].textContent==="0") && rows.some(row=>row.cells[1].textContent==="0" && row.cells[2].textContent==="—" && row.cells[4].textContent==="1");})()', "The table shows both models' per-class recall, misses and false positives, plus the no-ground-truth case");
+    await click("#downloadComparison");
+    const comparisonDownload = await eventually(() => fs.readdirSync(downloads).find(name => /^labelpilot-compare-.+\.json$/.test(name)));
+    const comparisonReport = JSON.parse(fs.readFileSync(path.join(downloads, comparisonDownload)));
+    assert.equal(comparisonReport.snapshot.name, "月度盲测");
+    assert.equal(comparisonReport.options.match_iou, .5);
+    const comparisonScreenshot = await cdp("Page.captureScreenshot", {format:"png"});
+    fs.writeFileSync(path.join(home,"comparison.png"), Buffer.from(comparisonScreenshot.data,"base64"));
+    const setReviewValue = (id, value) => evaluate(`(()=>{const field=element(${JSON.stringify(id)});field.value=${JSON.stringify(value)};field.dispatchEvent(new Event("change",{bubbles:true}));})()`);
+    await click('[data-review-label="class_a"][data-review-kind="new_missed"]');
+    await waitFor('element("comparisonReviewDialog").open && !element("comparisonFrame").hidden && element("comparisonFrameNewImage").querySelector("img")?.naturalWidth');
+    await check('element("comparisonReviewKind").value==="new_missed" && element("comparisonReviewClass").value==="class_a" && element("comparisonFrameOldImage").querySelectorAll(".comparison-frame-box.matched").length===1 && element("comparisonFrameNewImage").querySelector(".comparison-frame-box.truth").textContent.includes("漏检")', "A missed count opens the exact class and image with frozen truth and old/new predictions");
+    await setReviewValue("comparisonReviewKind", "newly_missed");
+    await waitFor('element("comparisonFrameNewImage").querySelector(".focused")?.textContent.includes("新增漏检")');
+    await check('element("comparisonReviewStatus").textContent.includes("1 张图 · 1 个漏检")', "The regression filter highlights the specific newly missed target");
+    const reviewScreenshot = await cdp("Page.captureScreenshot", {format:"png"});
+    fs.writeFileSync(path.join(home,"comparison-review.png"), Buffer.from(reviewScreenshot.data,"base64"));
+    for (const width of [1024, 760, 400]) {
+      await cdp("Emulation.setDeviceMetricsOverride", {width,height:850,deviceScaleFactor:1,mobile:false});
+      await sleep(100);
+      await check('(()=>{const dialog=element("comparisonReviewDialog");const rect=dialog.getBoundingClientRect();return rect.left>=0 && rect.right<=innerWidth && rect.top>=0 && rect.bottom<=innerHeight && dialog.scrollWidth<=dialog.clientWidth && element("comparisonFrameNewImage").querySelector("img").clientWidth>100;})()', `Per-image review stays usable at width ${width}`);
+    }
+    await cdp("Emulation.setDeviceMetricsOverride", {width:1600,height:1000,deviceScaleFactor:1,mobile:false});
+    await setReviewValue("comparisonReviewKind", "fixed_missed");
+    await waitFor('element("comparisonFrame").hidden && element("comparisonReviewStatus").textContent.includes("0 张图")');
+    const fixedClass = await evaluate('comparisonUi.reportData.classes.find(row=>row.old.missed>0 && row.new.matched>0).name');
+    await setReviewValue("comparisonReviewClass", fixedClass);
+    await waitFor('element("comparisonFrameNewImage").querySelector(".focused")?.textContent.includes("修复漏检")');
+    await evaluate('element("comparisonReviewDialog").close();');
+    await click('[data-review-label="class_b"][data-review-kind="old_false_positives"]');
+    await waitFor('element("comparisonFrameOldImage").querySelector(".comparison-frame-box.false-positive") && !element("comparisonFrame").hidden');
+    await check('element("comparisonReviewKind").value==="old_false_positives" && element("comparisonReviewStatus").textContent.includes("1 个误检") && !element("comparisonFrameOldImage").querySelector(".comparison-frame-box.truth")', "The false-positive count opens the negative image and renders its unmatched prediction");
+    await evaluate('element("comparisonReviewDialog").close();');
+    for (const width of [1024, 760, 400]) {
+      await cdp("Emulation.setDeviceMetricsOverride", {width,height:850,deviceScaleFactor:1,mobile:false});
+      await sleep(100);
+      await check('(()=>{const dialog=element("comparisonDialog");const rect=dialog.getBoundingClientRect();return rect.left>=0 && rect.right<=innerWidth && rect.top>=0 && rect.bottom<=innerHeight && dialog.scrollWidth<=dialog.clientWidth && element("comparisonOldPath").clientWidth>100;})()', `Model comparison remains usable at width ${width}`);
+    }
+    await cdp("Emulation.setDeviceMetricsOverride", {width:1600,height:1000,deviceScaleFactor:1,mobile:false});
+    await evaluate('element("comparisonDialog").close();');
+    await click("#comparisonButton");
+    await waitFor('!element("comparisonReport").hidden && element("comparisonRunStatus").textContent==="对比完成"');
+    await evaluate('element("comparisonDialog").close();');
     const originalItemId = await evaluate('state.current.item.id');
     const originalStoredAnnotation = await evaluate('(async()=>JSON.stringify(await api(projectUrl("/items/"+state.current.item.id))))()');
     await click("#newProjectButton");
@@ -656,6 +845,207 @@ print('Rotation ZIP: all angles, dimensions, exact normalized boxes and train-on
     assert.equal(fs.readFileSync(labelsAfterReload, "utf8"), expectedLabelText, "Standalone label export still includes persisted new classes after a reload");
     assert.equal(fs.readFileSync(downloadedLabels, "utf8"), expectedLabelText, "Reuse and later exports never overwrite the original class file");
     context.diagnostic("Standalone classes.txt download, unused custom classes, Unicode, ID order, pending input, busy guards, annotation preservation, real reimport and reload passed");
+
+    await evaluate(`(async()=>{
+      const project=await api("/api/projects","POST",{name:"Efficiency modes",image_root:${JSON.stringify(efficiencyFrames)},
+        classes:["part","another"],model_path:${JSON.stringify(firstModel)}});
+      state.projects.push(project);
+      element("projectSelect").add(new Option(project.name,project.id));
+      await selectProject(project.id);
+    })()`);
+    await waitFor('state.current?.item.photo_id==="part_000" && !state.busy');
+    const changeMode = mode => setReviewValue("efficiencyMode", mode);
+    await changeMode("fourpoint");
+    await waitFor('state.tool==="fourpoint"');
+    for (const xy of [[75,50],[75,117],[35,80],[115,80]]) await mouseClick(await point(xy));
+    await waitFor('element("labelPicker").open');
+    await press("q","KeyQ");
+    await waitFor('!element("labelPicker").open && state.current.document.shapes.length===1');
+    await check('state.tool==="fourpoint" && Math.abs(bounds(state.current.document.shapes[0])[0]-35)<1 && Math.abs(bounds(state.current.document.shapes[0])[3]-117)<1', "Four edge clicks yield a labeled rectangle, and the mode stays ready for the next object");
+    for (const xy of [[217,150],[217,186],[198,168],[236,168]]) await mouseClick(await point(xy));
+    await waitFor('element("labelPicker").open');
+    await press("q","KeyQ");
+    await waitFor('!element("labelPicker").open && state.current.document.shapes.length===2');
+    await evaluate('selectShape(0)');
+    await changeMode("fast");
+    await waitFor('element("fastControls").hidden===false && state.selected===0');
+    await press("]","BracketRight");
+    await waitFor('state.selected===1');
+    await press("2","Digit2");
+    await check('(()=>{const [l,t,r,b]=bounds(state.current.document.shapes[1]),[x,y]=screenPoint([(l+r)/2,(t+b)/2]);return state.current.document.shapes[1].label==="another" && Math.abs(x-viewport().width/2)<2 && Math.abs(y-viewport().height/2)<2;})()', "Fast review centers the next box and reassigns its class from the keyboard");
+    await click("#fastFull");
+    await check('state.selected===-1 && state.dirty', "Returning to the whole frame preserves edits for its human review");
+    await changeMode("sequence");
+    await click('[data-shape="0"]');
+    await click("#markFirstFrame");
+    await waitFor('!state.busy && element("efficiencyHint").textContent.includes("起点 part_000")');
+    await click("#inheritNext");
+    await waitFor('state.current?.item.photo_id==="part_001" && !state.busy && state.current.status==="draft"');
+    await check('state.current.document.shapes.length===1 && state.current.document.shapes[0].annotation_origin==="inherit_previous"', "Inheriting the selected box lands on the next same-sequence frame with a draft");
+
+    const endpointFrame = await evaluate('state.items.find(item=>item.photo_id==="part_003").id');
+    await click(`[data-item="${endpointFrame}"]`);
+    await waitFor('state.current?.item.photo_id==="part_003" && !state.busy');
+    await changeMode("prompt");
+    await waitFor('state.tool==="prompt"');
+    await mouseClick(await point([125,78]));
+    await waitFor('!element("acceptPrompt").disabled');
+    await click("#promptNegative");
+    await mouseClick(await point([258,166]));
+    await waitFor('!element("acceptPrompt").disabled');
+    await click("#acceptPrompt");
+    await waitFor('element("labelPicker").open');
+    await press("q","KeyQ");
+    await waitFor('!element("labelPicker").open && state.current.document.shapes.length===1');
+    await check('bounds(state.current.document.shapes[0]).every((coord,index)=>Math.abs(coord-[101,50,181,117][index])<1)', "Real local point prompting proposes the target box and accepts it through the standard label picker");
+    await changeMode("sequence");
+    await click('[data-shape="0"]');
+    await click("#previewLastFrame");
+    await waitFor('element("sequenceDialog").open && element("sequenceTarget").options[0]?.text==="part_002"');
+    await check('element("sequenceSummary").textContent.includes("1 张草稿") && element("sequencePreview").querySelector(".comparison-frame-box")!==null', "Keyframe interpolation previews the intermediate box and skips the already inherited draft");
+    await click("#sequenceApply");
+    await waitFor('!element("sequenceDialog").open && state.items.find(item=>item.photo_id==="part_002")?.status==="draft"');
+
+    await click("#similarityButton");
+    await click("#scanSimilarity");
+    await waitFor('!element("similarityResults").hidden && element("similarityCards").querySelectorAll("input").length===2');
+    await click("#similarityKeepRecommended");
+    await check('element("similaritySelectionInfo").textContent.includes("队列保留 1 张") && element("similarityCards").querySelectorAll("input:checked").length===1', "Visual screening groups a PNG and its re-encoded JPEG and allows retaining the representative");
+    const similarityScreenshot = await cdp("Page.captureScreenshot", {format:"png"});
+    fs.writeFileSync(path.join(home,"similarity-review.png"), Buffer.from(similarityScreenshot.data,"base64"));
+    await click("#applySimilarity");
+    await waitFor('!element("similarityDialog").open && !state.busy && element("statusSelect").value==="curated" && state.items.length===1');
+
+    await click("#auditButton");
+    await click("#startAudit");
+    await waitFor('element("auditStatus").textContent.includes("扫描完成") && element("auditStatus").textContent.includes("疑点 1 张")');
+    await click("#openAuditQueue");
+    await waitFor('!element("auditFrameBar").hidden && state.current?.item.photo_id==="part_002"');
+    await check('element("auditFrameReasons").textContent.includes("类别冲突 1") && state.current.document.shapes[0].label==="part"', "Suspicion review opens the flagged frame next to its unchanged manual label");
+    await click("#toggleAuditOverlay");
+    await check('element("toggleAuditOverlay").getAttribute("aria-pressed")==="false"', "The audit hint overlay can be toggled while the frame stays editable");
+    await click("#dismissAuditFrame");
+    await waitFor('state.items.length===0 && element("auditFrameBar").hidden && !state.current');
+
+    await setReviewValue("statusSelect", "");
+    await waitFor('!state.busy && state.items.length===6 && state.current?.item.photo_id==="part_000"');
+    const resumeItem = await evaluate('state.items.find(item=>item.photo_id==="part_003").id');
+    const prefetchItem = await evaluate('state.items.find(item=>item.photo_id==="part_004").id');
+    await click(`[data-item="${resumeItem}"]`);
+    await waitFor('state.current?.item.photo_id==="part_003" && !state.busy');
+    await waitFor(`performance.getEntriesByType("resource").some(entry=>entry.name.endsWith("/items/${prefetchItem}/image"))`);
+    await check('!element("autoDraft").checked', "The draft preference survives workspace navigation");
+    await click("#autoDraft");
+    await box([21,158],[55,185]);
+    await press("q","KeyQ");
+    await waitFor('state.current.document.shapes.length===2 && !state.dirty && element("autoSaveStatus").textContent.includes("自动保存")');
+    const savedVersion = await evaluate('state.current.version');
+    await evaluate('zoom(1.35); window.beforeResumeReload=true;');
+    const savedZoom = await evaluate('state.scale');
+    await sleep(280);
+    await cdp("Page.reload");
+    await waitFor(`window.beforeResumeReload!==true && typeof state!=="undefined" && !state.busy && state.current?.item.id===${JSON.stringify(resumeItem)}`);
+    await check(`state.current.version===${savedVersion} && state.current.status==="draft" && state.selected===1 && Math.abs(state.scale-${savedZoom})<.001`, "Idle editing saves a draft and a reload restores the image, box selection and zoom");
+
+    await click("#automationButton");
+    await waitFor('element("automationDialog").open && !element("runIntake").disabled');
+    const originalWorkflowFolder = await evaluate('element("workflowFolder").value');
+    await click("#browseWorkflowFolder");
+    await waitFor('element("imageBrowserDialog").open && imageBrowser.valid && !imageBrowser.loading');
+    await check('imageBrowser.target==="workflowFolder" && imageBrowser.mode==="folder"', "Automation retains its local folder browser alongside native project image selection");
+    await click("#cancelImageBrowser");
+    await check(`element("workflowFolder").value===${JSON.stringify(originalWorkflowFolder)} && element("automationDialog").open`, "Cancelling the automation folder browser preserves its recipe and open dialog");
+    await click("#workflowRepresentatives");
+    await click("#runIntake");
+    await waitFor('document.querySelector("[data-workflow-run]")?.textContent.includes("待审核 1 张")');
+    await check('element("workflowRuns").textContent.includes("暂缓 1 张") && !!element("workflowRuns").querySelector("[data-workflow-action=triage]")', "The new batch pipeline groups similar images, prelabels the representative and exposes its review queue");
+    const workflowScreenshot = await cdp("Page.captureScreenshot", {format:"png"});
+    fs.writeFileSync(path.join(home,"automation.png"), Buffer.from(workflowScreenshot.data,"base64"));
+    await click('[data-workflow-action="triage"]');
+    await waitFor('!element("automationDialog").open && element("statusSelect").value==="triage" && state.items.length===1 && !state.busy');
+    await check('state.current.status==="predicted" && element("imageList").textContent.includes("无候选框")', "Automated routing keeps empty outputs pending for human review");
+
+    const createTask = async (task, label) => {
+      await click("#newProjectButton");
+      await waitFor('element("projectDialog").open');
+      await click(`.task-option:has(input[value="${task}"])`);
+      await setExportValue("newProjectName", task);
+      await setExportValue("newClasses", label);
+      await evaluate(`element("newImageRoot").value=${JSON.stringify(efficiencyFrames)}; element("newImageRoot").dispatchEvent(new Event("input"));`);
+      await click("#createProject");
+      await waitFor(`state.project.task_type==="${task}" && state.current && !state.busy && !element("projectDialog").open`);
+    };
+    if (await evaluate('element("autoDraft").checked')) await click("#autoDraft");
+    await click("#newProjectButton");
+    await check('document.querySelector(".logo img").naturalWidth>0 && document.querySelectorAll(".task-option").length===4',
+      "The RealityLoop logo loads and the project dialog offers four task types");
+    const taskNamesFit = `Array.from(document.querySelectorAll(".task-option")).every(tile =>
+      tile.querySelector("span").getBoundingClientRect().right <= tile.getBoundingClientRect().right)`;
+    await check(taskNamesFit, "Task names and descriptions fit inside the desktop choices");
+    fs.writeFileSync(path.join(home,"task-selection.png"), Buffer.from((await cdp("Page.captureScreenshot", {format:"png"})).data,"base64"));
+    await cdp("Emulation.setDeviceMetricsOverride", {width:420,height:850,deviceScaleFactor:1,mobile:false});
+    await sleep(80);
+    await check(taskNamesFit, "Task names and descriptions also fit on a narrow screen");
+    await cdp("Emulation.setDeviceMetricsOverride", {width:1600,height:1000,deviceScaleFactor:1,mobile:false});
+    await evaluate('element("projectDialog").close()');
+    await createTask("segment", "part");
+    await check(`element("projectTask").textContent==="实例分割" && document.querySelector('[data-tool="rectangle"]').hidden`,
+      "Instance projects show contour tools and a task-specific header");
+    await click('[data-tool="polygon"]');
+    for (const coords of [[35,50],[114,50],[114,116],[35,116]]) await mouseClick(await point(coords));
+    await press("q","KeyQ");
+    await waitFor('element("labelPicker").open');
+    await press("q","KeyQ");
+    await waitFor('state.current.document.shapes[0]?.shape_type==="polygon"');
+    await changeMode("prompt");
+    await mouseClick(await point([60,73]));
+    await waitFor('!element("acceptPrompt").disabled');
+    await click("#acceptPrompt");
+    await waitFor('element("labelPicker").open');
+    await press("q","KeyQ");
+    await waitFor('state.current.document.shapes.length===2');
+    await check('state.current.document.shapes.every(shape=>shape.shape_type==="polygon")',
+      "Manual contours and point-assisted proposals both create independent instance polygons");
+    await click("#saveButton");
+    await waitFor('!state.busy && !state.dirty');
+
+    await createTask("semantic", "region");
+    await click('[data-tool="brush"]');
+    await mouseClick(await point([61,80]));
+    await click('[data-tool="erase"]');
+    await setExportValue("brushRadius", "6");
+    await mouseClick(await point([61,80]));
+    await check('state.current.document.shapes.length===2 && state.current.document.shapes[1].erase===true && state.current.document.shapes[1].radius===6',
+      "Semantic painting and erasing retain ordered pixel regions");
+    await press("e","KeyE");
+    await waitFor('state.items.some(item=>item.status==="reviewed") && !state.busy');
+    await click("#exportButton");
+    await waitFor('element("exportDialog").open');
+    if (await evaluate('element("splitDataset").checked')) await click("#splitDataset");
+    await waitFor('element("exportDialog").open && exportPreview.plan');
+    await check('element("exportFormat").value==="mask" && !exportPreview.plan.data.blocking_issue',
+      "Semantic export is ready with a per-pixel PNG mask");
+    await evaluate('element("exportDialog").close()');
+
+    await createTask("hand_pose", "");
+    await click('[data-tool="hand"]');
+    await mouseClick(await point([130,147]));
+    await click("#skipHandPoint");
+    await mouseClick(await point([105,113]));
+    await click("#finishHand");
+    await waitFor('state.current.document.shapes[0]?.keypoints.length===21');
+    await check('state.project.classes[0].name==="hand" && state.current.document.shapes[0].keypoints[1][2]===0',
+      "Hand annotation stores the 21-point template with skipped keypoints");
+    await setReviewValue("jointSelect", "2");
+    await setReviewValue("jointVisibility", "1");
+    await click("#placeJoint");
+    await mouseClick(await point([112,105]));
+    await check('state.current.document.shapes[0].keypoints[2][2]===1 && Math.abs(state.current.document.shapes[0].keypoints[2][0]-112)<2',
+      "Hand keypoints can be relocated and marked occluded");
+    await click("#saveButton");
+    await waitFor('state.current.status==="draft" && !state.dirty && !state.busy');
+    fs.writeFileSync(path.join(home,"hand-workspace.png"), Buffer.from((await cdp("Page.captureScreenshot", {format:"png"})).data,"base64"));
+
     assert.deepEqual(errors, [], "No browser runtime errors");
   } finally {
     if (socket?.readyState === WebSocket.OPEN && cdp) await cdp("Browser.close").catch(() => {});

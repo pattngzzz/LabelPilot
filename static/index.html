@@ -5,14 +5,18 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="labelpilot-token" content="__SESSION_TOKEN__">
   <meta name="color-scheme" content="dark">
-  <title>LabelPilot · 本地半自动标注</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='11' fill='%238b5cf6'/%3E%3Cpath d='M11 10v20h18M18 11h11v11' fill='none' stroke='white' stroke-width='3'/%3E%3C/svg%3E">
+  <title>LabelPilot · 现实回环</title>
+  <link rel="icon" type="image/png" href="/static/realityloop.png?v=__ASSET_VERSION__">
   <link rel="stylesheet" href="/static/style.css?v=__ASSET_VERSION__">
+  <script src="/static/efficiency.js?v=__ASSET_VERSION__" defer></script>
+  <script src="/static/resume.js?v=__ASSET_VERSION__" defer></script>
+  <script src="/static/automation.js?v=__ASSET_VERSION__" defer></script>
+  <script src="/static/task-tools.js?v=__ASSET_VERSION__" defer></script>
   <script src="/static/app.js?v=__ASSET_VERSION__" defer></script>
 </head>
 <body>
   <aside class="rail">
-    <div class="logo" title="LabelPilot"><svg viewBox="0 0 32 32"><path d="M8 7v18h17M15 8h10v10"/></svg></div>
+    <div class="logo" title="现实回环"><img src="/static/realityloop.png?v=__ASSET_VERSION__" alt="现实回环"></div>
     <button class="rail-button active" id="workspaceButton" title="标注工作台"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></button>
     <button class="rail-button" id="modelSettings" title="基线模型与批量预标注"><svg viewBox="0 0 24 24"><path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5Z"/></svg></button>
     <button class="rail-button" id="railExport" title="导出数据集"><svg viewBox="0 0 24 24"><path d="M12 3v12m-4-4 4 4 4-4M4 15v6h16v-6"/></svg></button>
@@ -23,17 +27,24 @@
   </aside>
   <div class="shell">
     <header class="topbar">
-      <div class="brand">LabelPilot <span>LOCAL WORKSPACE</span></div>
+      <div class="brand"><img src="/static/realityloop.png?v=__ASSET_VERSION__" alt=""><strong>LabelPilot</strong></div>
       <span class="divider"></span>
       <select id="projectSelect" aria-label="当前项目"></select>
-      <button class="button" id="newProjectButton" title="选择待标注图片或文件夹，建立新项目">＋ 选择图片</button>
-      <div class="topbar-right"><span class="privacy"><i></i> 数据不离开本机</span><button class="button" id="exportButton">↗ 导出数据集</button></div>
+      <button class="button" id="newProjectButton" title="选择标注任务和本机图片">＋ 新建项目</button>
+      <div class="topbar-right">
+        <span class="privacy"><i></i> 本地工作区</span>
+        <button class="button" id="cleanButton">一键清洗</button>
+        <button class="button" id="exportButton">导出数据集</button>
+        <button class="button primary" id="trainingButton">一键训练</button>
+        <button class="button" id="comparisonButton" data-tasks="detect">模型对比</button>
+        <button class="button" id="automationButton">自动流程</button>
+      </div>
     </header>
     <section class="overview">
-      <div class="page-title"><div class="eyebrow">ANNOTATION STUDIO</div><h1>标注工作台 <span class="pill subtle">目标检测 / 多边形</span></h1><p id="projectSubtitle">正在读取本地项目…</p></div>
+      <div class="page-title"><h1>标注工作台 <span id="projectTask" class="task-chip" hidden></span></h1><p id="projectSubtitle">正在读取本地项目…</p></div>
       <div class="metrics">
         <div class="metric"><span>图片总数</span><strong id="totalCount">—</strong></div>
-        <div class="metric"><span><i class="dot violet"></i>模型待审核</span><strong id="predictedCount">—</strong></div>
+        <div class="metric"><span><i class="dot prediction"></i>模型待审核</span><strong id="predictedCount">—</strong></div>
         <div class="metric"><span><i class="dot green"></i>已审核</span><strong id="reviewedCount">—</strong></div>
         <div class="metric progress-metric"><span>人工审核进度 <b id="progressText">0%</b></span><div class="progress-track"><div id="reviewProgress"></div></div><small id="progressCaption">源标注保留 · 新修改独立保存</small></div>
       </div>
@@ -41,29 +52,87 @@
     <main class="workbench">
       <aside class="queue panel">
         <div class="panel-heading"><h2>图片队列 <span id="filteredCount">0</span></h2><button class="icon-button" id="refreshButton" title="刷新队列">↻</button></div>
-        <div class="queue-filters"><input id="searchInput" type="search" placeholder="搜索图片名称…" aria-label="搜索图片"><select id="batchSelect" aria-label="筛选批次"><option value="">全部批次</option></select><select id="statusSelect" aria-label="筛选审核状态"><option value="">全部状态</option><option value="unstarted">未开始</option><option value="imported">人工标注 · 待审核</option><option value="predicted">模型预标注 · 待审核</option><option value="draft">编辑中</option><option value="reviewed">已审核</option><option value="skipped">已跳过</option><option value="error">读取异常</option></select></div>
+        <div class="queue-filters">
+          <button class="button queue-review" id="reviewQueueButton" type="button" aria-pressed="false">待审核队列</button>
+          <div class="queue-utilities"><button class="button" id="similarityButton" type="button">相似筛图</button><button class="button" id="auditButton" type="button" data-tasks="detect">疑点复核</button></div>
+          <input id="searchInput" type="search" placeholder="搜索图片名称…" aria-label="搜索图片">
+          <select id="batchSelect" aria-label="筛选批次"><option value="">全部批次</option></select>
+          <select id="statusSelect" aria-label="筛选审核状态">
+            <option value="">全部状态</option>
+            <optgroup label="待审核">
+              <option value="review">按优先级</option><option value="review_empty">未确认空图</option>
+              <option value="review_difficult">难例</option><option value="review_low">低置信度 · 低于 50%</option>
+              <option value="curated">相似筛图后的待标注图</option><option value="audit" data-tasks="detect">标注疑点待复核</option>
+              <option value="triage">智能审核分流</option><option value="spot_review">按来源抽样复核</option>
+            </optgroup>
+            <optgroup label="标注状态">
+              <option value="unstarted">未开始</option><option value="imported">人工标注 · 待审核</option>
+              <option value="predicted">模型预标注 · 待审核</option><option value="draft">编辑中</option>
+              <option value="reviewed">已审核</option><option value="skipped">已跳过</option><option value="error">读取异常</option>
+            </optgroup>
+          </select>
+        </div>
         <div class="image-list" id="imageList"></div>
         <div class="queue-footer"><button class="icon-button" id="prevPage" title="上一页">‹</button><span id="pageInfo">0 / 0</span><button class="icon-button" id="nextPage" title="下一页">›</button></div>
       </aside>
       <section class="editor panel">
         <div class="editor-heading"><div><strong id="imageTitle">选择图片开始标注</strong><span id="imageMeta"></span></div><div class="editor-status"><span id="dirtyBadge" class="dirty" hidden>未保存</span><span id="statusBadge" class="pill">未开始</span><button class="icon-button" id="historyButton" title="保存历史与恢复">↶</button></div></div>
-        <div class="editor-toolbar"><div class="tool-group"><button class="tool active" data-tool="select" title="选择 / 移动 (V)">↖</button><button class="tool" data-tool="rectangle" title="矩形框 (R)">▢</button><button class="tool" data-tool="polygon" title="多边形 (P)">⬡</button><button class="tool" data-tool="pan" title="平移 (H / 按住空格)">✥</button></div><span class="divider"></span><button class="tool" id="undoButton" title="撤销 (Ctrl+Z)">↶</button><button class="tool" id="redoButton" title="重做 (Ctrl+Shift+Z)">↷</button><div class="toolbar-space"></div><button class="tool" id="zoomOut" title="缩小">−</button><button class="zoom-label" id="fitButton" title="适应画布 (F)">100%</button><button class="tool" id="zoomIn" title="放大">＋</button><button class="button focus-toggle" id="focusButton" title="放大 / 恢复画布工作区 (Tab)" aria-pressed="false">⛶ 大画布</button><button class="button magic" id="predictButton">✦ 模型预标注</button></div>
+        <div class="editor-toolbar"><div class="tool-group"><button class="tool active" data-tool="select" title="选择 / 移动 (V)">↖</button><button class="tool" data-tool="rectangle" data-tasks="detect" title="矩形框 (R)" aria-label="矩形框">▢</button><button class="tool" data-tool="polygon" data-tasks="detect segment semantic" title="多边形 (P)" aria-label="多边形">⬡</button>
+          <button class="tool task-tool" data-tool="brush" data-tasks="semantic" title="画笔 (B)" hidden>画笔</button>
+          <button class="tool task-tool" data-tool="erase" data-tasks="semantic" title="橡皮 (X)" hidden>橡皮</button>
+          <button class="tool task-tool" data-tool="hand" data-tasks="hand_pose" title="添加手部关键点 (K)" hidden>＋ 手部</button>
+          <button class="tool" data-tool="pan" title="平移 (H / 按住空格)">✥</button></div><span class="divider"></span><button class="tool" id="undoButton" title="撤销 (Ctrl+Z)">↶</button><button class="tool" id="redoButton" title="重做 (Ctrl+Shift+Z)">↷</button><div class="toolbar-space"></div><button class="tool" id="zoomOut" title="缩小">−</button><button class="zoom-label" id="fitButton" title="适应画布 (F)">100%</button><button class="tool" id="zoomIn" title="放大">＋</button><button class="button focus-toggle" id="focusButton" title="放大 / 恢复画布工作区 (Tab)" aria-pressed="false">⛶ 大画布</button><button class="button magic" id="predictButton">✦ 模型预标注</button>
+          <select id="efficiencyMode" aria-label="标注模式"><option value="">常规标注</option><option value="fast">逐对象快审</option><option value="sequence" data-tasks="detect">连续帧</option><option value="fourpoint" data-tasks="detect">四点画框</option><option value="prompt" data-tasks="detect segment semantic">点选辅助</option></select>
+        </div>
+        <div id="efficiencyBar" class="efficiency-bar" hidden>
+          <div id="fastControls" class="efficiency-actions" hidden>
+            <button class="button" type="button" id="fastPrevious">上一个框 <kbd>[</kbd></button><button class="button" type="button" id="fastNext">确认并到下一框 <kbd>↵</kbd></button><button class="button" type="button" id="fastFull">回全图</button>
+          </div>
+          <div id="sequenceControls" class="efficiency-actions" hidden>
+            <button class="button" type="button" id="inheritNext">带所选框到下一张</button><button class="button" type="button" id="markFirstFrame">设为起点</button><button class="button" type="button" id="previewLastFrame">末帧预览插值</button><button class="button" type="button" id="clearKeyframe" hidden>清除起点</button>
+            <button class="button" type="button" id="previewTracking">跟踪选中框</button>
+            <select id="trackingLimit" aria-label="连续跟踪帧数"><option value="20">20 帧</option><option value="40" selected>40 帧</option><option value="100">100 帧</option><option value="200">200 帧</option></select>
+          </div>
+          <div id="promptControls" class="efficiency-actions" hidden>
+            <button class="button" type="button" id="promptPositive" aria-pressed="true">前景点</button><button class="button" type="button" id="promptNegative" aria-pressed="false">背景点</button><button class="button" type="button" id="resetPrompt">清空点</button><button class="button primary" type="button" id="acceptPrompt">采用候选框</button>
+          </div>
+          <span id="efficiencyHint" class="muted" role="status"></span>
+        </div>
+        <div id="maskTools" class="task-tools" data-tasks="segment semantic" hidden>
+          <label>掩膜透明度 <input id="maskOpacity" type="range" min="10" max="85" value="42"></label>
+          <label id="brushControls" hidden>笔刷半径 <input id="brushRadius" type="range" min="2" max="128" value="18"><output id="brushRadiusValue">18 px</output></label>
+        </div>
+        <div id="handTools" class="task-tools" data-tasks="hand_pose" hidden>
+          <span id="handStep" role="status"></span>
+          <button type="button" class="button" id="skipHandPoint">跳过此点</button>
+          <button type="button" class="button" id="undoHandPoint">上一个点</button>
+          <button type="button" class="button" id="finishHand">完成此手</button>
+        </div>
+        <div id="auditFrameBar" class="efficiency-bar" hidden>
+          <span id="auditFrameReasons" role="status"></span><button id="toggleAuditOverlay" class="button" type="button" aria-pressed="true">显示疑点框</button><button id="dismissAuditFrame" class="button" type="button">本图已核对</button>
+        </div>
         <div class="canvas-wrap" id="canvasWrap"><canvas id="canvas" tabindex="0" aria-label="标注画布"></canvas><div id="canvasCrosshair" class="canvas-crosshair" hidden aria-hidden="true"></div><div class="canvas-message" id="canvasMessage"><span class="empty-symbol">⌖</span><h3>让模型先做第一步</h3><p>选择图片，预标注后再精修确认</p></div><div class="canvas-hint" id="canvasHint">R 两次点击画框 · Esc 取消 · A / D 翻页 · Tab 大画布</div></div>
-        <div class="image-context"><span id="sourceNote">源图片只读，所有修改保存在独立工作区</span><span id="coordinateText">—</span></div>
+        <div class="image-context"><span id="sourceNote">源图片只读，所有修改保存在独立工作区</span>
+          <div class="draft-status"><label class="check"><input id="autoDraft" type="checkbox">自动存草稿</label><span id="autoSaveStatus" role="status"></span>
+          <button class="button" id="downloadLocalDraft" type="button" hidden>下载本机草稿</button></div><span id="coordinateText">—</span></div>
         <div class="editor-footer"><button class="button" id="previousImage" title="上一张；修改自动保存为草稿 (A)">← 上一张 <kbd>A</kbd></button><button class="button" id="nextImage" title="下一张；修改自动保存为草稿，不标记已审核 (D)">下一张 → <kbd>D</kbd></button><button class="button quiet" id="skipButton">跳过</button><div class="toolbar-space"></div><button class="button" id="saveButton">保存草稿 <kbd>⌃ S</kbd></button><button class="button primary" id="reviewButton" title="保存并标记已审核，然后下一张 (E)">确认并下一张 <kbd>E</kbd></button></div>
       </section>
       <aside class="inspector panel">
         <div class="inspector-tabs"><button class="selected" id="objectsTab">标注对象 <span id="objectCount">0</span></button><button id="classesTab">标签</button></div>
         <form class="label-composer" id="labelForm"><div><input id="newLabelInput" maxlength="160" placeholder="输入自定义标签" aria-label="自定义标签名称" autocomplete="off"><button class="button" id="addLabelButton" type="submit" title="新增标签；选中对象时同时赋给该对象">＋</button></div><small>保留原始名称 · 新标签追加 ID</small></form>
-        <div class="label-export"><button type="button" class="button" id="exportLabelsButton" title="下载当前项目全部类别，包含新增类别，保持原有 ID 顺序" disabled>↓ 导出标签</button><small>全部类别 · classes.txt</small></div>
-        <div class="inspector-content" id="objectsContent"><div class="annotation-summary"><span id="annotationSummary">请选择图片</span><button class="icon-button" id="toggleLabels" title="显示 / 隐藏类别文字 (L)">Aa</button></div><div class="object-list" id="objectList"></div><div class="shape-properties" id="shapeProperties" hidden><label>对象类别<select id="shapeClass"></select></label><label>描述 / 原有属性备注<textarea id="shapeDescription" rows="3" placeholder="如 readability=unreadable"></textarea></label><label class="check"><input type="checkbox" id="shapeDifficult">难例 / 遮挡</label><button class="button danger" id="deleteShape">删除选中对象 <kbd>Del</kbd></button></div></div>
-        <div class="inspector-content" id="classesContent" hidden><p class="muted class-note">点击标签后按 R 画框。标签不翻译；新增标签追加在末尾，不改变已有 ID。</p><div id="classList"></div></div>
+        <div class="label-export"><button class="button" id="exportLabelsButton" type="button" title="导出当前项目完整类别表，保留原始名称与类别 ID">↓ 导出标签</button></div>
+        <div class="inspector-content" id="objectsContent"><div class="annotation-summary"><span id="annotationSummary">请选择图片</span><button class="icon-button" id="toggleLabels" title="显示 / 隐藏类别文字 (L)">Aa</button></div><div class="object-list" id="objectList"></div><div class="shape-properties" id="shapeProperties" hidden><label>对象类别<select id="shapeClass"></select></label><div id="handPointEditor" class="hand-point-editor" hidden>
+          <label>关键点<select id="jointSelect"></select></label>
+          <label>可见性<select id="jointVisibility"><option value="2">可见</option><option value="1">遮挡</option><option value="0">未标注</option></select></label>
+          <button class="button" type="button" id="placeJoint">在画布定位</button>
+        </div><label>描述 / 原有属性备注<textarea id="shapeDescription" rows="3" placeholder="如 readability=unreadable"></textarea></label><label class="check"><input type="checkbox" id="shapeDifficult">难例 / 遮挡</label><button class="button danger" id="deleteShape">删除选中对象 <kbd>Del</kbd></button></div></div>
+        <div class="inspector-content" id="classesContent" hidden><p class="muted class-note" id="classesHint">选择标签后开始标注。</p><div id="classList"></div></div>
         <div class="inspector-bottom"><div class="model-chip"><span class="model-symbol">✦</span><div><strong>基线模型辅助</strong><span id="modelCaption">本地模型 · 按需加载</span></div><button class="icon-button" id="modelSettingsSmall" title="设置模型">⚙</button></div><p>预标注仅是建议，确认前不作为已审核真值。</p><div id="jobStatus" hidden></div></div>
       </aside>
     </main>
     <footer class="statusbar"><span><i class="dot green"></i><span id="connectionStatus">本地工作区</span></span><span id="activeClassText">绘制类别：—</span><button id="keyboardHelp">快捷键 <kbd>?</kbd></button></footer>
   </div>
-  <dialog id="modelDialog"><form method="dialog" class="dialog-heading"><div><div class="eyebrow">MODEL ASSIST</div><h2>让基线模型先标一遍</h2></div><button class="icon-button" aria-label="关闭">×</button></form><div class="dialog-body"><p class="muted">单张结果先预览；批量任务只处理未开始图片，绝不覆盖人工标注。</p><label for="modelPath">本地模型路径 (.pt)</label><div class="model-path-row"><input id="modelPath" placeholder="D:\models\best.pt"><button type="button" class="button" id="browseModelFile">选择文件</button><button type="button" class="button" id="browseModelFolder">选择文件夹</button></div><p id="modelSelectionStatus" class="model-selection-status" role="status"></p><small class="warning">仅加载来源可信的 PyTorch 权重。选择后需保存配置或发起预标注；首次推理校验类别 ID。</small><div class="form-row"><label>置信度 <output id="confidenceValue">0.25</output><input id="confidence" type="range" min="0.05" max="0.95" step="0.05" value="0.25"></label><label>NMS IoU <output id="iouValue">0.70</output><input id="iou" type="range" min="0.1" max="0.95" step="0.05" value="0.7"></label></div><div class="form-row"><label>推理尺寸<select id="imageSize"><option>640</option><option selected>960</option><option>1280</option></select></label><label>批量张数上限<input id="batchLimit" type="number" min="1" max="10000" value="100"></label></div><p class="scope-note" id="batchScope">范围：当前队列筛选内的未开始图片</p><div id="modelRuntime" class="muted"></div><div id="jobsList"></div></div><div class="dialog-actions"><button class="button" id="saveModel">保存模型配置</button><button class="button" id="batchPredict">批量预标注</button><button class="button primary" id="singlePredict">✦ 预标注当前图片</button></div></dialog>
+  <dialog id="modelDialog"><form method="dialog" class="dialog-heading"><div><div class="eyebrow">MODEL ASSIST</div><h2>让基线模型先标一遍</h2></div><button class="icon-button" aria-label="关闭">×</button></form><div class="dialog-body"><p class="muted">单张结果先预览；批量任务只处理未开始图片，绝不覆盖人工标注。</p><p id="modelTaskHint" class="task-hint"></p><label for="modelPath">本地模型路径 (.pt)</label><div class="model-path-row"><input id="modelPath" placeholder="D:\models\best.pt"><button type="button" class="button" id="browseModelFile">选择文件</button><button type="button" class="button" id="browseModelFolder">选择文件夹</button></div><p id="modelSelectionStatus" class="model-selection-status" role="status"></p><small class="warning">仅加载来源可信的 PyTorch 权重。选择后需保存配置或发起预标注；首次推理校验类别 ID。</small><div class="form-row"><label data-tasks="detect segment hand_pose">置信度 <output id="confidenceValue">0.25</output><input id="confidence" type="range" min="0.05" max="0.95" step="0.05" value="0.25"></label><label data-tasks="detect segment hand_pose">NMS IoU <output id="iouValue">0.70</output><input id="iou" type="range" min="0.1" max="0.95" step="0.05" value="0.7"></label></div><div class="form-row"><label>推理尺寸<select id="imageSize"><option>320</option><option>640</option><option selected>960</option><option>1280</option></select></label><label>批量张数上限<input id="batchLimit" type="number" min="1" max="10000" value="100"></label></div><p class="scope-note" id="batchScope">范围：当前队列筛选内的未开始图片</p><div id="modelRuntime" class="muted"></div><div id="jobsList"></div></div><div class="dialog-actions"><button class="button" id="saveModel">保存模型配置</button><button class="button" id="batchPredict">批量预标注</button><button class="button primary" id="singlePredict">✦ 预标注当前图片</button></div></dialog>
   <dialog id="modelBrowserDialog" class="model-browser" aria-labelledby="modelBrowserTitle">
     <form method="dialog" class="dialog-heading"><h2 id="modelBrowserTitle">选择本机模型文件</h2><button class="icon-button" aria-label="关闭模型文件浏览器">×</button></form>
     <div class="dialog-body">
@@ -76,31 +145,377 @@
     <div class="dialog-actions"><button type="button" class="button" id="cancelModelBrowser">取消</button><button type="button" class="button primary" id="searchModelFolder">选择此文件夹并查找模型</button></div>
   </dialog>
   <dialog id="predictionDialog"><form method="dialog" class="dialog-heading"><h2>应用模型建议</h2><button class="icon-button" aria-label="关闭">×</button></form><div class="dialog-body"><p id="predictionSummary"></p><p class="warning">替换会移除当前画布的对象，但可撤销；任何应用都不会自动标记已审核。</p></div><div class="dialog-actions"><button class="button" id="discardPrediction">不应用</button><button class="button" id="appendPrediction">追加对象</button><button class="button primary" id="replacePrediction">替换当前对象</button></div></dialog>
-  <dialog id="exportDialog"><form method="dialog" class="dialog-heading"><div><div class="eyebrow">DATASET EXPORT</div><h2>导出你的数据资产</h2></div><button class="icon-button" aria-label="关闭">×</button></form><div class="dialog-body">
-    <label>导出格式<select id="exportFormat"><option value="yolo">YOLO · 目标检测框</option><option value="labelme">Labelme / X-AnyLabeling · 保留属性</option><option value="coco">COCO · 检测与多边形</option></select></label><label>批次<select id="exportBatch"><option value="">全部批次</option></select></label>
-    <label class="check"><input type="checkbox" id="reviewedOnly" checked>只导出已人工确认的标注（推荐）</label><label class="check"><input type="checkbox" id="includeImages" checked>包含原始图片副本</label>
-    <label class="check"><input type="checkbox" id="splitDataset" checked>按比例划分训练 / 验证 / 测试集</label>
-    <fieldset id="exportSplitSettings" class="export-split"><legend>数据集划分</legend>
-      <div class="export-ratios"><label>训练集 train (%)<input id="splitTrain" type="number" min="0" max="100" step="any" value="80"></label><label>验证集 val (%)<input id="splitVal" type="number" min="0" max="100" step="any" value="10"></label><label>测试集 test (%)<input id="splitTest" type="number" min="0" max="100" step="any" value="10"></label></div>
-      <label>随机种子<input id="splitSeed" type="number" min="0" max="4294967295" step="1" value="42"></label>
-      <p id="exportSplitSummary" class="muted" aria-live="polite"></p>
-      <p class="muted">相同图片集合、比例和种子可复现划分。小样本按张数取整，每个非零集合至少 1 张；验证 / 测试集可设为 0。验证集为 0 时，YOLO 训练前需另行配置验证数据。</p>
-    </fieldset>
-    <fieldset class="export-split"><legend>导出时数据增强（仅训练集）</legend>
-      <label>增强方案<select id="augmentationPreset" disabled><option value="none">不增强 · 保留原样（默认）</option></select></label>
-      <p id="augmentationDescription" class="muted">不生成额外图片。</p>
-      <div class="form-row"><label><span id="augmentationCopiesLabel">每张训练图片额外生成</span><input id="augmentationCopies" type="number" min="1" max="3" step="1" value="1" disabled></label><label>增强随机种子<input id="augmentationSeed" type="number" min="0" max="4294967295" step="1" value="42" disabled></label></div>
-      <p id="augmentationSummary" class="muted" aria-live="polite"></p>
-      <p class="muted">数量建议：先用轻量方案额外 1 张；选“全部方案”建议每方案 1 张，即每张原图增加 5 张、共 6 张。旋转方案支持 90° / 180° / 270°，生成 3 张时覆盖三个角度，不裁剪画面。增强随机种子用于复现随机参数，默认 42 即可；它不是增强强度，与划分种子独立。</p>
-      <p class="muted">先按原图划分，再仅给训练集追加增强副本；验证 / 测试集保留原样。仅支持已审核、包含图片的导出。标签名称和 ID 不变，不修改原图或数据库。增强不是新采集数据，也不保证提升效果。</p>
-    </fieldset>
-    <p class="muted">按图片随机划分，不保证同源隔离；同视频连续帧、近似或重复图片请检查是否跨集。划分仅作用于导出副本，不修改原图或数据库标注。YOLO 分组导出会生成对应目录和 dataset.yaml；训练时需包含图片。</p>
-    <div id="exportResult" aria-live="polite"></div></div><div class="dialog-actions"><button class="button primary" id="createExport">生成 ZIP 并下载</button></div></dialog>
+  <dialog id="exportDialog" class="export-dialog" aria-labelledby="exportTitle">
+    <form method="dialog" class="dialog-heading">
+      <h2 id="exportTitle">导出数据集</h2>
+      <button class="icon-button" aria-label="关闭">×</button>
+    </form>
+    <div class="dialog-body export-layout">
+      <fieldset class="export-controls" id="exportControls" aria-label="导出设置">
+        <label>导出格式<select id="exportFormat"><option value="yolo" data-tasks="detect segment hand_pose">YOLO</option><option value="labelme" data-tasks="detect segment">Labelme / X-AnyLabeling</option><option value="coco" data-tasks="detect segment hand_pose">COCO</option><option value="mask" data-tasks="semantic" hidden>PNG 类别掩膜</option></select></label>
+        <label>批次<select id="exportBatch"><option value="">全部批次</option></select></label>
+        <label class="check"><input type="checkbox" id="reviewedOnly" checked>仅纳入已人工确认的标注</label>
+        <label class="check"><input type="checkbox" id="includeImages" checked>包含原图副本</label>
+        <label class="check"><input type="checkbox" id="cleanDataset">清洗后导出</label>
+        <label class="check"><input type="checkbox" id="splitDataset" checked>划分训练、验证和测试集</label>
+        <fieldset id="exportSplitSettings" class="export-split"><legend>数据集划分</legend>
+          <label>划分方式<select id="exportSplitUnit" aria-describedby="exportSplitHint">
+            <option value="source_group">按任务清单来源组</option>
+            <option value="directory">按原图文件夹</option>
+            <option value="image">按图片随机</option>
+          </select></label>
+          <div class="export-ratios">
+            <label>训练 (%)<input id="splitTrain" type="number" min="0" max="100" step="any" value="80"></label>
+            <label>验证 (%)<input id="splitVal" type="number" min="0" max="100" step="any" value="10"></label>
+            <label>测试 (%)<input id="splitTest" type="number" min="0" max="100" step="any" value="10"></label>
+          </div>
+          <label>随机种子<input id="splitSeed" type="number" min="0" max="4294967295" step="1" value="42"></label>
+          <p id="exportSplitSummary" aria-live="polite" hidden></p>
+          <p id="exportSplitHint" class="muted"></p>
+        </fieldset>
+        <fieldset class="export-split" id="augmentationSettings"><legend>导出时数据增强（仅训练集）</legend>
+          <label>增强方案<select id="augmentationPreset" disabled><option value="none">不增强 · 保留原样（默认）</option></select></label>
+          <p id="augmentationDescription" class="muted">不生成额外图片。</p>
+          <div class="form-row"><label><span id="augmentationCopiesLabel">每张训练图片额外生成</span><input id="augmentationCopies" type="number" min="1" max="3" step="1" value="1" disabled></label><label>增强随机种子<input id="augmentationSeed" type="number" min="0" max="4294967295" step="1" value="42" disabled></label></div>
+          <p id="augmentationSummary" class="muted" aria-live="polite"></p>
+          <p class="muted">数量建议：先用轻量方案额外 1 张；选“全部方案”建议每方案 1 张，即每张原图增加 5 张、共 6 张。旋转方案支持 90° / 180° / 270°，生成 3 张时覆盖三个角度，不裁剪画面。增强随机种子用于复现随机参数，默认 42 即可；它不是增强强度，与划分种子独立。</p>
+          <p class="muted">先按原图划分，再仅给训练集追加增强副本；验证 / 测试集保留原样。仅支持已审核、包含图片的导出。标签名称和 ID 不变，不修改原图或数据库。增强不是新采集数据，也不保证提升效果。</p>
+        </fieldset>
+      </fieldset>
+      <section class="export-preview" aria-labelledby="exportPreviewTitle">
+        <div class="export-preview-heading">
+          <h3 id="exportPreviewTitle">数据质量预检</h3>
+          <button class="button" type="button" id="refreshExportPreview">刷新</button>
+        </div>
+        <p id="exportPreviewStatus" class="muted" role="status"></p>
+        <div id="exportPreviewContent" hidden>
+          <dl class="export-preview-metrics">
+            <div><dt>纳入图片</dt><dd id="exportImageCount"></dd></div>
+            <div><dt>标注对象</dt><dd id="exportObjectCount"></dd></div>
+            <div><dt>已确认空图</dt><dd id="exportEmptyCount"></dd></div>
+          </dl>
+          <div id="exportSplitDistribution" class="export-distribution" hidden>
+            <div id="exportSplitBar" class="export-split-bar" aria-hidden="true"></div>
+            <dl id="exportSplitCounts" class="export-split-counts"></dl>
+          </div>
+          <div id="exportPreviewIssues" class="export-preview-issues" hidden></div>
+          <section id="exportCleaning" class="export-cleaning" aria-labelledby="exportCleaningTitle" hidden>
+            <h4 id="exportCleaningTitle">清洗结果</h4>
+            <p id="exportCleaningSummary"></p>
+            <details id="exportCleaningDetails" hidden>
+              <summary>查看排除示例</summary>
+              <ul id="exportCleaningExamples"></ul>
+            </details>
+          </section>
+          <div class="export-class-table" tabindex="0" role="region" aria-label="类别分布">
+            <table>
+              <caption>各类别标注数</caption>
+              <thead><tr id="exportClassColumns"></tr></thead>
+              <tbody id="exportClassRows"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </div>
+    <div class="dialog-actions export-actions">
+      <div id="exportResult" aria-live="polite"></div>
+      <button class="button primary" id="createExport" disabled>生成 ZIP 并下载</button>
+    </div>
+  </dialog>
+  <dialog id="trainingDialog" class="export-dialog training-dialog" aria-labelledby="trainingTitle">
+    <form method="dialog" class="dialog-heading">
+      <h2 id="trainingTitle">本地 YOLO 训练</h2>
+      <button class="icon-button" aria-label="关闭">×</button>
+    </form>
+    <div class="dialog-body export-layout">
+      <form id="trainingForm">
+        <p class="training-note">用已审核标注生成清洗版数据，按 80% / 20% 划分训练和验证集。</p>
+        <label>训练批次<select id="trainingBatch"><option value="">全部批次</option></select></label>
+        <label>划分方式<select id="trainingUnit">
+          <option value="source_group">按任务清单来源组</option>
+          <option value="directory">按原图文件夹</option>
+          <option value="image">按图片随机</option>
+        </select></label>
+        <label>起始模型<select id="trainingMode">
+          <option value="fine_tune">微调当前项目的本地权重</option>
+          <option value="scratch">从零训练 YOLO11n</option>
+        </select></label>
+        <div class="form-row">
+          <label>训练轮数<input id="trainingEpochs" type="number" min="1" max="300" value="30" required></label>
+          <label>训练设备<select id="trainingDevice"><option value="auto">自动</option><option value="cuda">CUDA</option><option value="cpu">CPU</option></select></label>
+        </div>
+        <details class="training-advanced">
+          <summary>高级参数</summary>
+          <div class="form-row">
+            <label>输入尺寸<input id="trainingImageSize" type="number" min="64" max="1280" step="32" value="640" required></label>
+            <label>每批图片<input id="trainingBatchSize" type="number" min="1" max="64" value="4" required></label>
+          </div>
+          <label>随机种子<input id="trainingSeed" type="number" min="0" max="2147483647" value="42" required></label>
+        </details>
+      </form>
+      <section class="export-preview" aria-labelledby="trainingRunsTitle">
+        <h3 id="trainingRunsTitle">训练记录</h3>
+        <p class="muted" id="trainingRuntime"></p>
+        <div id="trainingRuns" class="training-runs"></div>
+      </section>
+    </div>
+    <div class="dialog-actions export-actions">
+      <p id="trainingMessage" role="status"></p>
+      <button class="button primary" id="startTraining" type="submit" form="trainingForm">开始训练</button>
+    </div>
+  </dialog>
+  <dialog id="comparisonDialog" class="export-dialog comparison-dialog" aria-labelledby="comparisonTitle">
+    <form method="dialog" class="dialog-heading">
+      <h2 id="comparisonTitle">模型对比</h2>
+      <button class="icon-button" aria-label="关闭">×</button>
+    </form>
+    <div class="dialog-body export-layout comparison-layout">
+      <form id="comparisonForm">
+        <div class="comparison-set-heading">
+          <strong>固定盲测集</strong>
+          <button class="button" type="button" id="openBlindset">冻结新盲测集</button>
+        </div>
+        <select id="comparisonSet" aria-label="固定盲测集" required></select>
+        <p id="comparisonSetInfo" class="muted comparison-note"></p>
+        <label for="comparisonOldPath">旧版模型</label>
+        <div class="model-path-row">
+          <input id="comparisonOldPath" list="comparisonModels" placeholder="选择训练产物或输入 .pt 路径" required>
+          <button class="button" type="button" id="browseComparisonOld">选择文件</button>
+        </div>
+        <label for="comparisonNewPath">新版模型</label>
+        <div class="model-path-row">
+          <input id="comparisonNewPath" list="comparisonModels" placeholder="选择训练产物或输入 .pt 路径" required>
+          <button class="button" type="button" id="browseComparisonNew">选择文件</button>
+        </div>
+        <datalist id="comparisonModels"></datalist>
+        <details class="training-advanced comparison-advanced">
+          <summary>共同评测参数</summary>
+          <div class="form-row">
+            <label>置信度阈值<input id="comparisonConfidence" type="number" min="0.01" max="1" step="0.01" value="0.25" required></label>
+            <label>匹配 IoU<input id="comparisonIoU" type="number" min="0.01" max="1" step="0.01" value="0.50" required></label>
+          </div>
+          <label>输入尺寸<select id="comparisonImageSize"><option>320</option><option selected>640</option><option>960</option><option>1280</option></select></label>
+        </details>
+      </form>
+      <section class="export-preview" aria-labelledby="comparisonResultsTitle">
+        <h3 id="comparisonResultsTitle">逐类结果</h3>
+        <select id="comparisonRunSelect" aria-label="对比记录" hidden></select>
+        <p id="comparisonRunStatus" class="muted" role="status"></p>
+        <progress id="comparisonProgress" aria-label="对比进度" hidden></progress>
+        <button class="button" id="stopComparison" type="button" hidden>停止对比</button>
+        <div id="comparisonReport" hidden>
+          <p id="comparisonReportMeta" class="muted"></p>
+          <div id="comparisonModelInfo"></div>
+          <div class="export-class-table comparison-table" role="region" aria-label="旧版和新版逐类指标" tabindex="0">
+            <table>
+              <thead><tr><th rowspan="2" scope="col">类别</th><th rowspan="2" scope="col">真值数</th><th colspan="3" scope="colgroup">旧版模型</th><th colspan="3" scope="colgroup">新版模型</th></tr>
+              <tr><th scope="col">召回率</th><th scope="col">漏检</th><th scope="col">误检</th><th scope="col">召回率</th><th scope="col">漏检</th><th scope="col">误检</th></tr></thead>
+              <tbody id="comparisonClassRows"></tbody>
+            </table>
+          </div>
+          <p id="comparisonReviewHint" class="muted" hidden></p>
+          <div class="comparison-report-actions">
+            <button class="button" type="button" id="openComparisonReview" hidden>逐图回看</button>
+            <a class="button" id="downloadComparison" download>下载对比报告</a>
+          </div>
+        </div>
+      </section>
+    </div>
+    <div class="dialog-actions export-actions">
+      <p id="comparisonMessage" class="workflow-message" role="status"></p>
+      <button class="button primary" id="startComparison" type="submit" form="comparisonForm" disabled>一键对比</button>
+    </div>
+  </dialog>
+  <dialog id="comparisonReviewDialog" class="export-dialog comparison-review-dialog" aria-labelledby="comparisonReviewTitle">
+    <form method="dialog" class="dialog-heading">
+      <div><h2 id="comparisonReviewTitle">逐图回看</h2><p id="comparisonReviewRun" class="muted"></p></div>
+      <button class="icon-button" aria-label="关闭">×</button>
+    </form>
+    <div class="dialog-body comparison-review-layout">
+      <aside class="comparison-review-sidebar" aria-label="回看筛选和图片列表">
+        <label>类别<select id="comparisonReviewClass"></select></label>
+        <label>筛选<select id="comparisonReviewKind" autofocus></select></label>
+        <p id="comparisonReviewStatus" class="muted" role="status"></p>
+        <div id="comparisonReviewList" class="comparison-review-list" aria-label="对应图片"></div>
+        <div id="comparisonReviewPages" class="comparison-review-pages" hidden>
+          <button class="button" id="comparisonReviewPrevious" type="button">上一页</button>
+          <button class="button" id="comparisonReviewNext" type="button">下一页</button>
+        </div>
+      </aside>
+      <section class="comparison-review-inspector" aria-label="人工标注和新旧模型预测">
+        <p id="comparisonFrameStatus" class="muted" role="status"></p>
+        <div id="comparisonFrame" hidden>
+          <div class="comparison-frame-heading">
+            <h3 id="comparisonFrameName"></h3>
+            <label class="check"><input type="checkbox" id="comparisonFrameAllClasses">显示全部评测类别</label>
+          </div>
+          <ul class="comparison-frame-legend">
+            <li><span class="comparison-swatch truth"></span>人工标注</li>
+            <li><span class="comparison-swatch matched"></span>匹配预测</li>
+            <li><span class="comparison-swatch false-positive"></span>误检预测</li>
+          </ul>
+          <div class="comparison-frame-panels">
+            <figure class="comparison-frame-panel">
+              <figcaption><strong id="comparisonFrameOldModel"></strong><p id="comparisonFrameOldCounts" class="muted"></p></figcaption>
+              <div class="comparison-frame-stage" id="comparisonFrameOldImage"></div>
+            </figure>
+            <figure class="comparison-frame-panel">
+              <figcaption><strong id="comparisonFrameNewModel"></strong><p id="comparisonFrameNewCounts" class="muted"></p></figcaption>
+              <div class="comparison-frame-stage" id="comparisonFrameNewImage"></div>
+            </figure>
+          </div>
+        </div>
+      </section>
+    </div>
+  </dialog>
+  <dialog id="blindsetDialog" aria-labelledby="blindsetTitle">
+    <form method="dialog" class="dialog-heading">
+      <h2 id="blindsetTitle">冻结盲测集</h2>
+      <button class="icon-button" aria-label="关闭">×</button>
+    </form>
+    <form class="dialog-body" id="blindsetForm">
+      <p class="muted">从已审核的检测框图片中抽取快照。冻结的图片、重复副本和已知同源图片会从后续本地训练中预留。</p>
+      <label>名称<input id="blindsetName" maxlength="64" placeholder="例如：11 月产线盲测" required></label>
+      <label>批次<select id="blindsetBatch"></select></label>
+      <label>划分方式<select id="blindsetUnit">
+        <option value="source_group">按任务清单来源组</option><option value="directory">按原图文件夹</option><option value="image">按图片随机</option>
+      </select></label>
+      <div class="form-row">
+        <label>冻结比例（%）<input id="blindsetPercent" type="number" min="1" max="100" step="1" value="20" required></label>
+        <label>随机种子<input id="blindsetSeed" type="number" min="0" max="4294967295" step="1" value="42" required></label>
+      </div>
+      <p class="muted">100% 冻结所选批次中的全部合格样本。按组冻结时，实际张数取决于分组大小。</p>
+    </form>
+    <div class="dialog-actions export-actions">
+      <p id="blindsetMessage" class="workflow-message" role="status"></p>
+      <button class="button primary" id="freezeBlindset" type="submit" form="blindsetForm">冻结图片和标注</button>
+    </div>
+  </dialog>
+  <dialog id="sequenceDialog" class="wide-dialog" aria-labelledby="sequenceTitle">
+    <form method="dialog" class="dialog-heading"><h2 id="sequenceTitle">关键帧插值</h2><button class="icon-button" aria-label="关闭">×</button></form>
+    <div class="dialog-body">
+      <p id="sequenceSummary" class="muted"></p>
+      <label id="sequenceTargetLabel">预览中间帧<select id="sequenceTarget"></select></label>
+      <div id="sequencePreview" class="comparison-frame-stage" hidden></div>
+      <div id="sequenceStop" class="sequence-stop" hidden><span id="sequenceStopText"></span><button id="openTrackStop" class="button" type="button">打开待修帧</button></div>
+      <p id="sequenceStatus" class="workflow-message" role="status"></p>
+    </div>
+    <div class="dialog-actions"><button class="button primary" id="sequenceApply" type="button">写入草稿</button></div>
+  </dialog>
+  <dialog id="automationDialog" class="export-dialog automation-dialog" aria-labelledby="automationTitle">
+    <form method="dialog" class="dialog-heading"><h2 id="automationTitle">自动流程</h2><button class="icon-button" aria-label="关闭">×</button></form>
+    <div class="dialog-body automation-layout">
+      <section aria-label="工作流设置">
+        <div class="automation-tabs" role="group" aria-label="设置类型">
+          <button type="button" id="automationIntakeTab" class="button" aria-pressed="true">收图与审核</button>
+          <button type="button" id="automationReleaseTab" class="button" data-tasks="detect" aria-pressed="false">训练与验收</button>
+        </div>
+        <div id="automationIntakePanel">
+          <label for="workflowFolder">监控目录</label>
+          <div class="model-path-row"><input id="workflowFolder" placeholder="留空使用当前项目图片目录"><button class="button" type="button" id="browseWorkflowFolder">选择目录</button></div>
+          <label class="check"><input id="workflowWatch" type="checkbox">监控新图，写入完成后入队</label>
+          <div class="form-row">
+            <label>相似程度<select id="workflowSimilarity"><option value="strict">更严格</option><option value="balanced">平衡</option><option value="loose">更多候选</option></select></label>
+            <label class="check"><input id="workflowRepresentatives" type="checkbox">相似组优先预标推荐图</label>
+          </div>
+          <label for="workflowCompanion" data-tasks="detect">第二模型（可选）</label>
+          <div class="model-path-row" data-tasks="detect"><input id="workflowCompanion" placeholder="本地 .pt 权重"><button class="button" type="button" id="browseWorkflowCompanion">选择文件</button></div>
+          <div class="form-row">
+            <label>预标置信度<input id="workflowConfidence" type="number" min="0.01" max="1" step="0.01"></label>
+            <label>低分优先复核<input id="workflowLow" type="number" min="0.01" max="1" step="0.01"></label>
+          </div>
+          <div class="form-row">
+            <label>稀有类别少于（目标数）<input id="workflowRare" type="number" min="0" max="10000" step="1"></label>
+            <label>普通图按来源抽样（%）<input id="workflowSample" type="number" min="0" max="100" step="1"></label>
+          </div>
+          <div class="automation-actions">
+            <button type="button" class="button primary" id="runIntake">处理新批次</button>
+            <button type="button" class="button" id="runRouting">分流当前批次的候选图</button>
+          </div>
+        </div>
+        <div id="automationReleasePanel" hidden>
+          <label>固定盲测集<select id="workflowBlindset" required></select></label>
+          <label>训练批次<select id="workflowTrainBatch"></select></label>
+          <label class="check"><input id="workflowAutoTrain" type="checkbox">计数及类别覆盖达标后自动运行</label>
+          <div class="form-row">
+            <label>最低可训练图量<input id="workflowMinImages" type="number" min="2" max="10000" step="1"></label>
+            <label>每个验收类最低带框图量<input id="workflowMinEach" type="number" min="1" max="10000" step="1"></label>
+          </div>
+          <label for="workflowBaseline">基线权重（留空使用项目模型）</label>
+          <div class="model-path-row"><input id="workflowBaseline" placeholder="本机 .pt"><button type="button" class="button" id="browseWorkflowBaseline">选择文件</button></div>
+          <div class="form-row">
+            <label>训练起点<select id="workflowTrainMode"><option value="scratch">从零训练</option><option value="fine_tune">微调基线</option></select></label>
+            <label>训练轮数<input id="workflowEpochs" type="number" min="1" max="300" step="1"></label>
+          </div>
+          <div class="form-row">
+            <label>划分方式<select id="workflowSplitUnit"><option value="source_group">来源组</option><option value="directory">目录</option><option value="image">按图随机</option></select></label>
+            <label>共同评测置信度<input id="workflowEvalConfidence" type="number" min="0.01" max="1" step="0.01"></label>
+            <label>匹配 IoU<input id="workflowEvalIou" type="number" min="0.01" max="1" step="0.01"></label>
+          </div>
+          <table class="automation-gates" aria-label="逐类别验收门槛">
+            <thead><tr><th scope="col">验收类别</th><th scope="col">最低召回率 %</th><th scope="col">最多误检</th></tr></thead>
+            <tbody id="workflowGates"></tbody>
+          </table>
+          <button type="button" class="button primary" id="runRelease">开始训练与验收</button>
+        </div>
+      </section>
+      <section class="export-preview" aria-labelledby="workflowRunsTitle">
+        <h3 id="workflowRunsTitle">运行记录</h3>
+        <p id="workflowReadiness" class="muted" role="status"></p>
+        <div id="workflowRuns"></div>
+      </section>
+    </div>
+    <div class="dialog-actions export-actions"><p id="workflowStatus" class="workflow-message" role="status"></p>
+      <button type="button" class="button" id="saveWorkflow">保存配置</button></div>
+  </dialog>
+  <dialog id="similarityDialog" class="export-dialog similarity-dialog" aria-labelledby="similarityTitle">
+    <form method="dialog" class="dialog-heading"><h2 id="similarityTitle">相似筛图</h2><button class="icon-button" aria-label="关闭">×</button></form>
+    <div class="dialog-body spread-dialog-body">
+      <div class="batch-tool-settings">
+        <label>未标注批次<select id="similarityBatch"></select></label>
+        <label>相似程度<select id="similarityLevel"><option value="strict">更严格</option><option value="balanced" selected>平衡</option><option value="loose">更多候选</option></select></label>
+        <button class="button" type="button" id="scanSimilarity">扫描相似图</button>
+      </div>
+      <p id="similarityStatus" class="workflow-message" role="status"></p>
+      <section id="similarityResults" hidden>
+        <div class="similarity-navigation">
+          <button class="button" type="button" id="similarityPrevGroup">上一组</button><strong id="similarityGroupInfo"></strong><button class="button" type="button" id="similarityNextGroup">下一组</button>
+          <span class="toolbar-space"></span><button class="button" type="button" id="similarityKeepRecommended">每组先选推荐图</button><button class="button" type="button" id="similarityKeepAll">保留全部</button>
+        </div>
+        <div id="similarityCards" class="similarity-cards"></div>
+        <div class="similarity-navigation" id="similarityPages" hidden>
+          <button class="button" type="button" id="similarityPrevPage">上一页</button><span id="similarityPageInfo" class="muted"></span><button class="button" type="button" id="similarityNextPage">下一页</button>
+        </div>
+      </section>
+    </div>
+    <div class="dialog-actions export-actions"><p id="similaritySelectionInfo" class="workflow-message muted" role="status"></p><button class="button primary" id="applySimilarity" type="button" disabled>打开筛后队列</button></div>
+  </dialog>
+  <dialog id="auditDialog" class="wide-dialog" aria-labelledby="auditTitle">
+    <form method="dialog" class="dialog-heading"><h2 id="auditTitle">按疑点复核</h2><button class="icon-button" aria-label="关闭">×</button></form>
+    <div class="dialog-body">
+      <p class="muted">用当前项目模型找出疑似漏标、类别冲突和框偏移。查看原标注与候选框后，由你决定如何修正。</p>
+      <div class="similarity-navigation"><button class="button" type="button" id="auditModelSettings">模型设置</button><span class="muted" id="auditModelName"></span></div>
+      <label>标注批次<select id="auditBatch"></select></label>
+      <div class="form-row"><label>候选置信度<input id="auditConfidence" type="number" min="0.05" max="1" step="0.05" value="0.60"></label>
+        <label>本次最多检查<input id="auditLimit" type="number" min="1" max="10000" step="1" value="100"></label></div>
+      <progress id="auditProgress" aria-label="疑点扫描进度" hidden></progress>
+      <p id="auditStatus" class="workflow-message" role="status"></p>
+    </div>
+    <div class="dialog-actions"><button class="button" type="button" id="stopAudit" hidden>取消扫描</button>
+      <button class="button" type="button" id="startAudit">开始扫描</button><button class="button primary" type="button" id="openAuditQueue">打开疑点队列</button></div>
+  </dialog>
   <dialog id="projectDialog" class="wide-dialog">
-    <form method="dialog" class="dialog-heading"><div><div class="eyebrow">NEW WORKSPACE</div><h2>选择需要标注的图片</h2></div><button class="icon-button" aria-label="关闭">×</button></form>
+    <form method="dialog" class="dialog-heading"><h2>新建标注项目</h2><button class="icon-button" aria-label="关闭">×</button></form>
     <div class="dialog-body">
       <p class="muted">选择本机图片文件或文件夹，不上传、不复制原图；新修改独立保存，不影响现有项目。</p>
       <label>项目名称<input id="newProjectName" placeholder="例如：产线设备检测"></label>
+      <fieldset class="task-options">
+        <legend>标注任务</legend>
+        <label class="task-option"><input type="radio" name="projectTask" value="detect" checked><span><strong>目标检测</strong><small>用矩形框定位目标</small></span></label>
+        <label class="task-option"><input type="radio" name="projectTask" value="segment"><span><strong>实例分割</strong><small>为每个对象描出轮廓</small></span></label>
+        <label class="task-option"><input type="radio" name="projectTask" value="semantic"><span><strong>语义分割</strong><small>把像素划分为类别区域</small></span></label>
+        <label class="task-option"><input type="radio" name="projectTask" value="hand_pose"><span><strong>手部姿态</strong><small>逐手标注 21 个关键点</small></span></label>
+      </fieldset>
       <label for="newImageRoot">图片目录</label>
       <div class="model-path-row"><input id="newImageRoot" placeholder="点击右侧按钮选择，路径会自动填入"><button type="button" class="button" id="chooseImageFiles" title="打开 Windows 文件选择窗口，可多选图片">选择图片文件</button><button type="button" class="button" id="chooseImageFolder" title="打开 Windows 文件夹选择窗口">选择文件夹</button></div>
       <p id="newImageSelection" class="model-selection-status" role="status">文件夹模式：读取目录及子目录内的图片；文件模式：仅导入明确选中的图片。</p>
@@ -108,7 +523,7 @@
       <div class="form-row"><label>原生 Labelme 标注目录（选填）<input id="newAnnotationRoot"></label><label>模型预标注目录（选填）<input id="newPreannotationRoot"></label></div>
       <label>有序类别（每行一个，顺序即 ID）<textarea id="newClasses" rows="4" placeholder="class_a&#10;class_b"></textarea></label>
       <label>或类别映射文件（优先）<input id="newClassMap" placeholder="class_map.json 的 names 字典，或 classes.txt"></label>
-      <label>本地检测模型（选填）<input id="newModelPath" placeholder="D:\models\best.pt"></label><label>华聚式 task_manifest.json（选填）<input id="newManifest"></label>
+      <label>本地模型（选填）<input id="newModelPath" placeholder="D:\models\best.pt"></label><label>华聚式 task_manifest.json（选填）<input id="newManifest"></label>
     </div>
     <div class="dialog-actions"><button class="button primary" id="createProject">建立项目</button></div>
   </dialog>
@@ -124,6 +539,17 @@
     </form>
   </dialog>
   <dialog id="historyDialog"><form method="dialog" class="dialog-heading"><h2>标注保存历史</h2><button class="icon-button" aria-label="关闭">×</button></form><div class="dialog-body" id="historyList"></div></dialog>
+  <dialog id="imageBrowserDialog" class="model-browser" aria-labelledby="imageBrowserTitle">
+    <form method="dialog" class="dialog-heading"><h2 id="imageBrowserTitle">选择待标注图片</h2><button class="icon-button" aria-label="关闭图片文件浏览器">×</button></form>
+    <div class="dialog-body">
+      <p id="imageBrowserHelp" class="muted"></p>
+      <form id="imageBrowserPathForm" class="model-browser-address"><select id="imageBrowserDrive" aria-label="图片磁盘位置"></select><input id="imageBrowserPath" aria-label="图片文件夹绝对路径" placeholder="输入文件夹完整路径"><button class="button" type="submit" id="imageBrowserGo">前往</button></form>
+      <div class="model-browser-toolbar"><button type="button" class="button" id="imageBrowserUp">↑ 上一级</button><span id="imageBrowserCount" role="status"></span></div>
+      <p id="imageBrowserError" class="warning" role="alert"></p>
+      <div id="imageBrowserList" class="model-browser-list" aria-label="文件夹与图片文件"></div>
+    </div>
+    <div class="dialog-actions"><button type="button" class="button" id="cancelImageBrowser">取消</button><button type="button" class="button primary" id="confirmImageSelection" disabled>使用所选图片</button></div>
+  </dialog>
   <dialog id="helpDialog"><form method="dialog" class="dialog-heading"><h2>你的本地标注工作流</h2><button class="icon-button" aria-label="关闭">×</button></form><div class="dialog-body"><div class="help-flow"><b>01 选择图片</b><span>导入现有标注，或让本地模型生成建议。</span><b>02 精修对象</b><span>按 R，点击起点后松开，再点击终点；在框旁窗口按 Q / Enter 使用当前标签，也可点击已有标签或输入新标签，名称原样保留。</span><b>03 人工确认</b><span>A / D 仅翻页，修改自动存草稿；按 E 保存并审核当前图片，然后下一张。</span><b>04 导出复用</b><span>YOLO / Labelme / COCO，原始数据始终保留。</span></div><div class="shortcut-grid"><span>选择 / 两次点击画框 / 多边形</span><kbd>V / R / P</kbd><span>大画布 / 恢复工作区</span><kbd>Tab</kbd><span>平移 / 适应画布</span><kbd>Space / F</kbd><span>保存 / 撤销 / 重做</span><kbd>Ctrl+S / Z / Shift+Z</kbd><span>上一张 / 下一张（不自动审核）</span><kbd>A / D</kbd><span>保存、审核并下一张</span><kbd>E</kbd><span>确认标签（非输入时） / 完成多边形</span><kbd>Q / Enter</kbd><span>删除 / 取消绘制</span><kbd>Del / Esc</kbd><span>切换前九个标签 / 显示文字</span><kbd>1–9 / L</kbd></div><p class="muted">所有图片、标签及推理都留在本机；默认仅监听 127.0.0.1。自定义新标签不会让旧模型自动学会该类别，仍需人工标注或重新训练。</p></div></dialog>
   <div class="toast-stack" id="toasts" aria-live="polite"></div>
 </body>
