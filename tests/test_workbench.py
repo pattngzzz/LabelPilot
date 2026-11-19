@@ -19,7 +19,7 @@ from labelpilot import model_files, native_picker
 from labelpilot import server
 from labelpilot.inference import Inference, Jobs, model_class_names
 from labelpilot.server import create_app
-from labelpilot.store import Problem, Store, digest
+from labelpilot.store import Problem, Project, Store, digest
 
 
 @pytest.fixture
@@ -1040,6 +1040,105 @@ def test_model_allows_append_only_custom_labels():
     for project_names in (["panel", "object"], ["object"], ["renamed", "panel"]):
         with pytest.raises(Problem, match="ID"):
             model_class_names({0: "object", 1: "panel"}, project_names)
+
+
+@pytest.fixture
+def renamed_store(store):
+    store.save("test", item(store, "human")["id"], payload(store, "human", "reviewed"))
+    config = copy.deepcopy(store.configs[0])
+    config["classes"] = ["object_1"]
+    config["label_aliases"] = {"object": "object_1"}
+    store.registry_path.write_text(json.dumps([config]), encoding="utf-8")
+    return Store(store.home)
+
+
+def test_label_alias_reads_legacy_database_and_sources_without_mutation(renamed_store, dataset):
+    store = renamed_store
+    sources = {path: digest(path) for folder in dataset[2:] for path in folder.rglob("*.json")}
+    for name in ("human", "model"):
+        current = store.detail("test", item(store, name)["id"])
+        assert current["document"]["shapes"][0]["label"] == "object_1"
+        assert current["document"]["shapes"][0]["points"] == [[12.5, 10], [110, 70]]
+        assert current["document"]["shapes"][0]["group_id"] == 9
+    with store.connect() as connection:
+        document = json.loads(connection.execute("SELECT document FROM annotations").fetchone()[0])
+    assert document["shapes"][0]["label"] == "object"
+    assert all(digest(path) == fingerprint for path, fingerprint in sources.items())
+    assert store.rescan("test")["classes"][0]["name"] == "object_1"
+
+
+def test_label_alias_normalizes_stale_browser_save(renamed_store):
+    store = renamed_store
+    data = payload(store, "human", "reviewed")
+    data["document"]["shapes"][0]["label"] = "object"
+    before = copy.deepcopy(data)
+    saved = store.save("test", item(store, "human")["id"], data)
+    assert saved["document"]["shapes"][0] == {**data["document"]["shapes"][0], "label": "object_1"}
+    assert data == before
+    reloaded = Store(store.home)
+    assert reloaded.detail("test", item(reloaded, "human")["id"])["document"]["shapes"][0]["label"] == "object_1"
+
+
+def test_label_alias_restores_legacy_revision_without_rewriting_history(renamed_store):
+    store = renamed_store
+    with store.connect() as connection:
+        before = [tuple(row) for row in connection.execute("SELECT * FROM revisions ORDER BY version")]
+    restored = store.restore("test", item(store, "human")["id"], 0, 1)
+    assert restored["version"] == 2 and restored["status"] == "draft"
+    assert restored["document"]["shapes"][0]["label"] == "object_1"
+    assert restored["document"]["shapes"][0]["description"] == "readability=unreadable"
+    with store.connect() as connection:
+        after = [tuple(row) for row in connection.execute("SELECT * FROM revisions WHERE version < 2 ORDER BY version")]
+    assert after == before
+
+
+@pytest.mark.parametrize("format_name", ["yolo", "labelme", "coco"])
+def test_label_alias_exports_current_name_and_original_id(renamed_store, format_name):
+    store = renamed_store
+    result = export_project(store, "test", {"format": format_name, "reviewed_only": False})
+    with zipfile.ZipFile(store.home / "exports" / result["filename"]) as archive:
+        assert archive.read("classes.txt") == b"object_1\n"
+        if format_name == "yolo":
+            lines = [line for path in archive.namelist() if path.startswith("labels/")
+                     for line in archive.read(path).decode().splitlines()]
+            assert len(lines) == 2 and all(line.startswith("0 ") for line in lines)
+        elif format_name == "labelme":
+            shapes = [shape for path in archive.namelist() if path.startswith("annotations/")
+                      for shape in json.loads(archive.read(path))["shapes"]]
+            assert len(shapes) == 2 and all(shape["label"] == "object_1" for shape in shapes)
+        else:
+            document = json.loads(archive.read("annotations.json"))
+            assert document["categories"] == [{"id": 1, "name": "object_1"}]
+            assert len(document["annotations"]) == 2
+            assert all(shape["category_id"] == 1 for shape in document["annotations"])
+
+
+def test_label_alias_cannot_be_readded_as_new_class(renamed_store):
+    with pytest.raises(Problem, match="已更名为 object_1"):
+        renamed_store.add_label("test", "object")
+    assert renamed_store.project("test").names == ["object_1"]
+    renamed_store.add_label("test", "another_class")
+    assert Store(renamed_store.home).project("test").label_aliases == {"object": "object_1"}
+
+
+@pytest.mark.parametrize("aliases", [None, [], {"object_1": "other"}, {"old": "missing"},
+                                      {"old": "other_old", "other_old": "object_1"},
+                                      {"": "object_1"}, {"old": []}])
+def test_invalid_label_alias_rejected(store, aliases):
+    config = {**store.configs[0], "classes": ["object_1", "other"], "label_aliases": aliases}
+    with pytest.raises(Problem, match="别名"):
+        Project(config)
+
+
+def test_model_label_alias_keeps_strict_class_id_validation():
+    aliases = {"object": "object_1"}
+    names = ["object_1", "panel", "new_label"]
+    assert model_class_names({0: "object", 1: "panel"}, names, aliases) == names[:2]
+    assert model_class_names({0: "object_1", 1: "panel"}, names, aliases) == names[:2]
+    for model_names in ({0: "panel", 1: "object"}, {0: "unknown", 1: "panel"},
+                        {0: "object", 1: "object"}, {}):
+        with pytest.raises(Problem, match="ID"):
+            model_class_names(model_names, names, aliases)
 
 
 def test_asset_versions_change_with_frontend_content(dataset, tmp_path, monkeypatch):

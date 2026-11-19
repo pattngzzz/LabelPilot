@@ -82,6 +82,12 @@ class Project:
         self.id = config["id"]
         self.root = Path(config["image_root"]).resolve()
         self.names = load_classes(config)
+        self.label_aliases = copy.deepcopy(config.get("label_aliases", {}))
+        if not isinstance(self.label_aliases, dict) or any(
+                not isinstance(alias, str) or not alias.strip() or alias in self.names or
+                not isinstance(target, str) or target not in self.names
+                for alias, target in self.label_aliases.items()):
+            raise Problem("标签别名必须从旧名称直接映射到现有类别，且不能覆盖现有类别", 422)
         self.items = []
         self.by_id = {}
         self.warnings = []
@@ -164,6 +170,14 @@ class Project:
         if not self.items:
             self.warnings.append("未找到图片；请确认图片目录或任务清单路径")
         self.by_id = {item["id"]: item for item in self.items}
+
+    def normalize_labels(self, document):
+        document = copy.deepcopy(document)
+        if isinstance(document, dict) and isinstance(document.get("shapes"), list):
+            for shape in document["shapes"]:
+                if isinstance(shape, dict) and isinstance(shape.get("label"), str):
+                    shape["label"] = self.label_aliases.get(shape["label"], shape["label"])
+        return document
 
     def add_item(self, path, task):
         if not path.is_relative_to(self.root):
@@ -293,6 +307,8 @@ class Store:
             raise Problem("标签名称必须为 1 到 160 个字符，不能包含换行或控制字符", 422)
         with self.lock:
             project = self.project(project_id)
+            if name in project.label_aliases:
+                raise Problem(f"该标签已更名为 {project.label_aliases[name]}，请使用新名称", 422)
             if name in project.names:
                 return project.summary()
             names = project.names + [name]
@@ -372,6 +388,7 @@ class Store:
             version, status = 0, "unstarted"
         if (document.get("imageWidth"), document.get("imageHeight")) != (width, height):
             raise Problem("原生标注尺寸与原图不一致", 409)
+        document = project.normalize_labels(document)
         return {"item": {key: value for key, value in item.items() if key != "path"},
                 "document": document, "version": version, "status": status,
                 "width": width, "height": height, "image_sha256": image_digest,
@@ -425,7 +442,7 @@ class Store:
                 raise Problem("原生标注已被其他工具更新，请重新载入", 409)
             if predicted and current["status"] != "unstarted":
                 raise Problem("批量预标注不能覆盖任何已有标注", 409)
-            document = copy.deepcopy(payload.get("document", {}))
+            document = project.normalize_labels(payload.get("document", {}))
             status = payload["status"]
             self.validate(project, document, current["width"], current["height"], status, payload.get("confirmed_empty", False))
             version = current["version"] + 1

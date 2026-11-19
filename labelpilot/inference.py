@@ -9,10 +9,11 @@ from PIL import Image
 from .store import Problem, atomic_json, digest, now, read_json
 
 
-def model_class_names(names, project_names):
-    ordered = [names[index] for index in range(len(names))]
+def model_class_names(names, project_names, label_aliases=None):
+    aliases = label_aliases or {}
+    ordered = [aliases.get(names[index], names[index]) for index in range(len(names))]
     if not ordered or ordered != project_names[:len(ordered)]:
-        raise Problem("模型类别 ID / 名称与项目既有标签不一致；只允许在末尾追加新标签", 422)
+        raise Problem("模型类别 ID / 名称与项目既有标签不一致；仅允许末尾追加标签或显式配置的同 ID 更名", 422)
     return ordered
 
 
@@ -61,12 +62,12 @@ class Inference:
                 candidate = YOLO(str(path), task="detect")
                 if candidate.task != "detect":
                     raise Problem("当前仅支持目标检测模型；不将分割或分类输出当成检测框", 422)
-                model_class_names(candidate.names, project.names)
+                model_class_names(candidate.names, project.names, project.label_aliases)
                 self.model = candidate
                 self.model_digest = digest(path)
                 self.signature = signature
                 self.device = 0 if torch.cuda.is_available() else "cpu"
-            names = model_class_names(self.model.names, project.names)
+            names = model_class_names(self.model.names, project.names, project.label_aliases)
             current = self.store.detail(project_id, item_id)
             item = project.item(item_id)
             with Image.open(item["path"]) as image:
