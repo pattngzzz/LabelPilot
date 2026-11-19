@@ -68,6 +68,8 @@ def normalize_recipe(store, project, payload):
         settings[key] = str(weight_path(settings[key])) if settings[key].strip() else ""
     value.update(training_options(project, value))
     blindset = value["blindset"]
+    if project.task_type != "detect" and (intake["companion"] or value["enabled"] or blindset):
+        raise Problem("双模型框匹配和盲测验收适用于目标检测项目", 422)
     if blindset or value["enabled"]:
         get_blindset(store, project.id, blindset)
     gates = value["gates"]
@@ -181,6 +183,8 @@ class Automation:
                 raise Problem("无效的工作流设置", 422)
             recipe = normalize_recipe(self.store, self.store.project(project_id), configuration)
         if kind == "release":
+            if self.store.project(project_id).task_type != "detect":
+                raise Problem("盲测验收适用于目标检测项目", 422)
             get_blindset(self.store, project_id, recipe["release"]["blindset"])
         with self.lock:
             if any(row["project"] == project_id and row["kind"] == kind and row["status"] in IN_PROGRESS

@@ -868,6 +868,88 @@ with zipfile.ZipFile(sys.argv[1]) as archive:
     await click('[data-workflow-action="triage"]');
     await waitFor('!element("automationDialog").open && element("statusSelect").value==="triage" && state.items.length===1 && !state.busy');
     await check('state.current.status==="predicted" && element("imageList").textContent.includes("无候选框")', "Automated routing keeps empty outputs pending for human review");
+
+    const createTask = async (task, label) => {
+      await click("#newProjectButton");
+      await waitFor('element("projectDialog").open');
+      await click(`.task-option:has(input[value="${task}"])`);
+      await setExportValue("newProjectName", task);
+      await setExportValue("newClasses", label);
+      await evaluate(`element("newImageRoot").value=${JSON.stringify(efficiencyFrames)}; element("newImageRoot").dispatchEvent(new Event("input"));`);
+      await click("#createProject");
+      await waitFor(`state.project.task_type==="${task}" && state.current && !state.busy && !element("projectDialog").open`);
+    };
+    if (await evaluate('element("autoDraft").checked')) await click("#autoDraft");
+    await click("#newProjectButton");
+    await check('document.querySelector(".logo img").naturalWidth>0 && document.querySelectorAll(".task-option").length===4',
+      "The RealityLoop logo loads and the project dialog offers four task types");
+    const taskNamesFit = `Array.from(document.querySelectorAll(".task-option")).every(tile =>
+      tile.querySelector("span").getBoundingClientRect().right <= tile.getBoundingClientRect().right)`;
+    await check(taskNamesFit, "Task names and descriptions fit inside the desktop choices");
+    fs.writeFileSync(path.join(home,"task-selection.png"), Buffer.from((await cdp("Page.captureScreenshot", {format:"png"})).data,"base64"));
+    await cdp("Emulation.setDeviceMetricsOverride", {width:420,height:850,deviceScaleFactor:1,mobile:false});
+    await sleep(80);
+    await check(taskNamesFit, "Task names and descriptions also fit on a narrow screen");
+    await cdp("Emulation.setDeviceMetricsOverride", {width:1600,height:1000,deviceScaleFactor:1,mobile:false});
+    await evaluate('element("projectDialog").close()');
+    await createTask("segment", "part");
+    await check(`element("projectTask").textContent==="实例分割" && document.querySelector('[data-tool="rectangle"]').hidden`,
+      "Instance projects show contour tools and a task-specific header");
+    await click('[data-tool="polygon"]');
+    for (const coords of [[35,50],[114,50],[114,116],[35,116]]) await mouseClick(await point(coords));
+    await press("q","KeyQ");
+    await waitFor('element("labelPicker").open');
+    await press("q","KeyQ");
+    await waitFor('state.current.document.shapes[0]?.shape_type==="polygon"');
+    await changeMode("prompt");
+    await mouseClick(await point([60,73]));
+    await waitFor('!element("acceptPrompt").disabled');
+    await click("#acceptPrompt");
+    await waitFor('element("labelPicker").open');
+    await press("q","KeyQ");
+    await waitFor('state.current.document.shapes.length===2');
+    await check('state.current.document.shapes.every(shape=>shape.shape_type==="polygon")',
+      "Manual contours and point-assisted proposals both create independent instance polygons");
+    await click("#saveButton");
+    await waitFor('!state.busy && !state.dirty');
+
+    await createTask("semantic", "region");
+    await click('[data-tool="brush"]');
+    await mouseClick(await point([61,80]));
+    await click('[data-tool="erase"]');
+    await setExportValue("brushRadius", "6");
+    await mouseClick(await point([61,80]));
+    await check('state.current.document.shapes.length===2 && state.current.document.shapes[1].erase===true && state.current.document.shapes[1].radius===6',
+      "Semantic painting and erasing retain ordered pixel regions");
+    await press("e","KeyE");
+    await waitFor('state.items.some(item=>item.status==="reviewed") && !state.busy');
+    await click("#exportButton");
+    await waitFor('element("exportDialog").open');
+    if (await evaluate('element("splitDataset").checked')) await click("#splitDataset");
+    await waitFor('element("exportDialog").open && exportPreview.plan');
+    await check('element("exportFormat").value==="mask" && !exportPreview.plan.data.blocking_issue',
+      "Semantic export is ready with a per-pixel PNG mask");
+    await evaluate('element("exportDialog").close()');
+
+    await createTask("hand_pose", "");
+    await click('[data-tool="hand"]');
+    await mouseClick(await point([130,147]));
+    await click("#skipHandPoint");
+    await mouseClick(await point([105,113]));
+    await click("#finishHand");
+    await waitFor('state.current.document.shapes[0]?.keypoints.length===21');
+    await check('state.project.classes[0].name==="hand" && state.current.document.shapes[0].keypoints[1][2]===0',
+      "Hand annotation stores the 21-point template with skipped keypoints");
+    await setReviewValue("jointSelect", "2");
+    await setReviewValue("jointVisibility", "1");
+    await click("#placeJoint");
+    await mouseClick(await point([112,105]));
+    await check('state.current.document.shapes[0].keypoints[2][2]===1 && Math.abs(state.current.document.shapes[0].keypoints[2][0]-112)<2',
+      "Hand keypoints can be relocated and marked occluded");
+    await click("#saveButton");
+    await waitFor('state.current.status==="draft" && !state.dirty && !state.busy');
+    fs.writeFileSync(path.join(home,"hand-workspace.png"), Buffer.from((await cdp("Page.captureScreenshot", {format:"png"})).data,"base64"));
+
     assert.deepEqual(errors, [], "No browser runtime errors");
   } finally {
     if (socket?.readyState === WebSocket.OPEN && cdp) await cdp("Browser.close").catch(() => {});

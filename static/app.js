@@ -64,6 +64,7 @@ function setBusy(value, message="") {
   for (const id of ["predictButton","singlePredict","batchPredict","saveModel","saveButton","reviewButton","skipButton","previousImage","nextImage","projectSelect","deleteShape","shapeClass","shapeDescription","shapeDifficult","newLabelInput","addLabelButton"]) element(id).disabled = value;
   element("connectionStatus").textContent = value ? message || "正在处理…" : "本地工作区 · 仅本机可访问";
   efficiency.render();
+  taskUi.render();
   updateCrosshair();
 }
 
@@ -90,7 +91,7 @@ async function initialize() {
   for (const failure of response.errors) toast(`${failure.name}：${failure.error}`, true);
   element("projectSelect").innerHTML = state.projects.map(project => `<option value="${escapeHtml(project.id)}">${escapeHtml(project.name)}</option>`).join("");
   if (!state.projects.length) {
-    showCanvasMessage("接入你的第一个数据集", "点击左上角“选择图片”，选择本机图片文件或文件夹");
+    showCanvasMessage("接入你的第一个数据集", "新建项目后，选择标注任务和本机图片");
     element("projectDialog").showModal();
     return;
   }
@@ -116,7 +117,7 @@ async function selectProject(projectId) {
   state.activeClass = Math.max(0, state.project.classes.findIndex(item => item.name === "sample_container"));
   localStorage.setItem("labelpilot-project", projectId);
   element("projectSelect").value = projectId;
-  element("projectSubtitle").textContent = `${state.project.batches.length} 个批次 · ${state.project.classes.length} 个标签 · 原始数据只读`;
+  taskUi.projectChanged();
   const options = '<option value="">全部批次</option>' + state.project.batches.map(batch => `<option value="${escapeHtml(batch)}">${escapeHtml(batch)}</option>`).join("");
   element("batchSelect").innerHTML = options;
   element("exportBatch").innerHTML = options;
@@ -225,6 +226,7 @@ async function loadItem(itemId, remembered=null) {
     state.drag = null;
     state.rectangle = null;
     state.polygon = [];
+    taskUi.itemChanged();
     setDirty(false);
     setStatus(current.status);
     element("imageTitle").textContent = current.item.photo_id;
@@ -247,14 +249,23 @@ async function saveCurrent(status="draft") {
   await workspaceResume.wait();
   if (!state.current || state.busy) return false;
   let confirmedEmpty = false;
+  const confirmEmpty = () => window.confirm("此图没有前景标注。确认确实不存在项目目标后，将作为已确认的负样本。");
   if (status === "reviewed" && state.current.document.shapes.length === 0) {
-    confirmedEmpty = window.confirm("此图没有任何标注。你是否已逐图检查，确认确实不存在项目类别目标？确定后将作为人工确认的负样本。模型零检测不等于负样本。");
+    confirmedEmpty = confirmEmpty();
     if (!confirmedEmpty) return false;
   }
   setBusy(true,"正在安全保存…");
   try {
-    const response = await api(itemUrl(),"PUT",{document:state.current.document,expected_version:state.current.version,
-      status,confirmed_empty:confirmedEmpty,image_sha256:state.current.image_sha256,source_fingerprint:state.current.source_fingerprint});
+    const payload = {document:state.current.document,expected_version:state.current.version,
+      status,confirmed_empty:confirmedEmpty,image_sha256:state.current.image_sha256,source_fingerprint:state.current.source_fingerprint};
+    let response;
+    try {
+      response = await api(itemUrl(), "PUT", payload);
+    } catch (error) {
+      if (status !== "reviewed" || taskUi.type() !== "semantic" || !error.message.startsWith("空标注不能自动")) throw error;
+      if (!confirmEmpty()) return false;
+      response = await api(itemUrl(), "PUT", {...payload, confirmed_empty:true});
+    }
     Object.assign(state.current,response);
     setDirty(false);
     workspaceResume.savedManually();
@@ -271,7 +282,7 @@ async function saveCurrent(status="draft") {
 
 async function navigateImage(direction, reviewed=false) {
   if (!state.current || state.busy) return;
-  if (reviewed && (state.rectangle || state.polygon.length || state.pendingShape || efficiency.blocksReview())) return toast("请先完成或取消当前绘制", true);
+  if (reviewed && (state.rectangle || state.polygon.length || state.pendingShape || efficiency.blocksReview() || taskUi.blocksReview())) return toast("请先完成或取消当前绘制", true);
   const previousIds = state.items.map(item => item.id);
   const previousOffset = state.offset;
   const currentIndex = previousIds.indexOf(state.current.item.id);
@@ -318,10 +329,11 @@ function undo(redo=false) {
 }
 
 function classInfo(label) { return state.project.classes.find(item => item.name === label) || {name:label,display:label,color:"#f87171"}; }
+function classCode(item) { return taskUi.type() === "semantic" ? "像素 " + (item.id + 1) : "ID " + item.id; }
 function renderClasses() {
-  element("classList").innerHTML = state.project.classes.map((item,index) => `<button class="class-row ${state.activeClass === index ? "selected" : ""}" data-class="${index}" title="${escapeHtml(item.name)}"><span class="class-swatch" style="background:${item.color}"></span><span>${escapeHtml(item.name)}<small>ID ${item.id}</small></span>${index < 9 ? `<kbd>${index + 1}</kbd>` : ""}</button>`).join("");
+  element("classList").innerHTML = state.project.classes.map((item,index) => `<button class="class-row ${state.activeClass === index ? "selected" : ""}" data-class="${index}" title="${escapeHtml(item.name)}"><span class="class-swatch" style="background:${item.color}"></span><span>${escapeHtml(item.name)}<small>${classCode(item)}</small></span>${index < 9 ? `<kbd>${index + 1}</kbd>` : ""}</button>`).join("");
   const previousLabel = element("shapeClass").value;
-  element("shapeClass").innerHTML = state.project.classes.map(item => `<option value="${escapeHtml(item.name)}">${item.id} · ${escapeHtml(item.name)}</option>`).join("");
+  element("shapeClass").innerHTML = state.project.classes.map(item => `<option value="${escapeHtml(item.name)}">${classCode(item)} · ${escapeHtml(item.name)}</option>`).join("");
   const selectedLabel = state.current?.document.shapes[state.selected]?.label;
   element("shapeClass").value = selectedLabel || previousLabel || state.project.classes[state.activeClass].name;
   element("activeClassText").textContent = `绘制标签：${state.project.classes[state.activeClass].name}`;
@@ -349,8 +361,8 @@ async function addCustomLabel() {
     renderObjects();
     element("newLabelInput").value = "";
     element("newLabelInput").blur();
-    element("projectSubtitle").textContent = `${state.project.batches.length} 个批次 · ${state.project.classes.length} 个标签 · 原始数据只读`;
-    toast(selected ? `标签 ${name} 已设为当前对象标签；修改尚未保存` : `标签 ${name} 已就绪，按 R 画框`);
+    taskUi.projectSubtitle();
+    toast(selected ? `标签 ${name} 已设为当前对象标签；修改尚未保存` : `标签 ${name} 已就绪`);
   } finally {
     element("addLabelButton").disabled = false;
     element("newLabelInput").disabled = false;
@@ -360,11 +372,15 @@ async function addCustomLabel() {
 function renderObjects() {
   const shapes = state.current?.document.shapes || [];
   element("objectCount").textContent = shapes.length;
-  element("annotationSummary").textContent = shapes.length ? `${shapes.length} 个对象 · 点击选择 / 调整` : "暂无对象 · R 画框或运行模型";
+  const unit = taskUi.type() === "hand_pose" ? "只手" : taskUi.type() === "semantic" ? "个图层" : "个对象";
+  element("annotationSummary").textContent = shapes.length ? `${shapes.length} ${unit}` : "暂无标注";
   element("objectList").innerHTML = shapes.map((shape,index) => {
     const info = classInfo(shape.label);
-    return `<button class="object-row ${state.selected === index ? "selected" : ""}" data-shape="${index}" title="${escapeHtml(shape.label)}"><span class="object-index">${index + 1}</span><i class="class-swatch" style="background:${info.color}"></i><span class="object-name">${escapeHtml(info.name)}</span><small>${shape.score == null ? "人工" : `${Math.round(shape.score*100)}%`}</small></button>`;
-  }).join("") || '<p class="empty-list">模型先标，你来把关<br>或按 R 开始画框</p>';
+    const label = shape.erase ? "擦除区域" : info.name;
+    const detail = shape.shape_type === "hand" ? `${shape.keypoints.filter(point => point[2]).length} / 21`
+      : shape.score == null ? "人工" : `${Math.round(shape.score*100)}%`;
+    return `<button class="object-row ${state.selected === index ? "selected" : ""}" data-shape="${index}" title="${escapeHtml(label)}"><span class="object-index">${index + 1}</span><i class="class-swatch" style="background:${info.color}"></i><span class="object-name">${escapeHtml(label)}</span><small>${detail}</small></button>`;
+  }).join("") || `<p class="empty-list">${taskUi.instructions[taskUi.type()]}</p>`;
   const selected = shapes[state.selected];
   element("shapeProperties").hidden = !selected;
   if (selected) {
@@ -375,9 +391,11 @@ function renderObjects() {
   element("undoButton").disabled = !state.undo.length;
   element("redoButton").disabled = !state.redo.length;
   efficiency.render();
+  taskUi.render();
 }
 
 function selectShape(index) {
+  if (state.selected !== index) taskUi.selectionChanged();
   state.selected = index;
   const shape = state.current?.document.shapes[index];
   if (shape) {
@@ -403,15 +421,15 @@ function positionLabelPicker() {
 function renderLabelOptions() {
   const query = element("pickerLabelInput").value.trim();
   const labels = state.project.classes.filter(item => item.name.toLowerCase().includes(query.toLowerCase()));
-  element("pickerLabelOptions").innerHTML = labels.map(item => `<button type="button" class="picker-label-option ${item.id === state.activeClass ? "selected" : ""}" data-label="${escapeHtml(item.name)}"><i class="class-swatch" style="background:${item.color}"></i><span>${escapeHtml(item.name)}</span><small>ID ${item.id}</small></button>`).join("") || '<p class="picker-empty">没有匹配的已有标签，可直接创建新标签。</p>';
+  element("pickerLabelOptions").innerHTML = labels.map(item => `<button type="button" class="picker-label-option ${item.id === state.activeClass ? "selected" : ""}" data-label="${escapeHtml(item.name)}"><i class="class-swatch" style="background:${item.color}"></i><span>${escapeHtml(item.name)}</span><small>${classCode(item)}</small></button>`).join("") || '<p class="picker-empty">没有匹配的已有标签，可直接创建新标签。</p>';
   const existing = state.project.classes.some(item => item.name === query);
   element("confirmPickedLabel").textContent = !query ? "使用当前标签" : existing ? "使用此标签" : "创建并使用";
   element("pickerCurrentLabel").textContent = `当前标签：${state.project.classes[state.activeClass].name}`;
   positionLabelPicker();
 }
 
-function openLabelPicker(points, anchor) {
-  state.pendingShape = {points, anchor};
+function openLabelPicker(points, anchor, kind="rectangle", details={}) {
+  state.pendingShape = {points, anchor, kind, details};
   element("pickerLabelInput").value = "";
   element("pickerLabelError").textContent = "";
   renderLabelOptions();
@@ -439,14 +457,14 @@ async function applyPickedLabel(name) {
     if (!state.project.classes.some(item => item.name === label)) {
       const project = await api(projectUrl("/labels"), "POST", {name:label});
       Object.assign(state.project, project);
-      element("projectSubtitle").textContent = `${state.project.batches.length} 个批次 · ${state.project.classes.length} 个标签 · 原始数据只读`;
+      taskUi.projectSubtitle();
     }
     state.activeClass = state.project.classes.findIndex(item => item.name === label);
     if (state.activeClass < 0) throw new Error("标签未创建成功，请重新选择");
     state.pendingShape = null;
-    addShape(pending.points, "rectangle");
+    addShape(pending.points, pending.kind, pending.details);
     renderClasses();
-    setTool(efficiency.boxTool());
+    setTool(state.tool === "polygon" ? "polygon" : efficiency.boxTool());
     element("labelPicker").close();
     canvas.focus({preventScroll:true});
   } catch (error) {
@@ -468,6 +486,7 @@ function deleteShape() {
 }
 
 function setTool(tool) {
+  if (!taskUi.toolAllowed(tool)) return;
   state.tool = tool;
   state.polygon = [];
   state.rectangle = null;
@@ -475,6 +494,7 @@ function setTool(tool) {
   document.querySelectorAll("[data-tool]").forEach(button => button.classList.toggle("active",button.dataset.tool === tool));
   canvas.style.cursor = tool === "pan" ? "grab" : tool === "select" ? "default" : "crosshair";
   efficiency.toolChanged(tool);
+  taskUi.toolChanged();
   draw();
 }
 
@@ -527,12 +547,18 @@ function imagePoint(event,clamp=false) {
 function bounds(shape) {
   const horizontal = shape.points.map(point => point[0]);
   const vertical = shape.points.map(point => point[1]);
+  if (shape.shape_type === "brush") {
+    const radius = shape.radius;
+    return [Math.max(0, Math.min(...horizontal) - radius), Math.max(0, Math.min(...vertical) - radius),
+      Math.min(state.current.width, Math.max(...horizontal) + radius), Math.min(state.current.height, Math.max(...vertical) + radius)];
+  }
   return [Math.min(...horizontal),Math.min(...vertical),Math.max(...horizontal),Math.max(...vertical)];
 }
 function rectanglePoints(left,top,right,bottom) { return [[left,top],[right,top],[right,bottom],[left,bottom]]; }
-function shapePoints(shape) { return shape.shape_type === "rectangle" ? rectanglePoints(...bounds(shape)) : shape.points; }
+function shapePoints(shape) { return shape.shape_type === "polygon" ? shape.points : rectanglePoints(...bounds(shape)); }
 function handles(shape) {
-  if (shape.shape_type !== "rectangle") return shape.points;
+  if (shape.shape_type === "polygon") return shape.points;
+  if (shape.shape_type !== "rectangle") return [];
   const [left,top,right,bottom] = bounds(shape);
   return [[left,top],[(left+right)/2,top],[right,top],[right,(top+bottom)/2],[right,bottom],[(left+right)/2,bottom],[left,bottom],[left,(top+bottom)/2]];
 }
@@ -551,16 +577,32 @@ function draw() {
   context.shadowColor = "#0009"; context.shadowBlur = 18;
   context.drawImage(state.image,state.panX,state.panY,state.current.width*state.scale,state.current.height*state.scale);
   context.restore();
+  taskUi.drawRegions();
+  const task = taskUi.type();
   state.current.document.shapes.forEach((shape,index) => {
     const info = classInfo(shape.label);
     const selected = index === state.selected;
-    pathPoints(shapePoints(shape));
-    context.fillStyle = info.color+(selected ? "25" : "0b"); context.fill();
-    context.strokeStyle=info.color; context.lineWidth=selected?2:1.2; context.stroke();
+    if (task === "semantic" && !selected) return;
+    if (shape.shape_type === "hand") taskUi.drawHand(shape.keypoints, info.color, selected);
+    if (shape.shape_type !== "hand" || selected) {
+      pathPoints(shapePoints(shape));
+      if (task === "segment") {
+        context.save();
+        context.globalAlpha = taskUi.opacity();
+        context.fillStyle = info.color;
+        context.fill();
+        context.restore();
+      } else if (task === "detect") {
+        context.fillStyle = info.color+(selected ? "25" : "0b"); context.fill();
+      }
+      if (task === "semantic" || shape.shape_type === "hand") context.setLineDash([5, 3]);
+      context.strokeStyle=info.color; context.lineWidth=selected?2:1.2; context.stroke();
+      context.setLineDash([]);
+    }
     const [left,top] = bounds(shape);
     if (state.showLabels || selected) {
       const position=screenPoint([left,top]);
-      const label=info.name+(shape.score == null?"":` ${Math.round(shape.score*100)}%`);
+      const label=shape.erase ? "擦除区域" : info.name+(shape.score == null?"":` ${Math.round(shape.score*100)}%`);
       context.font="10px 'Segoe UI','Microsoft YaHei',sans-serif";
       const textWidth=context.measureText(label).width+9;
       const textY=Math.max(0,position[1]-17);
@@ -575,15 +617,22 @@ function draw() {
   });
   if (state.rectangle || state.pendingShape) {
     const rectangle = state.rectangle;
-    const points = rectangle ? rectanglePoints(Math.min(rectangle.start[0],rectangle.end[0]),Math.min(rectangle.start[1],rectangle.end[1]),Math.max(rectangle.start[0],rectangle.end[0]),Math.max(rectangle.start[1],rectangle.end[1])) : state.pendingShape.points;
-    pathPoints(points);
-    context.strokeStyle=state.project.classes[state.activeClass].color; context.lineWidth=1.5; context.setLineDash([5,3]); context.stroke(); context.setLineDash([]);
+    const color = state.project.classes[state.activeClass].color;
+    if (state.pendingShape?.kind === "mask") {
+      taskUi.drawMaskPreview({points:state.pendingShape.points, ...state.pendingShape.details}, color);
+    } else {
+      const points = rectangle ? rectanglePoints(Math.min(rectangle.start[0],rectangle.end[0]),Math.min(rectangle.start[1],rectangle.end[1]),
+        Math.max(rectangle.start[0],rectangle.end[0]),Math.max(rectangle.start[1],rectangle.end[1])) : state.pendingShape.points;
+      pathPoints(points);
+      context.strokeStyle=color; context.lineWidth=1.5; context.setLineDash([5,3]); context.stroke(); context.setLineDash([]);
+    }
   }
   if (state.polygon.length) {
     const color=state.project.classes[state.activeClass].color;
     pathPoints(state.polygon,false); context.strokeStyle=color; context.lineWidth=1.5; context.stroke();
     for(const point of state.polygon){const position=screenPoint(point);context.fillStyle=color;context.beginPath();context.arc(...position,3,0,Math.PI*2);context.fill();}
   }
+  taskUi.drawDraft();
   efficiency.drawExtras();
   workspaceResume.observe();
   element("fitButton").textContent=`${Math.round(state.scale*100)}%`;
@@ -605,18 +654,25 @@ function pointInside(point,polygon) {
   }
   return inside;
 }
-function addShape(points,kind) {
+function addShape(points,kind,details={}) {
   checkpoint();
   state.current.document.shapes.push({label:state.project.classes[state.activeClass].name,points,shape_type:kind,
-    score:null,group_id:null,description:"",flags:{},attributes:{},difficult:false});
+    score:null,group_id:null,description:"",flags:{},attributes:{},difficult:false,...details});
   state.selected=state.current.document.shapes.length-1;
   changed();
 }
 function finishPolygon() {
+  if (state.pendingShape) return;
   if(state.polygon.length<3)return toast("多边形至少需要三个顶点");
   const points=copy(state.polygon);
   if(points.length>3 && Math.hypot(points.at(-1)[0]-points.at(-2)[0],points.at(-1)[1]-points.at(-2)[1])*state.scale<3)points.pop();
+  const area = points.reduce((sum, [x,y], index) => {
+    const [nextX, nextY] = points[(index + 1) % points.length];
+    return sum + x*nextY - nextX*y;
+  }, 0);
+  if (Math.abs(area) < 1e-8) return toast("请让多边形围成一个有面积的区域");
   state.polygon=[];
+  if (taskUi.type() !== "detect") return openLabelPicker(points, points.at(-1), "polygon");
   addShape(points,"polygon");
   setTool("select");
 }
@@ -640,6 +696,7 @@ canvas.addEventListener("pointerdown",event => {
   }
   if(actual[0]<0 || actual[1]<0 || actual[0]>state.current.width || actual[1]>state.current.height)return;
   if(efficiency.handleCanvas(point))return;
+  if(taskUi.pointerDown(event, point))return;
   if(state.tool==="rectangle"){state.rectangle={start:point,end:point};state.selected=-1;renderObjects();draw();return;}
   if(state.tool==="polygon"){state.polygon.push(point);draw();return;}
   canvas.setPointerCapture(event.pointerId);
@@ -649,15 +706,18 @@ canvas.addEventListener("pointerdown",event => {
     if(handle>=0){state.drag={type:"resize",handle,start:point,original:copy(selected),before:snapshot()};return;}
   }
   const matches=state.current.document.shapes.map((shape,index) => ({shape,index})).filter(entry=>pointInside(point,shapePoints(entry.shape)));
-  matches.sort((first,second)=>{const firstBounds=bounds(first.shape),secondBounds=bounds(second.shape);return (firstBounds[2]-firstBounds[0])*(firstBounds[3]-firstBounds[1])-(secondBounds[2]-secondBounds[0])*(secondBounds[3]-secondBounds[1]);});
+  if (taskUi.type() === "semantic") matches.reverse();
+  else matches.sort((first,second)=>{const firstBounds=bounds(first.shape),secondBounds=bounds(second.shape);return (firstBounds[2]-firstBounds[0])*(firstBounds[3]-firstBounds[1])-(secondBounds[2]-secondBounds[0])*(secondBounds[3]-secondBounds[1]);});
   selectShape(matches[0]?.index ?? -1);
-  if(state.selected>=0)state.drag={type:"move",start:point,original:copy(state.current.document.shapes[state.selected]),before:snapshot()};
+  const chosen = state.current.document.shapes[state.selected];
+  if(chosen && ["rectangle","polygon"].includes(chosen.shape_type))state.drag={type:"move",start:point,original:copy(chosen),before:snapshot()};
 });
 canvas.addEventListener("pointermove",event => {
   updateCrosshair(event);
   if(!state.current)return;
   const point=imagePoint(event,true);
   element("coordinateText").textContent=`x ${Math.round(point[0])} · y ${Math.round(point[1])}`;
+  if(!state.busy && taskUi.pointerMove(event, point))return;
   if(state.rectangle && !state.busy){state.rectangle.end=point;draw();}
   const drag=state.drag;
   if(!drag || state.busy)return;
@@ -689,10 +749,10 @@ function finishDrag() {
   if(drag.before && JSON.stringify(drag.before)!==JSON.stringify(state.current.document)){checkpoint(drag.before);changed();}
   draw();
 }
-canvas.addEventListener("pointerup",finishDrag);
+canvas.addEventListener("pointerup",event=>{if(!taskUi.pointerUp(event))finishDrag();});
 canvas.addEventListener("pointerenter",updateCrosshair);
 canvas.addEventListener("pointerleave",()=>{state.canvasPointer=null;updateCrosshair();});
-canvas.addEventListener("pointercancel",()=>{if(state.drag?.before)state.current.document=state.drag.before;state.drag=null;state.rectangle=null;state.canvasPointer=null;draw();});
+canvas.addEventListener("pointercancel",()=>{if(state.drag?.before)state.current.document=state.drag.before;state.drag=null;state.rectangle=null;state.canvasPointer=null;taskUi.cancelPointer();draw();});
 canvas.addEventListener("dblclick",()=>{if(state.tool==="polygon" && !state.busy)finishPolygon();});
 canvas.addEventListener("contextmenu",event=>event.preventDefault());
 canvas.addEventListener("wheel",event=>{event.preventDefault();if(state.busy)return;const rect=canvas.getBoundingClientRect();zoom(Math.exp(-event.deltaY*.001),[event.clientX-rect.left,event.clientY-rect.top]);},{passive:false});
@@ -1100,7 +1160,8 @@ async function openExportDialog(clean=false) {
   element("cleanDataset").checked = clean;
   if (clean) {
     element("augmentationPreset").value = "none";
-    element("exportFormat").value = "labelme";
+    const format = element("exportFormat");
+    format.value = format.querySelector('[value="labelme"]').disabled ? Array.from(format.options).find(option => !option.disabled).value : "labelme";
     element("exportBatch").value = filters().batch;
     element("includeImages").checked = true;
     element("splitDataset").checked = false;
@@ -1131,8 +1192,11 @@ function renderTrainingRuns(runs) {
     const progress = run.progress;
     const epoch = progress.epoch ?? 0;
     const epochs = progress.epochs ?? run.options.epochs;
-    const metrics = [["mAP50–95", progress.metrics?.map50_95], ["mAP50", progress.metrics?.map50],
-      ["召回率", progress.metrics?.recall], ["精确率", progress.metrics?.precision]];
+    const prefix = {segment:"掩膜 ", hand_pose:"关键点 "}[run.task_type] || "";
+    const metrics = run.task_type === "semantic"
+      ? [["mIoU", progress.metrics?.miou], ["像素准确率", progress.metrics?.pixel_accuracy]]
+      : [[prefix + "mAP50–95", progress.metrics?.map50_95], [prefix + "mAP50", progress.metrics?.map50],
+        ["召回率", progress.metrics?.recall], ["精确率", progress.metrics?.precision]];
     const scored = metrics.filter(([, value]) => Number.isFinite(value));
     const information = [escapeHtml(run.options.batch || "全部批次")];
     if (counts) information.push(`训练 ${counts.train} 张 · 验证 ${counts.val} 张`, `清洗排除 ${run.cleaned_out} 张`);
@@ -1164,10 +1228,13 @@ async function refreshTrainingRuns() {
 
 async function openTrainingDialog() {
   if (!state.project) return;
+  element("trainingTitle").textContent = taskUi.name() + " · 本地训练";
   element("trainingBatch").innerHTML = element("exportBatch").innerHTML;
   element("trainingBatch").value = filters().batch;
   element("trainingUnit").value = state.project.has_source_groups ? "source_group" : "image";
   element("trainingMode").value = state.project.model_path ? "fine_tune" : "scratch";
+  element("trainingMode").querySelector('[value="scratch"]').textContent =
+    "从零训练 " + {detect:"YOLO11n", segment:"YOLO11n-seg", semantic:"YOLO26n-sem", hand_pose:"YOLO11n-pose（手部 21 点）"}[taskUi.type()];
   element("trainingRuns").textContent = "正在读取训练记录…";
   trainingRuns = null;
   trainingMessage("");
@@ -1624,6 +1691,7 @@ async function createProject() {
   element("createProject").disabled=true;
   try{
     const project=await api("/api/projects","POST",{name:element("newProjectName").value.trim(),image_root:element("newImageRoot").value.trim(),
+      task_type:taskUi.projectTask(),
       ...(projectImages.files.length ? {image_files:projectImages.files} : {}),
       annotation_root:element("newAnnotationRoot").value.trim(),preannotation_root:element("newPreannotationRoot").value.trim(),
       classes:element("newClasses").value.split(/\r?\n/).map(name=>name.trim()).filter(Boolean),class_map_path:element("newClassMap").value.trim(),
@@ -1882,7 +1950,7 @@ document.addEventListener("keydown",event=>{
   if(state.busy)return;
   if((event.ctrlKey || event.metaKey) && key==="z"){event.preventDefault();undo(event.shiftKey);return;}
   if(event.ctrlKey || event.metaKey || event.altKey)return;
-  if(efficiency.keydown(event,key)){event.preventDefault();return;}
+  if(taskUi.keydown(key) || efficiency.keydown(event,key)){event.preventDefault();return;}
   if(event.repeat && ["a","d","e","q"].includes(key))return;
   if(key==="v")setTool("select");if(key==="r")setTool("rectangle");if(key==="p")setTool("polygon");if(key==="h")setTool("pan");if(key==="f")fitImage();
   if(key==="delete" || key==="backspace"){event.preventDefault();deleteShape();}
@@ -1908,4 +1976,5 @@ efficiency.install();
 efficiency.render();
 workspaceResume.install();
 automationUi.install();
+taskUi.install();
 initialize().catch(error=>{toast(error.message,true);showCanvasMessage("工作区启动失败",error.message);});

@@ -5,7 +5,7 @@ from PIL import Image
 from .store import Problem
 
 
-def annotation_key(document):
+def annotation_key(document, *, ordered=False):
     shapes = []
     for original in document["shapes"]:
         shape = {name: value for name, value in original.items()
@@ -15,7 +15,7 @@ def annotation_key(document):
             shape["points"] = [[min(xs), min(ys)], [max(xs), max(ys)]]
         shape["points"] = [[float(x), float(y)] for x, y in shape["points"]]
         shapes.append(json.dumps(shape, sort_keys=True, ensure_ascii=False))
-    return tuple(sorted(shapes))
+    return tuple(shapes if ordered else sorted(shapes))
 
 
 def clean_selection(store, project, rows, *, include_documents=False, checkpoint=None):
@@ -46,7 +46,8 @@ def clean_selection(store, project, rows, *, include_documents=False, checkpoint
         verified = {**row, "image_sha256": current["image_sha256"]}
         if include_documents:
             verified["document"] = document
-        by_digest.setdefault(current["image_sha256"], []).append((verified, annotation_key(document)))
+        by_digest.setdefault(current["image_sha256"], []).append(
+            (verified, annotation_key(document, ordered=project.task_type == "semantic")))
 
     for copies in by_digest.values():
         kept, first_key = copies[0]

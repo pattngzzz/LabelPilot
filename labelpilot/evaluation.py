@@ -129,6 +129,8 @@ class ComparisonJobs:
         return sorted(records, key=lambda row: row["created_at"], reverse=True)[:20]
 
     def start(self, project_id, payload, *, task_id=None):
+        if self.store.project(project_id).task_type != "detect":
+            raise Problem("当前逐框模型对比适用于目标检测项目", 422)
         directory, snapshot = get_blindset(self.store, project_id, payload.get("set_id"))
         options = comparison_options(payload)
         weights = {name: weight_path(payload.get(f"{name}_path")) for name in ("old", "new")}

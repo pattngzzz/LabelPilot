@@ -207,7 +207,7 @@ const efficiency = (() => {
     const sequence = ++editor.request;
     const id = state.current.item.id;
     editor.proposal = null;
-    editor.promptText = editor.positive.length ? "正在生成本地候选框…" : "";
+    editor.promptText = editor.positive.length ? (taskUi.isMaskTask() ? "正在生成分割建议…" : "正在生成候选框…") : "";
     render(); draw();
     if (!editor.positive.length) return;
     editor.timer = setTimeout(async () => {
@@ -215,8 +215,8 @@ const efficiency = (() => {
         const response = await api(itemUrl("/prompt-box"), "POST", {positive:editor.positive, negative:editor.negative,
           image_sha256:state.current.image_sha256});
         if (sequence !== editor.request || id !== state.current?.item.id || state.tool !== "prompt") return;
-        editor.proposal = response.box;
-        editor.promptText = "候选框已生成，可加点调整或采用";
+        editor.proposal = response;
+        editor.promptText = "建议已生成，可加点调整或采用";
       } catch (error) {
         if (sequence !== editor.request) return;
         editor.promptText = error.message;
@@ -227,9 +227,12 @@ const efficiency = (() => {
 
   function acceptPrompt() {
     if (!editor.proposal || state.busy) return;
-    const box = editor.proposal;
+    const {box, shape} = editor.proposal;
     resetPoints(); render();
-    openLabelPicker(rectanglePoints(...box), box.slice(2));
+    if (shape) {
+      const {points, shape_type, ...details} = shape;
+      openLabelPicker(points, box.slice(2), shape_type, details);
+    } else openLabelPicker(rectanglePoints(...box), box.slice(2));
   }
 
   function drawExtras() {
@@ -247,20 +250,24 @@ const efficiency = (() => {
         context.fillStyle = "#ffc27c"; context.fillText(title, left + 4, top + 14);
       }
     }
-    if (editor.proposal) {
-      pathPoints(rectanglePoints(...editor.proposal));
+    if (editor.proposal?.shape?.shape_type === "mask") {
+      taskUi.drawMaskPreview(editor.proposal.shape, "#6be7b3");
+    } else if (editor.proposal) {
+      const shape = editor.proposal.shape;
+      pathPoints(shape ? shape.points : rectanglePoints(...editor.proposal.box));
+      if (shape) { context.fillStyle = "#6be7b344"; context.fill(); }
       context.strokeStyle = "#6be7b3"; context.lineWidth = 2;
       context.setLineDash([5, 3]); context.stroke();
     }
     context.setLineDash([]);
     const points = [...editor.positive.map(point => [point, "#6be7b3", "+"]),
       ...editor.negative.map(point => [point, "#f5a4a6", "−"]),
-      ...editor.points.map((point, index) => [point, "#cdbbff", String(index + 1)])];
+      ...editor.points.map((point, index) => [point, "#a3ece6", String(index + 1)])];
     for (const [point, color, label] of points) {
       const [x, y] = screenPoint(point);
       context.beginPath(); context.arc(x, y, 7.5, 0, Math.PI * 2);
       context.fillStyle = color; context.fill();
-      context.font = "bold 10px sans-serif"; context.fillStyle = "#10131a";
+      context.font = "bold 10px sans-serif"; context.fillStyle = "#10212a";
       context.textAlign = "center"; context.fillText(label, x, y + 3.5);
     }
     context.restore();

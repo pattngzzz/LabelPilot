@@ -1,4 +1,5 @@
 import copy
+import math
 import os
 import threading
 import uuid
@@ -10,6 +11,7 @@ from PIL import Image
 from .curation import save_findings
 from .intake import rare_labels, route_review
 from .store import AUDITABLE, PENDING_REVIEW, Problem, atomic_json, digest, now, read_json
+from .tasks import HAND_COUNT, MAX_MASK_PIXELS, MODEL_TASK, mask_shape, model_labels, polygon_area
 
 
 DISABLED_INTEGRATIONS = ("sync", "hub", "wandb", "mlflow", "comet", "clearml", "dvc", "neptune", "raytune", "tensorboard")
@@ -20,6 +22,78 @@ def model_class_names(names, project_names):
     if not ordered or ordered != project_names[:len(ordered)]:
         raise Problem("模型类别 ID / 名称与项目既有标签不一致；只允许在末尾追加新标签", 422)
     return ordered
+
+
+def validate_model_task(model, task):
+    if model.task != MODEL_TASK[task]:
+        raise Problem(f"项目需要 {MODEL_TASK[task]} 权重，当前模型为 {model.task}", 422)
+    if task == "hand_pose" and tuple(getattr(model.model, "kpt_shape", ())) not in ((HAND_COUNT, 2), (HAND_COUNT, 3)):
+        raise Problem("手部姿态需要 21 个手部关键点的权重", 422)
+
+
+def prediction_shapes(result, task, names, width, height):
+    if task == "semantic":
+        import numpy as np
+
+        mask = result.semantic_mask
+        if mask is None or tuple(mask.data.shape) != (height, width):
+            raise Problem("模型未返回原图大小的语义掩膜", 422)
+        pixels = mask.data.detach().cpu().numpy()
+        for index in np.unique(pixels):
+            if index in (0, 255):
+                continue
+            if not 0 < index < len(names):
+                raise Problem("掩膜中存在未知的类别 ID", 422)
+            shape = mask_shape(Image.fromarray((pixels == index).astype("uint8") * 255))
+            yield {**shape, "label": names[int(index)]}
+        return
+
+    if result.boxes is None:
+        raise Problem("模型未返回有效的目标结果", 422)
+    boxes = result.boxes.data.detach().cpu().tolist()
+    polygons = None
+    keypoints = None
+    if task == "segment" and boxes:
+        if result.masks is None or len(result.masks) != len(boxes):
+            raise Problem("模型返回的实例掩膜与目标不匹配", 422)
+        polygons = result.masks.xy
+    if task == "hand_pose" and boxes:
+        if result.keypoints is None or tuple(result.keypoints.data.shape[:2]) != (len(boxes), HAND_COUNT):
+            raise Problem("模型未为每只手返回 21 个关键点", 422)
+        keypoints = result.keypoints.data.detach().cpu().tolist()
+    for index, values in enumerate(boxes):
+        left, top, right, bottom, score, class_id = values
+        if (not all(math.isfinite(value) for value in values)
+                or not 0 <= class_id < len(names) or int(class_id) != class_id):
+            raise Problem("模型返回无效的检测框或类别", 422)
+        left, right = max(0, left), min(width, right)
+        top, bottom = max(0, top), min(height, bottom)
+        if right <= left or bottom <= top:
+            continue
+        shape = {"label": names[int(class_id)], "score": score, "shape_type": "rectangle",
+                 "points": [[left, top], [right, top], [right, bottom], [left, bottom]]}
+        if polygons is not None:
+            if not all(math.isfinite(coord) for point in polygons[index] for coord in point):
+                raise Problem("实例掩膜包含无效坐标", 422)
+            points = [[min(width, max(0, float(x))), min(height, max(0, float(y)))] for x, y in polygons[index]]
+            if len(points) < 3 or polygon_area(points) < 5e-9:
+                continue
+            shape.update(shape_type="polygon", points=points)
+        if keypoints is not None:
+            hand = []
+            for x, y, *confidence in keypoints[index]:
+                if not all(math.isfinite(value) for value in (x, y, *confidence)):
+                    raise Problem("模型返回无效的手部关键点", 422)
+                if confidence and confidence[0] < .25:
+                    hand.append([0, 0, 0])
+                    continue
+                x, y = min(width, max(0, x)), min(height, max(0, y))
+                hand.append([x, y, 1 if confidence and confidence[0] < .50 else 2])
+                left, top, right, bottom = min(left, x), min(top, y), max(right, x), max(bottom, y)
+            if not any(point[2] for point in hand):
+                continue
+            shape.update(shape_type="hand", points=[[left, top], [right, bottom]], keypoints=hand)
+        yield shape
 
 
 class Inference:
@@ -59,6 +133,8 @@ class Inference:
 
     def predict(self, project_id, item_id, options, *, model_path=None, model_sha256=None):
         project = self.store.project(project_id)
+        task = project.task_type
+        project_names = model_labels(task, project.names)
         path = Path(model_path or project.config.get("model_path", ""))
         if path.suffix.lower() != ".pt" or not path.is_file():
             raise Problem("未配置可信的本地 .pt 模型；不会联网下载权重", 422)
@@ -69,8 +145,8 @@ class Inference:
             raise Problem("置信度必须在 0.01 到 1 之间", 422)
         if not isinstance(iou, (int, float)) or not 0.01 <= iou <= 1:
             raise Problem("IoU 必须在 0.01 到 1 之间", 422)
-        if not isinstance(image_size, int) or image_size not in (640, 960, 1280):
-            raise Problem("输入尺寸必须为 640、960 或 1280", 422)
+        if not isinstance(image_size, int) or image_size not in (320, 640, 960, 1280):
+            raise Problem("输入尺寸必须为 320、640、960 或 1280", 422)
         with self.prediction_slot():
             import torch
             from ultralytics import YOLO
@@ -83,44 +159,37 @@ class Inference:
                 fingerprint = digest(path)
                 if model_sha256 and model_sha256 != fingerprint:
                     raise Problem("工作流所选权重已变化，请恢复该版本或新建任务", 422)
-                candidate = YOLO(str(path), task="detect")
-                if candidate.task != "detect":
-                    raise Problem("当前仅支持目标检测模型；不将分割或分类输出当成检测框", 422)
-                model_class_names(candidate.names, project.names)
+                candidate = YOLO(str(path))
+                validate_model_task(candidate, task)
+                model_class_names(candidate.names, project_names)
                 self.model = candidate
                 self.model_digest = fingerprint
                 self.signature = signature
                 self.device = 0 if torch.cuda.is_available() else "cpu"
             if model_sha256 and self.model_digest != model_sha256:
                 raise Problem("工作流所选权重已变化，请恢复该版本或新建任务", 422)
-            names = model_class_names(self.model.names, project.names)
+            validate_model_task(self.model, task)
+            names = model_class_names(self.model.names, project_names)
             current = self.store.detail(project_id, item_id)
+            width, height = current["width"], current["height"]
+            if task == "semantic" and width * height > MAX_MASK_PIXELS:
+                raise Problem("语义掩膜最多支持 3200 万像素", 422)
             item = project.item(item_id)
             with Image.open(item["path"]) as image:
                 result = self.model.predict(source=image.convert("RGB"), conf=confidence, iou=iou,
                                             imgsz=image_size, device=self.device, max_det=300,
                                             verbose=False, save=False, half=False)[0]
-            if tuple(result.orig_shape) != (current["height"], current["width"]):
+            if tuple(result.orig_shape) != (height, width):
                 raise Problem("模型返回尺寸与原图不一致", 422)
-            if not torch.isfinite(result.boxes.data).all().item():
-                raise Problem("模型返回非有限坐标", 422)
-            shapes = []
-            for index, values in enumerate(result.boxes.data.detach().cpu().tolist()):
-                left, top, right, bottom, score, class_id = values
-                left, right = max(0, left), min(current["width"], right)
-                top, bottom = max(0, top), min(current["height"], bottom)
-                if right <= left or bottom <= top:
-                    continue
-                shapes.append({"label": names[int(class_id)], "score": score,
-                               "points": [[left, top], [right, top], [right, bottom], [left, bottom]],
-                               "shape_type": "rectangle", "group_id": None, "description": "",
-                               "flags": {}, "attributes": {}, "difficult": False,
-                               "prediction_origin": "model_prediction",
-                               "prediction_id": f"{item_id}:{index}:{self.model_digest[:12]}"})
+            shapes = [{**shape, "group_id": None, "description": "", "flags": {}, "attributes": {},
+                       "difficult": False, "prediction_origin": "model_prediction",
+                       "prediction_id": f"{item_id}:{index}:{self.model_digest[:12]}"}
+                      for index, shape in enumerate(prediction_shapes(result, task, names, width, height))]
+            output = result.semantic_mask if task == "semantic" else result.boxes
             provenance = {"model_path": str(path), "model_sha256": self.model_digest,
                           "class_names": names, "project_class_names": list(project.names),
-                          "confidence": confidence, "iou": iou,
-                          "image_size": image_size, "device": str(result.boxes.data.device),
+                          "task_type": task, "confidence": confidence, "iou": iou,
+                          "image_size": image_size, "device": str(output.data.device),
                           "image_sha256": current["image_sha256"], "created_at": now(),
                           "human_reviewed": False, "speed_ms": result.speed}
             return {"shapes": shapes, "provenance": provenance, "base_version": current["version"],
@@ -174,6 +243,7 @@ class Jobs:
         self.inference.lock.release()
 
     def start(self, project_id, options, *, audit=False, routing=False, task_id=None, pinned_model=None):
+        project = self.store.project(project_id)
         limit = options.get("limit", 100)
         query, batch = options.get("query", ""), options.get("batch", "")
         if type(limit) is not int or not 1 <= limit <= 10000:
@@ -181,7 +251,9 @@ class Jobs:
         if not isinstance(query, str) or not isinstance(batch, str):
             raise Problem("批次和关键词必须为文本", 422)
         if audit:
-            model = Path(self.store.project(project_id).config.get("model_path") or "")
+            if project.task_type != "detect":
+                raise Problem("按框查找标注疑点适用于目标检测项目", 422)
+            model = Path(project.config.get("model_path") or "")
             if model.suffix.lower() != ".pt" or not model.is_file():
                 raise Problem("请在模型设置中保存一个本地检测模型，再扫描标注疑点", 422)
             options = {**options, "confidence": options.get("confidence", .60)}
@@ -189,7 +261,7 @@ class Jobs:
                 raise Problem("疑点置信度需在 0.05 到 1 之间", 422)
         status = "review" if routing else "auditable" if audit else "curated" if options.get("curated") is True else "unstarted"
         listing = self.store.listing(project_id, query=query, batch=batch, status=status,
-                                     limit=len(self.store.project(project_id).items) if routing else limit)
+                                     limit=len(project.items) if routing else limit)
         routes = self.store.review_routes(project_id) if routing else {}
         ids = []
         for item in listing["items"]:

@@ -15,6 +15,7 @@ from pathlib import Path
 from .blindsets import reserve_blind_images
 from .exporting import DatasetFolder, SPLIT_UNITS, describe_export, plan_splits, prepare_export, write_members
 from .store import Problem, atomic_json, digest, now, read_json
+from .tasks import EXPORT_FORMATS
 
 
 ACTIVE_TRAINING = ("preparing", "running")
@@ -61,7 +62,8 @@ def has_training_dependencies():
 
 
 def training_selection(store, project_id, options, checkpoint=None):
-    data_options = {"format": "yolo", "batch": options["batch"], "clean": True}
+    task = store.project(project_id).task_type
+    data_options = {"format": EXPORT_FORMATS[task][0], "batch": options["batch"], "clean": True}
     plan = prepare_export(store, project_id, data_options, include_documents=True, checkpoint=checkpoint)
     return plan, reserve_blind_images(store, project_id, plan.rows)
 
@@ -126,7 +128,8 @@ class TrainingJobs:
                 if weights.suffix.lower() != ".pt" or not weights.is_file():
                     raise Problem("请先在模型设置里选择可信的本地 .pt 权重，或选择从零训练", 422)
             run_id = task_id or uuid.uuid4().hex
-            record = {"id": run_id, "project": project_id, "status": "preparing", "created_at": now(), "options": options}
+            record = {"id": run_id, "project": project_id, "status": "preparing", "created_at": now(),
+                      "options": options, "task_type": project.task_type}
             if expected_dataset is not None:
                 record["expected_dataset"] = expected_dataset
             with self.lock:
@@ -214,7 +217,7 @@ class TrainingJobs:
                 starting = run / "starting.pt"
                 shutil.copyfile(weights, starting)
                 updates["starting_sha256"] = digest(starting)
-            atomic_json(run / "train.json", {"options": options, "classes": names})
+            atomic_json(run / "train.json", {"options": options, "classes": names, "task_type": plan.project.task_type})
             checkpoint()
             updates.update(split_counts=plan.split_counts, cleaned_out=len(plan.cleaning))
             with self.lock:

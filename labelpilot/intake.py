@@ -93,7 +93,7 @@ def rare_labels(store, project_id, minimum):
     counts = Counter()
     for row in store.overlay(project_id, include_documents=True).values():
         if row["status"] == "reviewed":
-            counts.update(shape["label"] for shape in row["document"]["shapes"])
+            counts.update(shape["label"] for shape in row["document"]["shapes"] if not shape.get("erase"))
     return {name for name in store.project(project_id).names if counts[name] < minimum}
 
 
@@ -108,10 +108,9 @@ def models_disagree(classes, primary, secondary):
 def route_review(store, project_id, item_id, current, prediction, rare, low, key):
     shapes = current["document"]["shapes"]
     names = store.project(project_id).names
-    store.validate(store.project(project_id), current["document"], current["width"], current["height"], "draft", False)
-    empty = not shapes
+    empty = store.validate(store.project(project_id), current["document"], current["width"], current["height"], "draft", False)
     low_score = any(type(shape.get("score")) in (float, int) and shape["score"] < low for shape in shapes)
-    sparse = sorted({shape["label"] for shape in shapes if shape["label"] in rare})
+    sparse = sorted({shape["label"] for shape in shapes if not empty and not shape.get("erase") and shape["label"] in rare})
     disagree = prediction is not None and models_disagree(names, shapes, prediction["shapes"])
     reasons = (["empty"] if empty else []) + (["disagree"] if disagree else [])
     reasons += (["rare"] if sparse else []) + (["low"] if low_score else [])

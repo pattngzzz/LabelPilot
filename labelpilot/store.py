@@ -4,12 +4,15 @@ import json
 import math
 import sqlite3
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 from PIL import Image
+
+from .tasks import BACKGROUND, HAND_KEYPOINTS, HAND_SKELETON, MAX_MASK_PIXELS, SHAPE_TYPES, polygon_area, read_mask, semantic_mask, validate_hand
 
 
 STATUSES = ("unstarted", "imported", "predicted", "draft", "reviewed", "skipped", "error")
@@ -46,7 +49,9 @@ def review_info(document):
     objects = [shape for shape in shapes if isinstance(shape, dict)]
     scores = [shape.get("score") for shape in objects]
     confidence = min((score for score in scores if type(score) in (int, float) and 0 <= score < REVIEW_CONFIDENCE), default=None)
-    return {"empty": not shapes, "difficult": any(shape.get("difficult") is True for shape in objects),
+    metadata = document.get("labelpilot")
+    empty = not shapes or (isinstance(metadata, dict) and metadata.get("semantic_empty") is True)
+    return {"empty": empty, "difficult": any(shape.get("difficult") is True for shape in objects),
             "low_confidence": confidence is not None, "confidence": confidence}
 
 
@@ -77,7 +82,15 @@ def atomic_json(path, value):
     temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
     try:
         temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(path)
+        for attempt in range(6):
+            try:
+                temporary.replace(path)
+                break
+            except PermissionError as exc:
+                # Windows readers briefly hold a sharing lock during progress polling.
+                if getattr(exc, "winerror", None) not in (5, 32, 33) or attempt == 5:
+                    raise
+                time.sleep(.02 * (attempt + 1))
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -112,7 +125,12 @@ class Project:
         self.config = copy.deepcopy(config)
         self.id = config["id"]
         self.root = Path(config["image_root"]).resolve()
+        self.task_type = config.get("task_type", "detect")
+        if not isinstance(self.task_type, str) or self.task_type not in SHAPE_TYPES:
+            raise Problem("请选择有效的项目任务类型", 422)
         self.names = load_classes(config)
+        if self.task_type == "semantic" and (BACKGROUND in self.names or len(self.names) > 254):
+            raise Problem("语义分割最多支持 254 个前景类别，background 为保留类别", 422)
         self.intake = intake or {}
         self.items = []
         self.by_id = {}
@@ -233,13 +251,17 @@ class Project:
             raise Problem("图片不存在", 404)
 
     def summary(self):
-        return {"id": self.id, "name": self.config["name"], "image_root": str(self.root),
+        result = {"id": self.id, "name": self.config["name"], "image_root": str(self.root), "task_type": self.task_type,
                 "classes": [{"id": index, "name": name, "display": name,
                              "color": COLORS[index % len(COLORS)]} for index, name in enumerate(self.names)],
                 "model_path": self.config.get("model_path", ""), "total": len(self.items),
                 "batches": sorted({item["batch"] for item in self.items}),
                 "has_source_groups": any(item["source_group"] != "unassigned" for item in self.items),
                 "warnings": self.warnings}
+        if self.task_type == "hand_pose":
+            result["keypoints"] = [{"name": name, "label": label} for name, label in HAND_KEYPOINTS]
+            result["skeleton"] = HAND_SKELETON
+        return result
 
 
 class Store:
@@ -350,6 +372,8 @@ class Store:
     def register(self, config):
         config = copy.deepcopy(config)
         config["id"] = uuid.uuid4().hex[:12]
+        if config.get("task_type") == "hand_pose" and not (config.get("classes") or config.get("class_map_path")):
+            config["classes"] = ["hand"]
         if not isinstance(config.get("name"), str) or not config["name"].strip():
             raise Problem("请填写项目名称")
         root = Path(config.get("image_root", "")).resolve()
@@ -400,6 +424,8 @@ class Store:
             project = self.project(project_id)
             if name in project.names:
                 return project.summary()
+            if project.task_type == "semantic" and (name == BACKGROUND or len(project.names) >= 254):
+                raise Problem("语义分割最多支持 254 个前景类别，background 为保留类别", 422)
             names = project.names + [name]
             configs = copy.deepcopy(self.configs)
             config = next(config for config in configs if config["id"] == project_id)
@@ -603,6 +629,8 @@ class Store:
             version, status = 0, "unstarted"
         if (document.get("imageWidth"), document.get("imageHeight")) != (width, height):
             raise Problem("原生标注尺寸与原图不一致", 409)
+        if not row and item["source"] and project.task_type != "detect":
+            self.validate(project, document, width, height, "draft", False)
         return {"item": {key: value for key, value in item.items() if key != "path"},
                 "document": document, "version": version, "status": status,
                 "width": width, "height": height, "image_sha256": image_digest,
@@ -616,14 +644,20 @@ class Store:
             raise Problem("shapes 必须是数组且不超过 10000 个对象", 422)
         if (document.get("imageWidth"), document.get("imageHeight")) != (width, height):
             raise Problem("不能修改图片尺寸", 422)
+        task = project.task_type
+        if task == "semantic" and width * height > MAX_MASK_PIXELS:
+            raise Problem("语义掩膜最多支持 3200 万像素", 422)
         for shape in shapes:
             if not isinstance(shape, dict) or shape.get("label") not in project.names:
                 raise Problem("存在项目字典之外的类别；不会自动改类", 422)
             kind = shape.get("shape_type")
             points = shape.get("points")
-            if kind not in ("rectangle", "polygon") or not isinstance(points, list):
-                raise Problem("仅支持矩形和多边形标注", 422)
-            if (kind == "rectangle" and len(points) not in (2, 4)) or (kind == "polygon" and len(points) < 3):
+            if kind not in SHAPE_TYPES[task] or not isinstance(points, list):
+                raise Problem("当前项目任务不支持此标注形状", 422)
+            if ((kind == "rectangle" and len(points) not in (2, 4))
+                    or (kind in ("mask", "hand") and len(points) != 2)
+                    or (kind == "polygon" and len(points) < 3)
+                    or (kind == "brush" and not 1 <= len(points) <= 4096)):
                 raise Problem("标注点数量无效", 422)
             for point in points:
                 if not isinstance(point, list) or len(point) != 2:
@@ -632,15 +666,32 @@ class Store:
                     raise Problem("坐标必须是有限数值", 422)
                 if not 0 <= point[0] <= width or not 0 <= point[1] <= height:
                     raise Problem("标注超出原图边界；不会静默裁切", 422)
-            if max(point[0] for point in points) <= min(point[0] for point in points) or max(point[1] for point in points) <= min(point[1] for point in points):
+            if kind == "brush":
+                radius = shape.get("radius")
+                if type(radius) is not int or not 1 <= radius <= 256 or type(shape.get("erase", False)) is not bool:
+                    raise Problem("笔刷半径必须为 1 到 256 像素的整数", 422)
+                continue
+            if shape.get("erase"):
+                raise Problem("橡皮仅支持笔刷图层", 422)
+            xs, ys = zip(*points)
+            left, top, right, bottom = min(xs), min(ys), max(xs), max(ys)
+            if right <= left or bottom <= top:
                 raise Problem("标注面积必须大于零", 422)
-            if kind == "polygon":
-                signed_area = sum(points[index][0] * points[(index + 1) % len(points)][1] -
-                                  points[(index + 1) % len(points)][0] * points[index][1] for index in range(len(points)))
-                if abs(signed_area) < 1e-8:
-                    raise Problem("多边形面积必须大于零", 422)
-        if status == "reviewed" and not shapes and not confirmed_empty:
+            if kind == "polygon" and polygon_area(points) < 5e-9:
+                raise Problem("多边形面积必须大于零", 422)
+            try:
+                if kind == "mask":
+                    read_mask(shape)
+                elif kind == "hand":
+                    validate_hand(shape, (left, top, right, bottom))
+            except ValueError as exc:
+                raise Problem(str(exc), 422) from exc
+        empty = not shapes
+        if task == "semantic" and any(shape.get("erase") for shape in shapes):
+            empty = semantic_mask(shapes, project.names, width, height).getbbox() is None
+        if status == "reviewed" and empty and confirmed_empty is not True:
             raise Problem("空标注不能自动作为负样本；请明确确认此图没有目标", 422)
+        return empty
 
     def save(self, project_id, item_id, payload, predicted=False):
         return self.save_many(project_id, [(item_id, payload)], predicted=predicted)[0]
@@ -660,7 +711,7 @@ class Store:
             raise Problem("批量预标注不能覆盖任何已有标注", 409)
         document = copy.deepcopy(payload.get("document", {}))
         status = payload["status"]
-        self.validate(project, document, current["width"], current["height"], status, payload.get("confirmed_empty", False))
+        empty = self.validate(project, document, current["width"], current["height"], status, payload.get("confirmed_empty", False))
         version = current["version"] + 1
         timestamp = now()
         previous_meta = current["document"].get("labelpilot", {})
@@ -669,14 +720,16 @@ class Store:
                                   "updated_at": timestamp, "image_sha256": current["image_sha256"],
                                   "source_annotation": current["item"].get("source"),
                                   "source_fingerprint": current["source_fingerprint"],
-                                  "negative_sample_confirmed": status == "reviewed" and not document["shapes"],
+                                  "negative_sample_confirmed": status == "reviewed" and empty,
                                   "human_reviewed": status == "reviewed",
                                   "prediction": provenance}
+        if project.task_type == "semantic":
+            document["labelpilot"]["semantic_empty"] = empty
         document["checked"] = status == "reviewed"
         document["imageData"] = None
         if isinstance(document.get("preannotation"), dict):
             document["preannotation"]["human_reviewed"] = status == "reviewed"
-            document["preannotation"]["negative_sample_confirmed"] = status == "reviewed" and not document["shapes"]
+            document["preannotation"]["negative_sample_confirmed"] = status == "reviewed" and empty
             document["preannotation"]["status"] = "human_reviewed" if status == "reviewed" else "model_prediction_unreviewed"
         result = {"version": version, "status": status, "document": document, "updated": timestamp}
         return current, result

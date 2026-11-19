@@ -80,6 +80,8 @@ def freeze_blindset(store, project_id, payload):
     percent = payload.get("percent", 20)
     seed = payload.get("seed", 42)
     project = store.project(project_id)
+    if project.task_type != "detect":
+        raise Problem("固定盲测模型对比适用于目标检测项目", 422)
     unit = payload.get("unit", "source_group" if project.summary()["has_source_groups"] else "image")
     if not isinstance(name, str) or not 1 <= len(name.strip()) <= 64 or any(ord(char) < 32 for char in name.strip()):
         raise Problem("请输入 1 到 64 个字符的盲测集名称", 422)

@@ -86,7 +86,8 @@ def create_app(home=None):
     @app.get("/", response_class=HTMLResponse)
     def index():
         version = hashlib.sha256(b"".join((ASSETS / name).read_bytes() for name in
-                                         ("index.html", "efficiency.js", "resume.js", "automation.js", "app.js", "style.css"))).hexdigest()[:16]
+                                         ("index.html", "efficiency.js", "resume.js", "automation.js", "task-tools.js",
+                                          "app.js", "style.css", "realityloop.png"))).hexdigest()[:16]
         return (ASSETS / "index.html").read_text(encoding="utf-8").replace(
             "__SESSION_TOKEN__", app.state.token).replace("__ASSET_VERSION__", version)
 

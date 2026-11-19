@@ -902,7 +902,8 @@ def test_model_allows_append_only_custom_labels():
 def test_asset_versions_change_with_frontend_content(dataset, tmp_path, monkeypatch):
     assets = tmp_path / "frontend"
     assets.mkdir()
-    for name in ("index.html", "efficiency.js", "resume.js", "automation.js", "app.js", "style.css"):
+    for name in ("index.html", "efficiency.js", "resume.js", "automation.js", "task-tools.js",
+                 "app.js", "style.css", "realityloop.png"):
         (assets / name).write_bytes((server.ASSETS / name).read_bytes())
     monkeypatch.setattr(server, "ASSETS", assets)
     with TestClient(create_app(dataset[0])) as client:

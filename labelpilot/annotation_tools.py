@@ -7,6 +7,8 @@ from pathlib import Path, PurePosixPath
 
 from PIL import Image
 
+from .tasks import MAX_MASK_PIXELS, mask_shape, polygon_area
+
 from .evaluation import iou
 from .store import Problem, source_group
 
@@ -175,26 +177,33 @@ def prompt_points(value, width, height):
 
 
 def prompt_box(store, project_id, item_id, payload):
+    project = store.project(project_id)
+    if project.task_type == "hand_pose":
+        raise Problem("手部项目使用关键点工具或 21 点模型预标注", 422)
     current = store.detail(project_id, item_id)
     if payload.get("image_sha256") != current["image_sha256"]:
         raise Problem("原图已变化，请重新载入", 409)
     width, height = current["width"], current["height"]
+    if project.task_type == "semantic" and width * height > MAX_MASK_PIXELS:
+        raise Problem("语义掩膜最多支持 3200 万像素", 422)
     positive = prompt_points(payload.get("positive", []), width, height)
     negative = prompt_points(payload.get("negative", []), width, height)
     if not positive:
         raise Problem("请先点击目标内的前景点", 422)
-    path = Path(store.project(project_id).item(item_id)["path"])
+    path = Path(project.item(item_id)["path"])
     contents = path.read_bytes()
     if hashlib.sha256(contents).hexdigest() != current["image_sha256"]:
         raise Problem("原图已变化，请重新载入", 409)
     with Image.open(io.BytesIO(contents)) as original:
         image = original.convert("RGB")
         image.thumbnail((640, 640), Image.Resampling.BILINEAR)
-    box = segment_prompt(image, positive, negative, (width, height))
-    return {"box": box, "image_sha256": current["image_sha256"]}
+    result = segment_prompt(image, positive, negative, (width, height), project.task_type)
+    if project.task_type == "detect":
+        result = {"box": result}
+    return {**result, "image_sha256": current["image_sha256"]}
 
 
-def segment_prompt(image, positive, negative, original_size):
+def segment_prompt(image, positive, negative, original_size, task="detect"):
     try:
         import cv2
         import numpy as np
@@ -229,9 +238,26 @@ def segment_prompt(image, positive, negative, original_size):
     except cv2.error as exc:
         raise Problem("当前提示点无法分离前景，请补充目标内外的点", 422) from exc
     _, segments = cv2.connectedComponents((mask % 2).astype(np.uint8), connectivity=8)
-    ys, xs = np.nonzero(np.isin(segments, [segments[y, x] for x, y in inside]))
+    selected = np.isin(segments, [segments[y, x] for x, y in inside])
+    ys, xs = np.nonzero(selected)
     if len(xs) < 4 or xs.min() == xs.max() or ys.min() == ys.max() or len(xs) > width * height * .98:
         raise Problem("尚未得到清晰的前景轮廓，请补充目标内或背景提示点", 422)
     x_scale, y_scale = original_size[0] / width, original_size[1] / height
-    return [float(xs.min()) * x_scale, float(ys.min()) * y_scale,
-            float(xs.max() + 1) * x_scale, float(ys.max() + 1) * y_scale]
+    box = [float(xs.min()) * x_scale, float(ys.min()) * y_scale,
+           float(xs.max() + 1) * x_scale, float(ys.max() + 1) * y_scale]
+    if task == "detect":
+        return box
+    response = {"box": box}
+    if task == "segment":
+        contours, _ = cv2.findContours(selected.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if len(contours) != 1:
+            raise Problem("每次点选一个独立实例，请将前景点放到同一个对象上", 422)
+        contour = cv2.approxPolyDP(contours[0], 0.75, True).reshape(-1, 2)
+        points = [[float(x) * x_scale, float(y) * y_scale] for x, y in contour]
+        if len(points) < 3 or not polygon_area(points):
+            raise Problem("前景轮廓太小，请补充提示点", 422)
+        response["shape"] = {"shape_type": "polygon", "points": points}
+    elif task == "semantic":
+        foreground = Image.fromarray(selected.astype(np.uint8) * 255).resize(original_size, Image.Resampling.NEAREST)
+        response["shape"] = mask_shape(foreground)
+    return response

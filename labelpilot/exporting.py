@@ -11,9 +11,12 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Optional
 
+from PIL import Image
+
 from .augmentation import augmented_variants, plan_augmentation, validate_augmented_sample
 from .cleaning import clean_selection
 from .store import Problem, Project, digest, now, read_annotation_snapshot, source_group
+from .tasks import EXPORT_FORMATS, HAND_COUNT, HAND_KEYPOINTS, HAND_SKELETON, model_labels, polygon_area, semantic_mask
 
 
 SPLIT_NAMES = ("train", "val", "test")
@@ -129,15 +132,18 @@ class ExportPlan:
 
 def prepare_export(store, project_id, options, *, include_documents=False, checkpoint=None, allow_empty_cleaning=False):
     project = store.project(project_id)
-    format_name = options.get("format", "yolo")
-    if format_name not in ("yolo", "labelme", "coco"):
-        raise Problem("导出格式必须为 yolo、labelme 或 coco", 422)
+    formats = EXPORT_FORMATS[project.task_type]
+    format_name = options.get("format", formats[0])
+    if format_name not in formats:
+        raise Problem("请选择当前任务支持的导出格式", 422)
     reviewed_only = options.get("reviewed_only", True)
     include_images = options.get("include_images", True)
     clean = options.get("clean", False)
     if any(type(value) is not bool for value in (reviewed_only, include_images, clean)):
         raise Problem("导出开关必须为布尔值", 422)
     augmentation = plan_augmentation(options)
+    if augmentation and project.task_type in ("semantic", "hand_pose"):
+        raise Problem("当前导出增强仅适用于目标检测和实例分割", 422)
     if clean and not reviewed_only:
         raise Problem("清洗版数据集仅纳入已人工确认的图片", 422)
     batch = options.get("batch")
@@ -227,15 +233,19 @@ def describe_export(store, plan):
         except Problem as exc:
             raise Problem(f"{row['photo_id']}：{exc.message}", exc.status) from exc
         shapes = document["shapes"]
-        objects += len(shapes)
+        labels = [shape["label"] for shape in shapes]
+        if plan.project.task_type == "semantic":
+            mask = semantic_mask(shapes, plan.project.names, width, height)
+            labels = [plan.project.names[value - 1] for _, value in mask.getcolors(256) if value]
+        objects += len(labels)
         if row["status"] == "reviewed":
-            confirmed_empty += not shapes
+            confirmed_empty += not labels
         else:
             unreviewed += 1
-            unreviewed_empty += not shapes
+            unreviewed_empty += not labels
         polygons += any(shape["shape_type"] == "polygon" for shape in shapes)
-        for shape in shapes:
-            class_counts[shape["label"]][subset] += 1
+        for label in labels:
+            class_counts[label][subset] += 1
         group = source_group(row["source_group"])
         if group is None:
             missing_sources += 1
@@ -245,7 +255,7 @@ def describe_export(store, plan):
     blocking_issue = None
     if not plan.rows:
         blocking_issue = "清洗后没有可用图片。请检查排除示例或扩大批次范围"
-    elif plan.format_name == "yolo" and polygons:
+    elif plan.format_name == "yolo" and plan.project.task_type == "detect" and polygons:
         blocking_issue = f"{polygons} 张图片包含多边形。{YOLO_POLYGON_ERROR}"
     return {
         "images": len(plan.rows), "excluded": plan.excluded, "annotations": objects,
@@ -313,7 +323,13 @@ class DatasetFolder:
     def writestr(self, name, content):
         path = self.root / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            path.write_text(content, encoding="utf-8")
+
+    def read(self, name):
+        return (self.root / name).read_bytes()
 
 
 def write_verified_image(archive, source, name, expected_digest):
@@ -336,9 +352,22 @@ def labelme_shapes(shapes):
     return result
 
 
+def yolo_values(shape, width, height):
+    if shape["shape_type"] == "polygon":
+        return [coord / size for x, y in shape["points"] for coord, size in ((x, width), (y, height))]
+    xs, ys = zip(*shape["points"])
+    left, right, top, bottom = min(xs), max(xs), min(ys), max(ys)
+    values = [(left + right) / (2 * width), (top + bottom) / (2 * height),
+              (right - left) / width, (bottom - top) / height]
+    if shape["shape_type"] == "hand":
+        values.extend(coord for x, y, visibility in shape["keypoints"] for coord in (x / width, y / height, visibility))
+    return values
+
+
 def write_annotation(archive, format_name, project, document, image_name, subset, split_config, coco_documents, image_index):
     suffix = f"/{subset}" if split_config else ""
     base_name = Path(image_name).stem
+    width, height = document["imageWidth"], document["imageHeight"]
     if format_name == "labelme":
         document["imagePath"] = ("../../" if split_config else "../") + image_name
         document["imageData"] = None
@@ -347,14 +376,16 @@ def write_annotation(archive, format_name, project, document, image_name, subset
     elif format_name == "yolo":
         lines = []
         for shape in document["shapes"]:
-            if shape["shape_type"] != "rectangle":
+            if project.task_type == "detect" and shape["shape_type"] != "rectangle":
                 raise Problem(YOLO_POLYGON_ERROR, 422)
-            xs, ys = zip(*shape["points"])
-            left, right, top, bottom = min(xs), max(xs), min(ys), max(ys)
-            values = [(left + right) / 2 / document["imageWidth"], (top + bottom) / 2 / document["imageHeight"],
-                      (right - left) / document["imageWidth"], (bottom - top) / document["imageHeight"]]
+            values = yolo_values(shape, width, height)
             lines.append(str(project.names.index(shape["label"])) + " " + " ".join(f"{value:.12f}" for value in values))
         archive.writestr(f"labels{suffix}/{base_name}.txt", "\n".join(lines) + ("\n" if lines else ""))
+    elif format_name == "mask":
+        mask = semantic_mask(document["shapes"], project.names, width, height)
+        with io.BytesIO() as buffer:
+            mask.save(buffer, format="PNG")
+            archive.writestr(f"masks{suffix}/{base_name}.png", buffer.getvalue())
     else:
         coco = coco_documents[subset]
         coco["images"].append({"id": image_index, "file_name": image_name,
@@ -363,16 +394,16 @@ def write_annotation(archive, format_name, project, document, image_name, subset
             xs, ys = zip(*shape["points"])
             width, height = max(xs) - min(xs), max(ys) - min(ys)
             polygon = shape["points"]
-            if shape["shape_type"] == "polygon":
-                area = abs(sum(polygon[index][0] * polygon[(index + 1) % len(polygon)][1] -
-                               polygon[(index + 1) % len(polygon)][0] * polygon[index][1]
-                               for index in range(len(polygon)))) / 2
-            else:
-                area = width * height
-            coco["annotations"].append({"id": len(coco["annotations"]) + 1, "image_id": image_index,
-                                        "category_id": project.names.index(shape["label"]) + 1,
-                                        "bbox": [min(xs), min(ys), width, height], "area": area, "iscrowd": 0,
-                                        "segmentation": [[value for point in polygon for value in point]] if shape["shape_type"] == "polygon" else []})
+            is_polygon = shape["shape_type"] == "polygon"
+            entry = {"id": len(coco["annotations"]) + 1, "image_id": image_index,
+                     "category_id": project.names.index(shape["label"]) + 1,
+                     "bbox": [min(xs), min(ys), width, height],
+                     "area": polygon_area(polygon) if is_polygon else width * height, "iscrowd": 0,
+                     "segmentation": [[value for point in polygon for value in point]] if is_polygon else []}
+            if shape["shape_type"] == "hand":
+                entry["keypoints"] = [coord for point in shape["keypoints"] for coord in point]
+                entry["num_keypoints"] = sum(point[2] > 0 for point in shape["keypoints"])
+            coco["annotations"].append(entry)
 
 
 def verify_export_annotation(archive, format_name, project, document, image_name, subset, split_config,
@@ -383,6 +414,7 @@ def verify_export_annotation(archive, format_name, project, document, image_name
     suffix = f"/{subset}" if split_config else ""
     base_name = Path(image_name).stem
     shapes = document["shapes"]
+    width, height = document["imageWidth"], document["imageHeight"]
     if format_name == "labelme":
         decoded = json.loads(archive.read(f"annotations{suffix}/{base_name}.json"))
         if (decoded.get("shapes") != labelme_shapes(shapes) or decoded.get("imageWidth") != document["imageWidth"]
@@ -392,24 +424,23 @@ def verify_export_annotation(archive, format_name, project, document, image_name
     elif format_name == "yolo":
         lines = archive.read(f"labels{suffix}/{base_name}.txt").decode().splitlines()
         if len(lines) != len(shapes):
-            reject("YOLO 框数量不一致")
-        width, height = document["imageWidth"], document["imageHeight"]
-        tolerance = max(width, height) * 1e-12 + 1e-9
+            reject("YOLO 对象数量不一致")
         for line, shape in zip(lines, shapes):
             values = line.split()
+            expected = yolo_values(shape, width, height)
             try:
-                if len(values) != 5 or int(values[0]) != project.names.index(shape["label"]):
+                if len(values) != len(expected) + 1 or int(values[0]) != project.names.index(shape["label"]):
                     reject("YOLO 类别或字段不一致")
-                center_x, center_y, box_width, box_height = map(float, values[1:])
+                actual = list(map(float, values[1:]))
             except ValueError as error:
                 raise Problem("YOLO 导出坐标无法解析，已中止导出", 422) from error
-            actual = [(center_x - box_width / 2) * width, (center_y - box_height / 2) * height,
-                      (center_x + box_width / 2) * width, (center_y + box_height / 2) * height]
-            xs, ys = zip(*shape["points"])
-            expected = [min(xs), min(ys), max(xs), max(ys)]
-            if (box_width <= 0 or box_height <= 0 or any(not math.isfinite(value) for value in actual)
-                    or any(abs(first - second) > tolerance for first, second in zip(actual, expected))):
-                reject("YOLO 框坐标与原标注不一致")
+            if any(not math.isclose(a, b, rel_tol=0, abs_tol=1e-12) for a, b in zip(actual, expected)):
+                reject("YOLO 坐标与原标注不一致")
+    elif format_name == "mask":
+        expected = semantic_mask(shapes, project.names, width, height)
+        with Image.open(io.BytesIO(archive.read(f"masks{suffix}/{base_name}.png"))) as actual:
+            if actual.mode != "L" or actual.size != expected.size or actual.tobytes() != expected.tobytes():
+                reject("语义掩膜像素或尺寸不一致")
     else:
         coco = coco_documents[subset]
         expected_image = {"id": image_index, "file_name": image_name,
@@ -426,6 +457,10 @@ def verify_export_annotation(archive, format_name, project, document, image_name
             if (actual.get("image_id") != image_index or actual.get("category_id") != project.names.index(shape["label"]) + 1
                     or actual.get("bbox") != expected_box or actual.get("segmentation") != expected_polygon):
                 reject("COCO 类别、坐标或多边形不一致")
+            if shape["shape_type"] == "hand" and (
+                    actual.get("keypoints") != [coord for point in shape["keypoints"] for coord in point]
+                    or actual.get("num_keypoints") != sum(point[2] > 0 for point in shape["keypoints"])):
+                reject("COCO 关键点或可见性不一致")
 
 
 def write_members(store, plan, archive, fingerprints, *, checkpoint=None):
@@ -437,7 +472,7 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None):
         split_counts["train"] += augmented_images
     unit = split_config["unit"] if split_config else None
     project_id = project.id
-    manifest = {"project": project_id, "format": format_name, "created_at": now(),
+    manifest = {"project": project_id, "task_type": project.task_type, "format": format_name, "created_at": now(),
                 "reviewed_only": plan.reviewed_only, "include_images": plan.include_images,
                 "classes": project.names, "split": {"image": "random_by_image", "source_group": "grouped_by_source",
                                                      "directory": "grouped_by_directory"}.get(unit, "unassigned"),
@@ -448,8 +483,13 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None):
                  "source_group": "按任务清单来源组划分，实际比例取决于各组图量",
                  "directory": "按原图文件夹划分，分散在不同文件夹的同源图片可能跨集"}.get(unit, "未划分 train/val/test")}
     subsets = [name for name in SPLIT_NAMES if split_counts[name]] if split_config else ["unassigned"]
-    coco_documents = {name: {"images": [], "annotations": [], "categories": [
-        {"id": index + 1, "name": label} for index, label in enumerate(project.names)]} for name in subsets}
+    categories = [{"id": index + 1, "name": label} for index, label in enumerate(project.names)]
+    if project.task_type == "hand_pose":
+        for category in categories:
+            category.update(keypoints=[name for name, _ in HAND_KEYPOINTS],
+                            skeleton=[[start + 1, end + 1] for start, end in HAND_SKELETON])
+    coco_documents = {name: {"images": [], "annotations": [], "categories": categories} for name in subsets}
+    verify_annotations = augmentation or project.task_type != "detect"
     if plan.cleaning is not None:
         manifest["cleaning"] = plan.cleaning
     for row in rows:
@@ -485,15 +525,16 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None):
                 write_verified_image(archive, item["path"], image_name, current["image_sha256"])
             else:
                 archive.write(item["path"], image_name)
-        source_document = copy.deepcopy(document) if augmentation else None
+        source_document = copy.deepcopy(document) if verify_annotations else None
         annotation_offset = len(coco_documents[subset]["annotations"])
         write_annotation(archive, format_name, project, document, image_name, subset, split_config,
                          coco_documents, len(manifest["items"]))
+        if verify_annotations:
+            verify_export_annotation(archive, format_name, project, source_document, image_name, subset,
+                                     split_config, coco_documents, len(manifest["items"]), annotation_offset)
         if augmentation:
             if hashlib.sha256(archive.read(image_name)).hexdigest() != current["image_sha256"]:
                 raise Problem("原图副本指纹与已保存标注不一致，已中止导出", 409)
-            verify_export_annotation(archive, format_name, project, source_document, image_name, subset,
-                                     split_config, coco_documents, len(manifest["items"]), annotation_offset)
             manifest["items"][-1]["annotation_count"] = len(source_document["shapes"])
         if augmentation and subset == "train":
             for preset in augmentation["presets"]:
@@ -526,17 +567,23 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None):
                                              split_config, coco_documents, len(manifest["items"]), annotation_offset)
                 if produced != settings["copies"]:
                     raise Problem("增强副本数量缺失，已中止导出", 422)
-    archive.writestr("classes.txt", "\n".join(project.names) + "\n")
-    if format_name == "yolo":
+    names = model_labels(project.task_type, project.names)
+    archive.writestr("classes.txt", "\n".join(names) + "\n")
+    if format_name in ("yolo", "mask"):
         paths = "" if not split_config else "".join(
             f"{name}: " + (f"images/{name}" if split_counts[name] else "null") + "\n" for name in SPLIT_NAMES)
+        if format_name == "mask":
+            paths += "masks_dir: masks\n"
+            manifest["mask_classes"] = names
+        elif project.task_type == "hand_pose":
+            paths += f"kpt_shape: [{HAND_COUNT}, 3]\nflip_idx: {list(range(HAND_COUNT))}\n"
         archive.writestr("dataset.yaml", paths + "names:\n" + "\n".join(
-            f"  {index}: {json.dumps(name, ensure_ascii=False)}" for index, name in enumerate(project.names)) + "\n")
+            f"  {index}: {json.dumps(name, ensure_ascii=False)}" for index, name in enumerate(names)) + "\n")
     if format_name == "coco":
         for name, document in coco_documents.items():
             filename = f"annotations/{name}.json" if split_config else "annotations.json"
             archive.writestr(filename, json.dumps(document, ensure_ascii=False))
-            if augmentation and json.loads(archive.read(filename)) != document:
+            if verify_annotations and json.loads(archive.read(filename)) != document:
                 raise Problem("COCO ZIP 回读与已校验标注不一致，已中止导出", 422)
     if augmentation:
         if len(manifest["items"]) != len(rows) + augmented_images:
