@@ -7,7 +7,9 @@ from pathlib import Path
 
 from PIL import Image
 
-from .store import Problem, atomic_json, digest, now, read_json
+from .curation import save_findings
+from .intake import rare_labels, route_review
+from .store import AUDITABLE, PENDING_REVIEW, Problem, atomic_json, digest, now, read_json
 
 
 DISABLED_INTEGRATIONS = ("sync", "hub", "wandb", "mlflow", "comet", "clearml", "dvc", "neptune", "raytune", "tensorboard")
@@ -55,9 +57,9 @@ class Inference:
             if torch.cuda.is_initialized():
                 torch.cuda.empty_cache()
 
-    def predict(self, project_id, item_id, options):
+    def predict(self, project_id, item_id, options, *, model_path=None, model_sha256=None):
         project = self.store.project(project_id)
-        path = Path(project.config.get("model_path", ""))
+        path = Path(model_path or project.config.get("model_path", ""))
         if path.suffix.lower() != ".pt" or not path.is_file():
             raise Problem("未配置可信的本地 .pt 模型；不会联网下载权重", 422)
         confidence = options.get("confidence", 0.25)
@@ -78,14 +80,19 @@ class Inference:
 
             signature = (str(path.resolve()), path.stat().st_size, path.stat().st_mtime_ns)
             if self.signature != signature:
+                fingerprint = digest(path)
+                if model_sha256 and model_sha256 != fingerprint:
+                    raise Problem("工作流所选权重已变化，请恢复该版本或新建任务", 422)
                 candidate = YOLO(str(path), task="detect")
                 if candidate.task != "detect":
                     raise Problem("当前仅支持目标检测模型；不将分割或分类输出当成检测框", 422)
                 model_class_names(candidate.names, project.names)
                 self.model = candidate
-                self.model_digest = digest(path)
+                self.model_digest = fingerprint
                 self.signature = signature
                 self.device = 0 if torch.cuda.is_available() else "cpu"
+            if model_sha256 and self.model_digest != model_sha256:
+                raise Problem("工作流所选权重已变化，请恢复该版本或新建任务", 422)
             names = model_class_names(self.model.names, project.names)
             current = self.store.detail(project_id, item_id)
             item = project.item(item_id)
@@ -149,10 +156,15 @@ class Jobs:
             return sorted([copy.deepcopy(record) for record in self.records.values() if record["project"] == project_id],
                           key=lambda record: record["created_at"], reverse=True)[:20]
 
+    def lookup(self, project_id, job_id):
+        with self.lock:
+            record = self.records.get(job_id)
+            return copy.deepcopy(record) if record and record["project"] == project_id else None
+
     def reserve_model_slot(self):
         with self.lock:
             if any(job["status"] in ("queued", "running") for job in self.records.values()):
-                raise Problem("请等待批量预标注完成或先取消任务", 409)
+                raise Problem("请等待批量预标注或疑点扫描完成，或先取消任务", 409)
             if not self.inference.lock.acquire(blocking=False):
                 raise Problem("模型运行环境正在使用，请等待当前任务结束", 409)
             self.inference.exclusive.set()
@@ -161,23 +173,50 @@ class Jobs:
         self.inference.exclusive.clear()
         self.inference.lock.release()
 
-    def start(self, project_id, options):
+    def start(self, project_id, options, *, audit=False, routing=False, task_id=None, pinned_model=None):
         limit = options.get("limit", 100)
-        if not isinstance(limit, int) or not 1 <= limit <= 10000:
+        query, batch = options.get("query", ""), options.get("batch", "")
+        if type(limit) is not int or not 1 <= limit <= 10000:
             raise Problem("每批数量必须为 1 到 10000", 422)
-        listing = self.store.listing(project_id, query=options.get("query", ""), batch=options.get("batch", ""),
-                                     status="unstarted", limit=10000)
-        ids = [item["id"] for item in listing["items"][:limit]]
+        if not isinstance(query, str) or not isinstance(batch, str):
+            raise Problem("批次和关键词必须为文本", 422)
+        if audit:
+            model = Path(self.store.project(project_id).config.get("model_path") or "")
+            if model.suffix.lower() != ".pt" or not model.is_file():
+                raise Problem("请在模型设置中保存一个本地检测模型，再扫描标注疑点", 422)
+            options = {**options, "confidence": options.get("confidence", .60)}
+            if type(options["confidence"]) not in (int, float) or not .05 <= options["confidence"] <= 1:
+                raise Problem("疑点置信度需在 0.05 到 1 之间", 422)
+        status = "review" if routing else "auditable" if audit else "curated" if options.get("curated") is True else "unstarted"
+        listing = self.store.listing(project_id, query=query, batch=batch, status=status,
+                                     limit=len(self.store.project(project_id).items) if routing else limit)
+        routes = self.store.review_routes(project_id) if routing else {}
+        ids = []
+        for item in listing["items"]:
+            route = routes.get(item["id"], {})
+            if routing and route.get("version") == item.get("version", 0) and route.get("key") == options["route_key"]:
+                continue
+            ids.append(item["id"])
+            if len(ids) == limit:
+                break
         if not ids:
-            raise Problem("当前范围没有未开始图片；已有标注一律不会覆盖", 422)
-        job_id = uuid.uuid4().hex
+            if routing:
+                raise Problem("当前没有需要重新分流的候选图", 422)
+            raise Problem("当前范围没有可复核的人工标注" if audit else "当前范围没有未开始图片；已有标注一律不会覆盖", 422)
+        job_id = task_id or uuid.uuid4().hex
         with self.lock:
             if self.inference.exclusive.is_set():
                 raise Problem("本地训练或模型对比正在占用运行环境", 409)
             if any(record["status"] in ("running", "queued") for record in self.records.values()):
-                raise Problem("已有预标注任务运行中，请先完成或取消", 409)
+                raise Problem("已有批量模型任务运行中，请先完成或取消", 409)
             record = {"id": job_id, "project": project_id, "status": "queued", "total": len(ids),
                       "done": 0, "skipped": 0, "failed": 0, "errors": [], "created_at": now(), "options": options}
+            if audit:
+                record.update(kind="audit", flagged=0)
+            if routing:
+                record.update(kind="routing", flagged=0)
+            if pinned_model:
+                record["pinned_model"] = pinned_model
             self.records[job_id] = record
             self.cancel_events[job_id] = threading.Event()
             atomic_json(self.directory / f"{job_id}.json", record)
@@ -197,7 +236,13 @@ class Jobs:
         record = copy.deepcopy(self.records[job_id])
         project_id = record["project"]
         self.update(job_id, status="running")
-        done = skipped = failed = 0
+        audit = record.get("kind") == "audit"
+        routing = record.get("kind") == "routing"
+        available = PENDING_REVIEW if routing else AUDITABLE if audit else ("unstarted",)
+        options = record["options"]
+        model = record.get("pinned_model", {})
+        rare = rare_labels(self.store, project_id, options["rare"]) if routing else set()
+        done = skipped = failed = flagged = 0
         errors = []
         for item_id in ids:
             if self.cancel_events[job_id].is_set():
@@ -205,18 +250,32 @@ class Jobs:
                 return
             try:
                 current = self.store.detail(project_id, item_id)
-                if current["status"] != "unstarted":
+                if current["status"] not in available:
                     skipped += 1
                 else:
-                    prediction = self.inference.predict(project_id, item_id, record["options"])
+                    if audit:
+                        self.store.validate(self.store.project(project_id), current["document"], current["width"],
+                                            current["height"], "draft", False)
+                    prediction = None
+                    if model:
+                        prediction = self.inference.predict(project_id, item_id, options,
+                                                            model_path=model["path"], model_sha256=model["sha256"])
+                    elif not routing:
+                        prediction = self.inference.predict(project_id, item_id, options)
                     if self.cancel_events[job_id].is_set():
                         self.update(job_id, status="cancelled", finished_at=now())
                         return
-                    document = copy.deepcopy(current["document"])
-                    document["shapes"] = prediction["shapes"]
-                    document["labelpilot"] = {"prediction": prediction["provenance"]}
-                    self.store.save(project_id, item_id, {**current, "document": document,
-                                                          "expected_version": current["version"], "status": "predicted"}, predicted=True)
+                    if routing:
+                        flagged += route_review(self.store, project_id, item_id, current, prediction, rare,
+                                                options["low"], options["route_key"])
+                    elif audit:
+                        flagged += save_findings(self.store, project_id, item_id, current, prediction)
+                    else:
+                        document = copy.deepcopy(current["document"])
+                        document["shapes"] = prediction["shapes"]
+                        document["labelpilot"] = {"prediction": prediction["provenance"]}
+                        self.store.save(project_id, item_id, {**current, "document": document,
+                                                              "expected_version": current["version"], "status": "predicted"}, predicted=True)
                     done += 1
             except Problem as exc:
                 if exc.status == 409:
@@ -227,7 +286,10 @@ class Jobs:
             except Exception as exc:
                 failed += 1
                 errors.append({"item": item_id, "error": str(exc)[:300]})
-            self.update(job_id, done=done, skipped=skipped, failed=failed, errors=errors[-50:])
+            progress = {"done": done, "skipped": skipped, "failed": failed, "errors": errors[-50:]}
+            if audit or routing:
+                progress["flagged"] = flagged
+            self.update(job_id, **progress)
             if failed >= 3 and done == 0:
                 self.update(job_id, status="failed", finished_at=now())
                 return

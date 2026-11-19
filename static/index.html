@@ -8,6 +8,9 @@
   <title>LabelPilot · 本地半自动标注</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='11' fill='%238b5cf6'/%3E%3Cpath d='M11 10v20h18M18 11h11v11' fill='none' stroke='white' stroke-width='3'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/static/style.css?v=__ASSET_VERSION__">
+  <script src="/static/efficiency.js?v=__ASSET_VERSION__" defer></script>
+  <script src="/static/resume.js?v=__ASSET_VERSION__" defer></script>
+  <script src="/static/automation.js?v=__ASSET_VERSION__" defer></script>
   <script src="/static/app.js?v=__ASSET_VERSION__" defer></script>
 </head>
 <body>
@@ -33,6 +36,7 @@
         <button class="button" id="exportButton">导出数据集</button>
         <button class="button primary" id="trainingButton">一键训练</button>
         <button class="button" id="comparisonButton">模型对比</button>
+        <button class="button" id="automationButton">自动流程</button>
       </div>
     </header>
     <section class="overview">
@@ -49,6 +53,7 @@
         <div class="panel-heading"><h2>图片队列 <span id="filteredCount">0</span></h2><button class="icon-button" id="refreshButton" title="刷新队列">↻</button></div>
         <div class="queue-filters">
           <button class="button queue-review" id="reviewQueueButton" type="button" aria-pressed="false">待审核队列</button>
+          <div class="queue-utilities"><button class="button" id="similarityButton" type="button">相似筛图</button><button class="button" id="auditButton" type="button">疑点复核</button></div>
           <input id="searchInput" type="search" placeholder="搜索图片名称…" aria-label="搜索图片">
           <select id="batchSelect" aria-label="筛选批次"><option value="">全部批次</option></select>
           <select id="statusSelect" aria-label="筛选审核状态">
@@ -56,6 +61,8 @@
             <optgroup label="待审核">
               <option value="review">按优先级</option><option value="review_empty">未确认空图</option>
               <option value="review_difficult">难例</option><option value="review_low">低置信度 · 低于 50%</option>
+              <option value="curated">相似筛图后的待标注图</option><option value="audit">标注疑点待复核</option>
+              <option value="triage">智能审核分流</option><option value="spot_review">按来源抽样复核</option>
             </optgroup>
             <optgroup label="标注状态">
               <option value="unstarted">未开始</option><option value="imported">人工标注 · 待审核</option>
@@ -69,9 +76,30 @@
       </aside>
       <section class="editor panel">
         <div class="editor-heading"><div><strong id="imageTitle">选择图片开始标注</strong><span id="imageMeta"></span></div><div class="editor-status"><span id="dirtyBadge" class="dirty" hidden>未保存</span><span id="statusBadge" class="pill">未开始</span><button class="icon-button" id="historyButton" title="保存历史与恢复">↶</button></div></div>
-        <div class="editor-toolbar"><div class="tool-group"><button class="tool active" data-tool="select" title="选择 / 移动 (V)">↖</button><button class="tool" data-tool="rectangle" title="矩形框 (R)">▢</button><button class="tool" data-tool="polygon" title="多边形 (P)">⬡</button><button class="tool" data-tool="pan" title="平移 (H / 按住空格)">✥</button></div><span class="divider"></span><button class="tool" id="undoButton" title="撤销 (Ctrl+Z)">↶</button><button class="tool" id="redoButton" title="重做 (Ctrl+Shift+Z)">↷</button><div class="toolbar-space"></div><button class="tool" id="zoomOut" title="缩小">−</button><button class="zoom-label" id="fitButton" title="适应画布 (F)">100%</button><button class="tool" id="zoomIn" title="放大">＋</button><button class="button focus-toggle" id="focusButton" title="放大 / 恢复画布工作区 (Tab)" aria-pressed="false">⛶ 大画布</button><button class="button magic" id="predictButton">✦ 模型预标注</button></div>
+        <div class="editor-toolbar"><div class="tool-group"><button class="tool active" data-tool="select" title="选择 / 移动 (V)">↖</button><button class="tool" data-tool="rectangle" title="矩形框 (R)">▢</button><button class="tool" data-tool="polygon" title="多边形 (P)">⬡</button><button class="tool" data-tool="pan" title="平移 (H / 按住空格)">✥</button></div><span class="divider"></span><button class="tool" id="undoButton" title="撤销 (Ctrl+Z)">↶</button><button class="tool" id="redoButton" title="重做 (Ctrl+Shift+Z)">↷</button><div class="toolbar-space"></div><button class="tool" id="zoomOut" title="缩小">−</button><button class="zoom-label" id="fitButton" title="适应画布 (F)">100%</button><button class="tool" id="zoomIn" title="放大">＋</button><button class="button focus-toggle" id="focusButton" title="放大 / 恢复画布工作区 (Tab)" aria-pressed="false">⛶ 大画布</button><button class="button magic" id="predictButton">✦ 模型预标注</button>
+          <select id="efficiencyMode" aria-label="标注模式"><option value="">常规标注</option><option value="fast">逐框快审</option><option value="sequence">连续帧</option><option value="fourpoint">四点画框</option><option value="prompt">点选辅助</option></select>
+        </div>
+        <div id="efficiencyBar" class="efficiency-bar" hidden>
+          <div id="fastControls" class="efficiency-actions" hidden>
+            <button class="button" type="button" id="fastPrevious">上一个框 <kbd>[</kbd></button><button class="button" type="button" id="fastNext">确认并到下一框 <kbd>↵</kbd></button><button class="button" type="button" id="fastFull">回全图</button>
+          </div>
+          <div id="sequenceControls" class="efficiency-actions" hidden>
+            <button class="button" type="button" id="inheritNext">带所选框到下一张</button><button class="button" type="button" id="markFirstFrame">设为起点</button><button class="button" type="button" id="previewLastFrame">末帧预览插值</button><button class="button" type="button" id="clearKeyframe" hidden>清除起点</button>
+            <button class="button" type="button" id="previewTracking">跟踪选中框</button>
+            <select id="trackingLimit" aria-label="连续跟踪帧数"><option value="20">20 帧</option><option value="40" selected>40 帧</option><option value="100">100 帧</option><option value="200">200 帧</option></select>
+          </div>
+          <div id="promptControls" class="efficiency-actions" hidden>
+            <button class="button" type="button" id="promptPositive" aria-pressed="true">前景点</button><button class="button" type="button" id="promptNegative" aria-pressed="false">背景点</button><button class="button" type="button" id="resetPrompt">清空点</button><button class="button primary" type="button" id="acceptPrompt">采用候选框</button>
+          </div>
+          <span id="efficiencyHint" class="muted" role="status"></span>
+        </div>
+        <div id="auditFrameBar" class="efficiency-bar" hidden>
+          <span id="auditFrameReasons" role="status"></span><button id="toggleAuditOverlay" class="button" type="button" aria-pressed="true">显示疑点框</button><button id="dismissAuditFrame" class="button" type="button">本图已核对</button>
+        </div>
         <div class="canvas-wrap" id="canvasWrap"><canvas id="canvas" tabindex="0" aria-label="标注画布"></canvas><div id="canvasCrosshair" class="canvas-crosshair" hidden aria-hidden="true"></div><div class="canvas-message" id="canvasMessage"><span class="empty-symbol">⌖</span><h3>让模型先做第一步</h3><p>选择图片，预标注后再精修确认</p></div><div class="canvas-hint" id="canvasHint">R 两次点击画框 · Esc 取消 · A / D 翻页 · Tab 大画布</div></div>
-        <div class="image-context"><span id="sourceNote">源图片只读，所有修改保存在独立工作区</span><span id="coordinateText">—</span></div>
+        <div class="image-context"><span id="sourceNote">源图片只读，所有修改保存在独立工作区</span>
+          <div class="draft-status"><label class="check"><input id="autoDraft" type="checkbox">自动存草稿</label><span id="autoSaveStatus" role="status"></span>
+          <button class="button" id="downloadLocalDraft" type="button" hidden>下载本机草稿</button></div><span id="coordinateText">—</span></div>
         <div class="editor-footer"><button class="button" id="previousImage" title="上一张；修改自动保存为草稿 (A)">← 上一张 <kbd>A</kbd></button><button class="button" id="nextImage" title="下一张；修改自动保存为草稿，不标记已审核 (D)">下一张 → <kbd>D</kbd></button><button class="button quiet" id="skipButton">跳过</button><div class="toolbar-space"></div><button class="button" id="saveButton">保存草稿 <kbd>⌃ S</kbd></button><button class="button primary" id="reviewButton" title="保存并标记已审核，然后下一张 (E)">确认并下一张 <kbd>E</kbd></button></div>
       </section>
       <aside class="inspector panel">
@@ -265,13 +293,59 @@
               <tbody id="comparisonClassRows"></tbody>
             </table>
           </div>
-          <a class="button" id="downloadComparison" download>下载对比报告</a>
+          <p id="comparisonReviewHint" class="muted" hidden></p>
+          <div class="comparison-report-actions">
+            <button class="button" type="button" id="openComparisonReview" hidden>逐图回看</button>
+            <a class="button" id="downloadComparison" download>下载对比报告</a>
+          </div>
         </div>
       </section>
     </div>
     <div class="dialog-actions export-actions">
       <p id="comparisonMessage" class="workflow-message" role="status"></p>
       <button class="button primary" id="startComparison" type="submit" form="comparisonForm" disabled>一键对比</button>
+    </div>
+  </dialog>
+  <dialog id="comparisonReviewDialog" class="export-dialog comparison-review-dialog" aria-labelledby="comparisonReviewTitle">
+    <form method="dialog" class="dialog-heading">
+      <div><h2 id="comparisonReviewTitle">逐图回看</h2><p id="comparisonReviewRun" class="muted"></p></div>
+      <button class="icon-button" aria-label="关闭">×</button>
+    </form>
+    <div class="dialog-body comparison-review-layout">
+      <aside class="comparison-review-sidebar" aria-label="回看筛选和图片列表">
+        <label>类别<select id="comparisonReviewClass"></select></label>
+        <label>筛选<select id="comparisonReviewKind" autofocus></select></label>
+        <p id="comparisonReviewStatus" class="muted" role="status"></p>
+        <div id="comparisonReviewList" class="comparison-review-list" aria-label="对应图片"></div>
+        <div id="comparisonReviewPages" class="comparison-review-pages" hidden>
+          <button class="button" id="comparisonReviewPrevious" type="button">上一页</button>
+          <button class="button" id="comparisonReviewNext" type="button">下一页</button>
+        </div>
+      </aside>
+      <section class="comparison-review-inspector" aria-label="人工标注和新旧模型预测">
+        <p id="comparisonFrameStatus" class="muted" role="status"></p>
+        <div id="comparisonFrame" hidden>
+          <div class="comparison-frame-heading">
+            <h3 id="comparisonFrameName"></h3>
+            <label class="check"><input type="checkbox" id="comparisonFrameAllClasses">显示全部评测类别</label>
+          </div>
+          <ul class="comparison-frame-legend">
+            <li><span class="comparison-swatch truth"></span>人工标注</li>
+            <li><span class="comparison-swatch matched"></span>匹配预测</li>
+            <li><span class="comparison-swatch false-positive"></span>误检预测</li>
+          </ul>
+          <div class="comparison-frame-panels">
+            <figure class="comparison-frame-panel">
+              <figcaption><strong id="comparisonFrameOldModel"></strong><p id="comparisonFrameOldCounts" class="muted"></p></figcaption>
+              <div class="comparison-frame-stage" id="comparisonFrameOldImage"></div>
+            </figure>
+            <figure class="comparison-frame-panel">
+              <figcaption><strong id="comparisonFrameNewModel"></strong><p id="comparisonFrameNewCounts" class="muted"></p></figcaption>
+              <div class="comparison-frame-stage" id="comparisonFrameNewImage"></div>
+            </figure>
+          </div>
+        </div>
+      </section>
     </div>
   </dialog>
   <dialog id="blindsetDialog" aria-labelledby="blindsetTitle">
@@ -296,6 +370,119 @@
       <p id="blindsetMessage" class="workflow-message" role="status"></p>
       <button class="button primary" id="freezeBlindset" type="submit" form="blindsetForm">冻结图片和标注</button>
     </div>
+  </dialog>
+  <dialog id="sequenceDialog" class="wide-dialog" aria-labelledby="sequenceTitle">
+    <form method="dialog" class="dialog-heading"><h2 id="sequenceTitle">关键帧插值</h2><button class="icon-button" aria-label="关闭">×</button></form>
+    <div class="dialog-body">
+      <p id="sequenceSummary" class="muted"></p>
+      <label id="sequenceTargetLabel">预览中间帧<select id="sequenceTarget"></select></label>
+      <div id="sequencePreview" class="comparison-frame-stage" hidden></div>
+      <div id="sequenceStop" class="sequence-stop" hidden><span id="sequenceStopText"></span><button id="openTrackStop" class="button" type="button">打开待修帧</button></div>
+      <p id="sequenceStatus" class="workflow-message" role="status"></p>
+    </div>
+    <div class="dialog-actions"><button class="button primary" id="sequenceApply" type="button">写入草稿</button></div>
+  </dialog>
+  <dialog id="automationDialog" class="export-dialog automation-dialog" aria-labelledby="automationTitle">
+    <form method="dialog" class="dialog-heading"><h2 id="automationTitle">自动流程</h2><button class="icon-button" aria-label="关闭">×</button></form>
+    <div class="dialog-body automation-layout">
+      <section aria-label="工作流设置">
+        <div class="automation-tabs" role="group" aria-label="设置类型">
+          <button type="button" id="automationIntakeTab" class="button" aria-pressed="true">收图与审核</button>
+          <button type="button" id="automationReleaseTab" class="button" aria-pressed="false">训练与验收</button>
+        </div>
+        <div id="automationIntakePanel">
+          <label for="workflowFolder">监控目录</label>
+          <div class="model-path-row"><input id="workflowFolder" placeholder="留空使用当前项目图片目录"><button class="button" type="button" id="browseWorkflowFolder">选择目录</button></div>
+          <label class="check"><input id="workflowWatch" type="checkbox">监控新图，写入完成后入队</label>
+          <div class="form-row">
+            <label>相似程度<select id="workflowSimilarity"><option value="strict">更严格</option><option value="balanced">平衡</option><option value="loose">更多候选</option></select></label>
+            <label class="check"><input id="workflowRepresentatives" type="checkbox">相似组优先预标推荐图</label>
+          </div>
+          <label for="workflowCompanion">第二模型（可选）</label>
+          <div class="model-path-row"><input id="workflowCompanion" placeholder="本地 .pt 权重"><button class="button" type="button" id="browseWorkflowCompanion">选择文件</button></div>
+          <div class="form-row">
+            <label>预标置信度<input id="workflowConfidence" type="number" min="0.01" max="1" step="0.01"></label>
+            <label>低分优先复核<input id="workflowLow" type="number" min="0.01" max="1" step="0.01"></label>
+          </div>
+          <div class="form-row">
+            <label>稀有类别少于（目标数）<input id="workflowRare" type="number" min="0" max="10000" step="1"></label>
+            <label>普通图按来源抽样（%）<input id="workflowSample" type="number" min="0" max="100" step="1"></label>
+          </div>
+          <div class="automation-actions">
+            <button type="button" class="button primary" id="runIntake">处理新批次</button>
+            <button type="button" class="button" id="runRouting">分流当前批次的候选图</button>
+          </div>
+        </div>
+        <div id="automationReleasePanel" hidden>
+          <label>固定盲测集<select id="workflowBlindset" required></select></label>
+          <label>训练批次<select id="workflowTrainBatch"></select></label>
+          <label class="check"><input id="workflowAutoTrain" type="checkbox">计数及类别覆盖达标后自动运行</label>
+          <div class="form-row">
+            <label>最低可训练图量<input id="workflowMinImages" type="number" min="2" max="10000" step="1"></label>
+            <label>每个验收类最低带框图量<input id="workflowMinEach" type="number" min="1" max="10000" step="1"></label>
+          </div>
+          <label for="workflowBaseline">基线权重（留空使用项目模型）</label>
+          <div class="model-path-row"><input id="workflowBaseline" placeholder="本机 .pt"><button type="button" class="button" id="browseWorkflowBaseline">选择文件</button></div>
+          <div class="form-row">
+            <label>训练起点<select id="workflowTrainMode"><option value="scratch">从零训练</option><option value="fine_tune">微调基线</option></select></label>
+            <label>训练轮数<input id="workflowEpochs" type="number" min="1" max="300" step="1"></label>
+          </div>
+          <div class="form-row">
+            <label>划分方式<select id="workflowSplitUnit"><option value="source_group">来源组</option><option value="directory">目录</option><option value="image">按图随机</option></select></label>
+            <label>共同评测置信度<input id="workflowEvalConfidence" type="number" min="0.01" max="1" step="0.01"></label>
+            <label>匹配 IoU<input id="workflowEvalIou" type="number" min="0.01" max="1" step="0.01"></label>
+          </div>
+          <table class="automation-gates" aria-label="逐类别验收门槛">
+            <thead><tr><th scope="col">验收类别</th><th scope="col">最低召回率 %</th><th scope="col">最多误检</th></tr></thead>
+            <tbody id="workflowGates"></tbody>
+          </table>
+          <button type="button" class="button primary" id="runRelease">开始训练与验收</button>
+        </div>
+      </section>
+      <section class="export-preview" aria-labelledby="workflowRunsTitle">
+        <h3 id="workflowRunsTitle">运行记录</h3>
+        <p id="workflowReadiness" class="muted" role="status"></p>
+        <div id="workflowRuns"></div>
+      </section>
+    </div>
+    <div class="dialog-actions export-actions"><p id="workflowStatus" class="workflow-message" role="status"></p>
+      <button type="button" class="button" id="saveWorkflow">保存配置</button></div>
+  </dialog>
+  <dialog id="similarityDialog" class="export-dialog similarity-dialog" aria-labelledby="similarityTitle">
+    <form method="dialog" class="dialog-heading"><h2 id="similarityTitle">相似筛图</h2><button class="icon-button" aria-label="关闭">×</button></form>
+    <div class="dialog-body spread-dialog-body">
+      <div class="batch-tool-settings">
+        <label>未标注批次<select id="similarityBatch"></select></label>
+        <label>相似程度<select id="similarityLevel"><option value="strict">更严格</option><option value="balanced" selected>平衡</option><option value="loose">更多候选</option></select></label>
+        <button class="button" type="button" id="scanSimilarity">扫描相似图</button>
+      </div>
+      <p id="similarityStatus" class="workflow-message" role="status"></p>
+      <section id="similarityResults" hidden>
+        <div class="similarity-navigation">
+          <button class="button" type="button" id="similarityPrevGroup">上一组</button><strong id="similarityGroupInfo"></strong><button class="button" type="button" id="similarityNextGroup">下一组</button>
+          <span class="toolbar-space"></span><button class="button" type="button" id="similarityKeepRecommended">每组先选推荐图</button><button class="button" type="button" id="similarityKeepAll">保留全部</button>
+        </div>
+        <div id="similarityCards" class="similarity-cards"></div>
+        <div class="similarity-navigation" id="similarityPages" hidden>
+          <button class="button" type="button" id="similarityPrevPage">上一页</button><span id="similarityPageInfo" class="muted"></span><button class="button" type="button" id="similarityNextPage">下一页</button>
+        </div>
+      </section>
+    </div>
+    <div class="dialog-actions export-actions"><p id="similaritySelectionInfo" class="workflow-message muted" role="status"></p><button class="button primary" id="applySimilarity" type="button" disabled>打开筛后队列</button></div>
+  </dialog>
+  <dialog id="auditDialog" class="wide-dialog" aria-labelledby="auditTitle">
+    <form method="dialog" class="dialog-heading"><h2 id="auditTitle">按疑点复核</h2><button class="icon-button" aria-label="关闭">×</button></form>
+    <div class="dialog-body">
+      <p class="muted">用当前项目模型找出疑似漏标、类别冲突和框偏移。查看原标注与候选框后，由你决定如何修正。</p>
+      <div class="similarity-navigation"><button class="button" type="button" id="auditModelSettings">模型设置</button><span class="muted" id="auditModelName"></span></div>
+      <label>标注批次<select id="auditBatch"></select></label>
+      <div class="form-row"><label>候选置信度<input id="auditConfidence" type="number" min="0.05" max="1" step="0.05" value="0.60"></label>
+        <label>本次最多检查<input id="auditLimit" type="number" min="1" max="10000" step="1" value="100"></label></div>
+      <progress id="auditProgress" aria-label="疑点扫描进度" hidden></progress>
+      <p id="auditStatus" class="workflow-message" role="status"></p>
+    </div>
+    <div class="dialog-actions"><button class="button" type="button" id="stopAudit" hidden>取消扫描</button>
+      <button class="button" type="button" id="startAudit">开始扫描</button><button class="button primary" type="button" id="openAuditQueue">打开疑点队列</button></div>
   </dialog>
   <dialog id="projectDialog" class="wide-dialog">
     <form method="dialog" class="dialog-heading"><div><div class="eyebrow">NEW WORKSPACE</div><h2>选择需要标注的图片</h2></div><button class="icon-button" aria-label="关闭">×</button></form>

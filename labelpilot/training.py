@@ -1,5 +1,7 @@
 import copy
+import hashlib
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -58,6 +60,17 @@ def has_training_dependencies():
     return all(importlib.util.find_spec(module) for module in ("torch", "ultralytics"))
 
 
+def training_selection(store, project_id, options, checkpoint=None):
+    data_options = {"format": "yolo", "batch": options["batch"], "clean": True}
+    plan = prepare_export(store, project_id, data_options, include_documents=True, checkpoint=checkpoint)
+    return plan, reserve_blind_images(store, project_id, plan.rows)
+
+
+def dataset_identity(rows, names):
+    items = sorted((row["id"], row["version"], row["image_sha256"], row["source_group"], row["relative"]) for row in rows)
+    return hashlib.sha256(json.dumps([names, items], ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
 class TrainingJobs:
     def __init__(self, store, inference, prediction_jobs):
         self.store = store
@@ -100,7 +113,7 @@ class TrainingJobs:
             records = [record for record in self.records.values() if record["project"] == project_id]
             return [self.view(record) for record in sorted(records, key=lambda row: row["created_at"], reverse=True)[:12]]
 
-    def start(self, project_id, payload):
+    def start(self, project_id, payload, *, task_id=None, starting_weights=None, expected_dataset=None):
         project = self.store.project(project_id)
         options = training_options(project, payload)
         if not has_training_dependencies():
@@ -109,11 +122,13 @@ class TrainingJobs:
         try:
             weights = None
             if options["mode"] == "fine_tune":
-                weights = Path(self.store.project(project_id).config.get("model_path") or "")
+                weights = Path(starting_weights or self.store.project(project_id).config.get("model_path") or "")
                 if weights.suffix.lower() != ".pt" or not weights.is_file():
                     raise Problem("请先在模型设置里选择可信的本地 .pt 权重，或选择从零训练", 422)
-            run_id = uuid.uuid4().hex
+            run_id = task_id or uuid.uuid4().hex
             record = {"id": run_id, "project": project_id, "status": "preparing", "created_at": now(), "options": options}
+            if expected_dataset is not None:
+                record["expected_dataset"] = expected_dataset
             with self.lock:
                 self.save_record(record)
                 self.stop = threading.Event()
@@ -130,6 +145,11 @@ class TrainingJobs:
         if not record or record["project"] != project_id:
             raise Problem("训练任务不存在", 404)
         return record
+
+    def lookup(self, project_id, run_id):
+        with self.lock:
+            record = self.records.get(run_id)
+            return self.view(record) if record and record["project"] == project_id else None
 
     def cancel(self, project_id, run_id):
         with self.lock:
@@ -170,12 +190,12 @@ class TrainingJobs:
         updates = {"status": "failed"}
         try:
             with self.store.lock:
-                data_options = {"format": "yolo", "batch": options["batch"], "clean": True}
-                plan = prepare_export(self.store, record["project"], data_options, include_documents=True, checkpoint=checkpoint)
-                rows = reserve_blind_images(self.store, record["project"], plan.rows)
+                plan, rows = training_selection(self.store, record["project"], options, checkpoint)
                 updates["blind_out"] = len(plan.rows) - len(rows)
                 if not rows:
                     raise Problem("这一批图片已留作盲测，请选择其他训练批次", 422)
+                if record.get("expected_dataset") and dataset_identity(rows, plan.project.names) != record["expected_dataset"]:
+                    raise Problem("审核数据在工作流启动后发生变化，请重新生成训练快照", 409)
                 split = {"train": 80, "val": 20, "test": 0, "unit": options["unit"], "seed": options["seed"]}
                 assignments, split_config, split_counts = plan_splits(rows, {"split": split})
                 plan = replace(plan, rows=rows, assignments=assignments, split_config=split_config, split_counts=split_counts)

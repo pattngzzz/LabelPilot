@@ -57,6 +57,24 @@ def verified_manifest(directory, record):
         raise Problem("盲测集清单与冻结版本不一致，请恢复对应快照", 409) from exc
 
 
+def frozen_image_path(directory, item):
+    root = (directory / "dataset").resolve()
+    path = (root / item["image"]).resolve()
+    if not path.is_relative_to(root / "images"):
+        raise Problem("盲测快照图片路径无效", 409)
+    return path
+
+
+def frozen_image_bytes(path, item):
+    try:
+        contents = path.read_bytes()
+    except OSError as exc:
+        raise Problem(f"{item['photo_id']} 的盲测图片无法读取", 409) from exc
+    if hashlib.sha256(contents).hexdigest() != item["sha256"]:
+        raise Problem(f"{item['photo_id']} 的盲测图片与冻结版本不一致", 409)
+    return contents
+
+
 def freeze_blindset(store, project_id, payload):
     name = payload.get("name")
     percent = payload.get("percent", 20)

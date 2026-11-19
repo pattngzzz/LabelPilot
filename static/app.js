@@ -20,7 +20,7 @@ const exportSplitHints = {
   image:"逐张随机分配。同一视频的相邻帧或重复图片可能跨集。"
 };
 
-const imageBrowser = {mode:"folder",listing:null,selected:new Set(),loading:false,valid:false,sequence:0};
+const imageBrowser = {mode:"folder",target:"newImageRoot",listing:null,selected:new Set(),loading:false,valid:false,sequence:0};
 const projectImages = {files:[]};
 const exportAugmentation = {presets:[],maxCopies:3,loaded:false};
 let searchTimer;
@@ -30,7 +30,8 @@ let trainingSequence = 0;
 let trainingSubmitting = false;
 let trainingRuns = [];
 const comparisonUi = {project:null, timer:null, session:0, read:0, sets:[], runs:[], selected:"",
-  report:null, loadingReport:null, submitting:false, freezing:false};
+  report:null, reportData:null, loadingReport:null, submitting:false, freezing:false};
+const comparisonReview = {url:"", listSequence:0, imageSequence:0, page:null, frame:null, imageUrl:null};
 
 function toast(message, error=false) {
   const node = document.createElement("div");
@@ -57,17 +58,19 @@ async function api(path, method="GET", body) {
 function projectUrl(suffix="") { return `/api/projects/${state.project.id}${suffix}`; }
 function itemUrl(suffix="") { return projectUrl(`/items/${state.current.item.id}${suffix}`); }
 function filters() { return {query:element("searchInput").value.trim(),batch:element("batchSelect").value,status:element("statusSelect").value}; }
+function managedQueue(status=filters().status) { return reviewModes.has(status) || ["audit","curated","triage","spot_review"].includes(status); }
 function setBusy(value, message="") {
   state.busy = value;
   for (const id of ["predictButton","singlePredict","batchPredict","saveModel","saveButton","reviewButton","skipButton","previousImage","nextImage","projectSelect","deleteShape","shapeClass","shapeDescription","shapeDifficult","newLabelInput","addLabelButton"]) element(id).disabled = value;
   element("connectionStatus").textContent = value ? message || "正在处理…" : "本地工作区 · 仅本机可访问";
+  efficiency.render();
   updateCrosshair();
 }
 
 function setDirty(value=true) {
   state.dirty = value;
   element("dirtyBadge").hidden = !value;
-  if (value && state.current) setStatus("draft");
+  if (value && state.current) { setStatus("draft"); workspaceResume.edited(); }
 }
 
 function setStatus(status) {
@@ -109,6 +112,7 @@ async function selectProject(projectId) {
   state.undo = [];
   state.redo = [];
   state.offset = 0;
+  efficiency.resetProject();
   state.activeClass = Math.max(0, state.project.classes.findIndex(item => item.name === "sample_container"));
   localStorage.setItem("labelpilot-project", projectId);
   element("projectSelect").value = projectId;
@@ -122,9 +126,12 @@ async function selectProject(projectId) {
   element("searchInput").value = "";
   element("statusSelect").value = "";
   element("modelPath").value = state.project.model_path;
+  const remembered = workspaceResume.position();
+  workspaceResume.restore(remembered);
   renderClasses();
   await refreshList();
-  if (state.items.length) await loadItem(state.items[0].id);
+  const prior = state.items.find(item => item.id === remembered?.item);
+  if (state.items.length) await loadItem((prior || state.items[0]).id, prior ? remembered : null);
   else showCanvasMessage("当前筛选没有图片", "切换批次或审核状态");
   clearInterval(jobTimer);
   jobTimer = setInterval(() => pollJobs().catch(() => {}), 3000);
@@ -155,6 +162,7 @@ async function refreshList() {
   element("prevPage").disabled = state.offset === 0;
   element("nextPage").disabled = state.offset + state.pageSize >= response.filtered;
   renderQueue();
+  workspaceResume.prefetch();
 }
 
 function renderQueue() {
@@ -165,6 +173,8 @@ function renderQueue() {
     if (item.review?.empty) reasons.push("待确认空图");
     if (item.review?.difficult) reasons.push("难例");
     if (item.review?.low_confidence) reasons.push(`低置信 ${Math.round(item.review.confidence * 100)}%`);
+    if (item.audit) reasons.push(efficiency.issueText(item.audit.kinds));
+    if (item.route) reasons.push(automationUi.routeText(item.route));
     return `<button class="image-row ${state.current?.item.id === item.id ? "selected" : ""}" data-item="${item.id}" title="${escapeHtml(item.relative)}">
       <img loading="lazy" src="${projectUrl(`/items/${item.id}/image?thumbnail=true`)}" alt="">
       <span class="image-row-info"><strong>${escapeHtml(item.photo_id)}</strong><small>${statusNames[item.status]} · ${item.count} 对象</small>
@@ -174,33 +184,38 @@ function renderQueue() {
 }
 
 function finishReviewQueue() {
+  const status = filters().status;
+  const titles = {audit:"标注疑点", curated:"筛后队列", triage:"智能审核", spot_review:"按来源抽样复核"};
+  const messages = {audit:"当前范围没有待复核疑点", curated:"当前范围没有筛后的未标注图",
+    triage:"当前范围没有已分流的待审核图", spot_review:"当前范围没有待复核样本"};
+  const title = titles[status] || "待审核队列";
+  const message = messages[status] || "当前范围没有待审核图片";
   Object.assign(state, {current:null, image:null, selected:-1, undo:[], redo:[], drag:null,
     rectangle:null, polygon:[], pendingShape:null});
-  element("imageTitle").textContent = "待审核队列";
+  element("imageTitle").textContent = title;
   element("imageMeta").textContent = "";
   element("sourceNote").textContent = "";
   setStatus("");
-  showCanvasMessage("当前范围没有待审核图片", "切换批次或审核筛选继续");
+  showCanvasMessage(message, "切换批次或审核筛选继续");
   renderObjects();
-  draw();
+  efficiency.itemChanged();
 }
 
 async function ensureSaved() {
+  await workspaceResume.wait();
   if (!state.dirty) return true;
   if (!window.confirm("当前图片有未保存修改。确定保存草稿后继续？取消将留在当前图片。")) return false;
   return saveCurrent("draft");
 }
 
-async function loadItem(itemId) {
+async function loadItem(itemId, remembered=null) {
   if (state.busy || !await ensureSaved()) return;
   const sequence = ++state.loadSequence;
   setBusy(true,"读取原图和标注…");
   showCanvasMessage("正在载入原图…");
   try {
     const current = await api(projectUrl(`/items/${itemId}`));
-    const image = new Image();
-    image.src = projectUrl(`/items/${itemId}/image`);
-    await image.decode();
+    const image = await workspaceResume.imageFor(current);
     if (sequence !== state.loadSequence) return;
     state.current = current;
     state.image = image;
@@ -220,6 +235,8 @@ async function loadItem(itemId) {
     renderQueue();
     renderObjects();
     fitImage();
+    efficiency.itemChanged();
+    workspaceResume.loaded(remembered);
   } catch (error) {
     showCanvasMessage("图片载入失败",error.message);
     throw error;
@@ -227,6 +244,7 @@ async function loadItem(itemId) {
 }
 
 async function saveCurrent(status="draft") {
+  await workspaceResume.wait();
   if (!state.current || state.busy) return false;
   let confirmedEmpty = false;
   if (status === "reviewed" && state.current.document.shapes.length === 0) {
@@ -239,7 +257,9 @@ async function saveCurrent(status="draft") {
       status,confirmed_empty:confirmedEmpty,image_sha256:state.current.image_sha256,source_fingerprint:state.current.source_fingerprint});
     Object.assign(state.current,response);
     setDirty(false);
+    workspaceResume.savedManually();
     setStatus(response.status);
+    draw();
     toast(status === "reviewed" ? "已人工确认并保存" : status === "skipped" ? "已跳过；标注仍保留" : "草稿已保存，原始标注未改动");
     await refreshList();
     return true;
@@ -251,14 +271,14 @@ async function saveCurrent(status="draft") {
 
 async function navigateImage(direction, reviewed=false) {
   if (!state.current || state.busy) return;
-  if (reviewed && (state.rectangle || state.polygon.length || state.pendingShape)) return toast("请先完成或取消当前绘制", true);
+  if (reviewed && (state.rectangle || state.polygon.length || state.pendingShape || efficiency.blocksReview())) return toast("请先完成或取消当前绘制", true);
   const previousIds = state.items.map(item => item.id);
   const previousOffset = state.offset;
   const currentIndex = previousIds.indexOf(state.current.item.id);
   const nextId = previousIds[currentIndex + direction];
   if (reviewed && !await saveCurrent("reviewed")) return;
   if (!reviewed && state.dirty && !await saveCurrent("draft")) return;
-  if (reviewed && reviewModes.has(filters().status)) {
+  if (reviewed && managedQueue()) {
     const stillNext = state.items.find(item => item.id === nextId);
     const next = stillNext || (state.offset === previousOffset && state.items[currentIndex]) || state.items[0];
     if (next) return loadItem(next.id);
@@ -354,6 +374,7 @@ function renderObjects() {
   }
   element("undoButton").disabled = !state.undo.length;
   element("redoButton").disabled = !state.redo.length;
+  efficiency.render();
 }
 
 function selectShape(index) {
@@ -425,7 +446,7 @@ async function applyPickedLabel(name) {
     state.pendingShape = null;
     addShape(pending.points, "rectangle");
     renderClasses();
-    setTool("select");
+    setTool(efficiency.boxTool());
     element("labelPicker").close();
     canvas.focus({preventScroll:true});
   } catch (error) {
@@ -453,6 +474,7 @@ function setTool(tool) {
   state.drag = null;
   document.querySelectorAll("[data-tool]").forEach(button => button.classList.toggle("active",button.dataset.tool === tool));
   canvas.style.cursor = tool === "pan" ? "grab" : tool === "select" ? "default" : "crosshair";
+  efficiency.toolChanged(tool);
   draw();
 }
 
@@ -477,7 +499,7 @@ function resizeCanvas() {
   const size = viewport();
   canvas.width = Math.round(size.width * devicePixelRatio);
   canvas.height = Math.round(size.height * devicePixelRatio);
-  if (!state.drag) fitImage();
+  if (!state.drag && !efficiency.refocus()) fitImage();
 }
 function screenPoint(point) { return [point[0]*state.scale+state.panX,point[1]*state.scale+state.panY]; }
 function updateCrosshair(event) {
@@ -562,6 +584,8 @@ function draw() {
     pathPoints(state.polygon,false); context.strokeStyle=color; context.lineWidth=1.5; context.stroke();
     for(const point of state.polygon){const position=screenPoint(point);context.fillStyle=color;context.beginPath();context.arc(...position,3,0,Math.PI*2);context.fill();}
   }
+  efficiency.drawExtras();
+  workspaceResume.observe();
   element("fitButton").textContent=`${Math.round(state.scale*100)}%`;
 }
 function zoom(factor,position) {
@@ -615,6 +639,7 @@ canvas.addEventListener("pointerdown",event => {
     return;
   }
   if(actual[0]<0 || actual[1]<0 || actual[0]>state.current.width || actual[1]>state.current.height)return;
+  if(efficiency.handleCanvas(point))return;
   if(state.tool==="rectangle"){state.rectangle={start:point,end:point};state.selected=-1;renderObjects();draw();return;}
   if(state.tool==="polygon"){state.polygon.push(point);draw();return;}
   canvas.setPointerCapture(event.pointerId);
@@ -789,31 +814,37 @@ async function loadImageDirectory(path) {
     element("imageBrowserCount").textContent="未能读取，请修改路径或返回上一级；尚未改变所选图片。";
   } finally {if(sequence===imageBrowser.sequence){imageBrowser.loading=false;updateImageBrowserControls();}}
 }
-async function openImageBrowser(mode) {
+async function openImageBrowser(mode, target="newImageRoot") {
   if(state.busy)return;
-  imageBrowser.mode=mode;imageBrowser.listing=null;imageBrowser.selected.clear();imageBrowser.valid=false;
+  imageBrowser.mode=mode;imageBrowser.target=target;imageBrowser.listing=null;imageBrowser.selected.clear();imageBrowser.valid=false;
   element("imageBrowserTitle").textContent=mode==="folder" ? "选择待标注图片文件夹" : "选择待标注图片（可多选）";
   element("imageBrowserHelp").textContent=mode==="folder" ? "进入目标目录后点击“选择此文件夹”，导入其中及子目录内的图片。仅引用路径，不上传或修改源文件。" : "点击图片勾选或取消，可选择同一文件夹内的多张图片；切换文件夹会清空本次勾选。支持 JPG、JPEG、PNG、BMP、WEBP、TIF、TIFF。";
+  if (target !== "newImageRoot") element("imageBrowserHelp").textContent = "选择当前项目的原图目录或子目录作为收图范围。";
   element("imageBrowserList").innerHTML="";
   element("imageBrowserDrive").innerHTML='<option value="">磁盘位置</option>';
   element("imageBrowserPath").value="";
   element("imageBrowserDialog").showModal();
-  await loadImageDirectory(element("newImageRoot").value.trim() || state.project?.image_root || null);
+  const field = element(target).value.trim();
+  await loadImageDirectory(target === "newImageRoot" ? field || state.project?.image_root || null : state.project.image_root);
 }
 function confirmImageSelection() {
   if(imageBrowser.loading || !imageBrowser.valid || (imageBrowser.mode==="file" && !imageBrowser.selected.size))return;
   const listing=imageBrowser.listing;
-  element("newImageRoot").value=listing.path;
-  projectImages.files=imageBrowser.mode==="file" ? listing.files.filter(item=>imageBrowser.selected.has(item.path)).map(item=>item.name) : [];
-  updateImageSelection();
+  const field = element(imageBrowser.target);
+  field.value=listing.path;
+  if (imageBrowser.target === "newImageRoot") {
+    projectImages.files=imageBrowser.mode==="file" ? listing.files.filter(item=>imageBrowser.selected.has(item.path)).map(item=>item.name) : [];
+    updateImageSelection();
+  }
   element("imageBrowserDialog").close();
-  element("newImageRoot").focus({preventScroll:true});
+  field.focus({preventScroll:true});
 }
 function openModelDialog() {
   if(!state.project)return;
   element("modelPath").value=state.project.model_path;
   modelSelectionChanged();
-  element("batchScope").textContent=`范围：${filters().batch || "全部批次"}${filters().query ? " · 搜索 "+filters().query : ""}中的未开始图片（忽略状态筛选）；已有标注不会覆盖`;
+  const scope = filters().status === "curated" ? "相似筛图后保留的未开始图片" : "未开始图片";
+  element("batchScope").textContent=`${filters().batch || "全部批次"}${filters().query ? " · 搜索 "+filters().query : ""} · ${scope}`;
   element("modelDialog").showModal();
   pollJobs().catch(error=>toast(error.message,true));
 }
@@ -849,19 +880,25 @@ async function startBatch() {
   await saveModelConfig();
   if(!await ensureSaved())return;
   const limit=Number(element("batchLimit").value);
-  if(!window.confirm(`即将对 ${filters().batch || "全部批次"}内最多 ${limit} 张未开始图片运行本地模型。结果仍为待审核，不覆盖任何已有标注。继续？`))return;
-  await api(projectUrl("/jobs"),"POST",{...modelOptions(),batch:filters().batch,query:filters().query,limit});
+  const curated = filters().status === "curated";
+  const scope = curated ? "筛后队列中保留的" : "";
+  if(!window.confirm(`即将对 ${filters().batch || "全部批次"}内最多 ${limit} 张${scope}未开始图片运行本地模型，结果将进入待审核队列。继续？`))return;
+  await api(projectUrl("/jobs"),"POST",{...modelOptions(),batch:filters().batch,query:filters().query,limit,curated});
   toast("批量任务已启动，可以继续标注其他图片");
   await pollJobs();
 }
 async function pollJobs() {
   if(!state.project)return;
+  const project = state.project.id;
   const jobs=await api(projectUrl("/jobs"));
+  if (state.project?.id !== project) return;
+  efficiency.updateJobs(jobs);
   const jobNames={queued:"等待中",running:"推理中",completed:"已完成",completed_with_errors:"完成，含失败",cancelled:"已取消",interrupted:"启动前任务已中断",failed:"失败"};
   const running=jobs.find(job=>["running","queued"].includes(job.status));
   element("jobStatus").hidden=!running;
-  if(running)element("jobStatus").textContent=`✦ 批量预标注 ${running.done+running.skipped+running.failed} / ${running.total} · 待人工审核`;
-  element("jobsList").innerHTML=jobs.slice(0,4).map(job=>`<div class="job-row"><div><strong>${jobNames[job.status] || escapeHtml(job.status)} · ${job.done} / ${job.total}</strong><small>跳过 ${job.skipped} · 失败 ${job.failed}${job.errors?.length ? " · "+escapeHtml(job.errors.at(-1).error) : ""}</small></div>${["running","queued"].includes(job.status) ? `<button class="button" data-cancel-job="${job.id}">取消</button>`:""}</div>`).join("");
+  const jobStages = {audit:"疑点扫描", routing:"智能审核分流"};
+  if(running)element("jobStatus").textContent=`✦ ${jobStages[running.kind] || "批量预标注"} ${running.done+running.skipped+running.failed} / ${running.total}`;
+  element("jobsList").innerHTML=jobs.slice(0,4).map(job=>`<div class="job-row"><div><strong>${jobStages[job.kind] ? jobStages[job.kind] + " · " : ""}${jobNames[job.status] || escapeHtml(job.status)} · ${job.done} / ${job.total}</strong><small>跳过 ${job.skipped} · 失败 ${job.failed}${job.errors?.length ? " · "+escapeHtml(job.errors.at(-1).error) : ""}</small></div>${["running","queued"].includes(job.status) ? `<button class="button" data-cancel-job="${job.id}">取消</button>`:""}</div>`).join("");
   const signature=jobs.map(job=>`${job.id}:${job.status}:${job.done}`).join("|");
   if(state.jobSignature && state.jobSignature!==signature && !state.busy)await refreshList();
   state.jobSignature=signature;
@@ -1172,6 +1209,8 @@ const comparisonStatuses = {preparing:"准备文件", running:"正在对比", ca
   cancelled:"已停止", interrupted:"服务关闭，任务已中断", failed:"对比失败"};
 const comparisonActive = new Set(["preparing", "running", "cancelling"]);
 const recallFormat = new Intl.NumberFormat("zh-CN", {style:"percent", maximumFractionDigits:1});
+const comparisonReviewLabels = {old_missed:"旧版漏检", new_missed:"新版漏检", old_false_positives:"旧版误检",
+  new_false_positives:"新版误检", newly_missed:"新版新增漏检", fixed_missed:"新版修复漏检"};
 
 function comparisonMessage(id, message, error=false) {
   const node = element(id);
@@ -1215,16 +1254,27 @@ function renderComparisonReport(run, report) {
   }));
   const metrics = ["recall", "missed", "false_positives"];
   element("comparisonClassRows").innerHTML = classes.map(({name, old, new: current}) => {
-    const values = [old, current].flatMap(row => metrics.map(key => {
+    const values = [["old", old], ["new", current]].flatMap(([role, row]) => metrics.map(key => {
       const value = row[key];
       const change = row === current && value !== null && old[key] !== null
         ? Math.sign(value - old[key]) * (key === "recall" ? 1 : -1) : 0;
       const style = change > 0 ? ' class="result-better"' : change < 0 ? ' class="result-worse"' : "";
+      if (report.has_details && key !== "recall") {
+        const kind = `${role}_${key}`;
+        const description = escapeHtml(`${name} ${comparisonReviewLabels[kind]} ${value} 个，查看图片`);
+        return `<td${style}><button type="button" class="comparison-count" data-review-kind="${kind}"
+          data-review-label="${escapeHtml(name)}" data-empty="${value === 0}" aria-label="${description}">${value}</button></td>`;
+      }
       const text = value === null ? "—" : key === "recall" ? recallFormat.format(value) : value;
       return `<td${style}>${text}</td>`;
     })).join("");
     return `<tr><th scope="row">${escapeHtml(name)}</th><td>${old.ground_truth}</td>${values}</tr>`;
   }).join("");
+  comparisonUi.reportData = report;
+  element("openComparisonReview").hidden = !report.has_details;
+  const hint = element("comparisonReviewHint");
+  hint.hidden = Boolean(report.has_details);
+  hint.textContent = "早期对比只保存了汇总。用同一盲测集重新对比，即可逐图回看。";
   element("downloadComparison").href = projectUrl(`/comparisons/${run.id}/report`);
   element("comparisonReport").hidden = false;
 }
@@ -1292,7 +1342,7 @@ async function openComparisonDialog() {
     element("comparisonNewPath").value = "";
     element("comparisonSet").value = "";
   }
-  comparisonUi.report = comparisonUi.loadingReport = null;
+  comparisonUi.report = comparisonUi.reportData = comparisonUi.loadingReport = null;
   element("comparisonModels").replaceChildren();
   element("comparisonRunSelect").hidden = true;
   element("comparisonProgress").hidden = true;
@@ -1320,6 +1370,160 @@ async function openComparisonDialog() {
   })]).catch(error => {
     if (session === comparisonUi.session) comparisonMessage("comparisonMessage", error.message, true);
   });
+}
+
+function clearComparisonFrame() {
+  comparisonReview.imageSequence++;
+  comparisonReview.frame = null;
+  element("comparisonFrame").hidden = true;
+  for (const id of ["comparisonFrameOldImage", "comparisonFrameNewImage"]) element(id).replaceChildren();
+  if (comparisonReview.imageUrl) URL.revokeObjectURL(comparisonReview.imageUrl);
+  comparisonReview.imageUrl = null;
+}
+
+function comparisonBox(box, frame, kind, caption, focused=false) {
+  const [left, top, right, bottom] = box;
+  const node = document.createElement("div");
+  node.className = `comparison-frame-box ${kind}${focused ? " focused" : ""}`;
+  Object.assign(node.style, {left:`${100 * left / frame.width}%`, top:`${100 * top / frame.height}%`,
+    width:`${100 * (right - left) / frame.width}%`, height:`${100 * (bottom - top) / frame.height}%`});
+  node.title = caption;
+  const text = document.createElement("span");
+  text.textContent = caption;
+  node.append(text);
+  return node;
+}
+
+function renderComparisonFrame() {
+  const frame = comparisonReview.frame;
+  if (!frame) return;
+  const name = element("comparisonReviewClass").value;
+  const kind = element("comparisonReviewKind").value;
+  const allClasses = element("comparisonFrameAllClasses").checked;
+  const visible = box => allClasses || box.label === name;
+  const truth = frame.truth.map((box, index) => ({...box, index})).filter(visible);
+  const hits = {old:new Set(frame.old.map(box => box.truth_index)), new:new Set(frame.new.map(box => box.truth_index))};
+  element("comparisonFrameName").textContent = frame.photo_id;
+  for (const [role, prefix] of [["old", "comparisonFrameOld"], ["new", "comparisonFrameNew"]]) {
+    const predictions = frame[role].filter(visible);
+    const misses = truth.filter(box => !hits[role].has(box.index)).length;
+    const errors = predictions.filter(box => box.truth_index === null).length;
+    element(`${prefix}Counts`).textContent = `${predictions.length} 个预测 · ${misses} 个漏检 · ${errors} 个误检`;
+    const scene = document.createElement("div");
+    scene.className = "comparison-frame-scene";
+    scene.style.setProperty("--image-ratio", frame.width / frame.height);
+    const picture = document.createElement("img");
+    picture.src = comparisonReview.imageUrl;
+    picture.alt = `冻结图片 ${frame.photo_id}`;
+    const overlay = document.createElement("div");
+    overlay.className = "comparison-frame-overlay";
+    overlay.setAttribute("aria-hidden", "true");
+    for (const box of truth) {
+      const missed = !hits[role].has(box.index);
+      const oldHit = hits.old.has(box.index), newHit = hits.new.has(box.index);
+      const added = box.label === name && kind === "newly_missed" && oldHit && !newHit;
+      const fixed = box.label === name && kind === "fixed_missed" && !oldHit && newHit;
+      const status = added && role === "new" ? " · 新增漏检" : fixed && role === "new" ? " · 修复漏检" : missed ? " · 漏检" : "";
+      overlay.append(comparisonBox(box.box, frame, "truth", box.label + status, added || fixed));
+    }
+    for (const prediction of predictions) {
+      const style = prediction.truth_index === null ? "false-positive" : "matched";
+      const caption = `${prediction.label} ${recallFormat.format(prediction.confidence)}`;
+      const box = comparisonBox(prediction.box, frame, style, caption);
+      box.title = prediction.iou === null ? `${caption} · 误检` : `${caption} · 匹配 IoU ${prediction.iou.toFixed(2)}`;
+      overlay.append(box);
+    }
+    scene.append(picture, overlay);
+    element(`${prefix}Image`).replaceChildren(scene);
+  }
+  element("comparisonFrame").hidden = false;
+}
+
+async function selectComparisonFrame(id) {
+  clearComparisonFrame();
+  const sequence = comparisonReview.imageSequence;
+  const url = `${comparisonReview.url}/${encodeURIComponent(id)}`;
+  const isCurrent = () => element("comparisonReviewDialog").open && sequence === comparisonReview.imageSequence;
+  for (const button of element("comparisonReviewList").querySelectorAll("button")) {
+    button.setAttribute("aria-pressed", String(button.dataset.reviewFrame === id));
+  }
+  comparisonMessage("comparisonFrameStatus", "正在读取冻结图片和标注…");
+  let imageUrl;
+  try {
+    const [frame, image] = await Promise.all([api(url), fetch(`${url}/image`).then(async response => {
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.detail || "冻结图片无法读取");
+      }
+      return response.blob();
+    })]);
+    if (!isCurrent()) return;
+    imageUrl = URL.createObjectURL(image);
+    const preview = new Image();
+    preview.src = imageUrl;
+    await preview.decode();
+    if (!isCurrent()) return;
+    comparisonReview.frame = frame;
+    comparisonReview.imageUrl = imageUrl;
+    imageUrl = null;
+    renderComparisonFrame();
+    comparisonMessage("comparisonFrameStatus", "");
+  } catch (error) {
+    if (isCurrent()) comparisonMessage("comparisonFrameStatus", error.message, true);
+  } finally {
+    if (imageUrl) URL.revokeObjectURL(imageUrl);
+  }
+}
+
+async function loadComparisonReview(offset=0) {
+  clearComparisonFrame();
+  const sequence = ++comparisonReview.listSequence;
+  comparisonReview.page = null;
+  const list = element("comparisonReviewList");
+  list.replaceChildren();
+  list.scrollTop = 0;
+  element("comparisonReviewPages").hidden = true;
+  comparisonMessage("comparisonReviewStatus", "正在筛选图片…");
+  comparisonMessage("comparisonFrameStatus", "");
+  const kind = element("comparisonReviewKind").value;
+  const query = new URLSearchParams({label:element("comparisonReviewClass").value, kind, offset});
+  const isCurrent = () => element("comparisonReviewDialog").open && sequence === comparisonReview.listSequence;
+  try {
+    const page = await api(`${comparisonReview.url}?${query}`);
+    if (!isCurrent()) return;
+    comparisonReview.page = page;
+    const metric = kind.endsWith("false_positives") ? "误检" : "漏检";
+    const shown = page.total > page.limit ? ` · 第 ${page.offset + 1}–${page.offset + page.items.length} 张` : "";
+    comparisonMessage("comparisonReviewStatus", `${page.total} 张图 · ${page.count} 个${metric}${shown}`);
+    element("comparisonReviewPages").hidden = page.total <= page.limit;
+    element("comparisonReviewPrevious").disabled = page.offset === 0;
+    element("comparisonReviewNext").disabled = page.offset + page.limit >= page.total;
+    list.innerHTML = page.items.map(item => `<button type="button" class="button" data-review-frame="${escapeHtml(item.id)}"
+      aria-pressed="false"><span>${escapeHtml(item.photo_id)}</span><span>${item.count} 个</span></button>`).join("");
+    if (page.items.length) {
+      await selectComparisonFrame(page.items[0].id);
+    } else {
+      comparisonMessage("comparisonFrameStatus", "此筛选条件没有对应图片。");
+    }
+  } catch (error) {
+    if (isCurrent()) comparisonMessage("comparisonReviewStatus", error.message, true);
+  }
+}
+
+async function openComparisonReview(label, kind="new_missed") {
+  const report = comparisonUi.reportData;
+  if (!report?.has_details || comparisonUi.report !== comparisonUi.selected) return;
+  comparisonReview.url = projectUrl(`/comparisons/${comparisonUi.report}/frames`);
+  element("comparisonReviewRun").textContent = report.snapshot.name;
+  element("comparisonReviewClass").replaceChildren(...report.classes.map(row => new Option(row.name, row.name)));
+  if (label !== undefined) element("comparisonReviewClass").value = label;
+  element("comparisonReviewKind").replaceChildren(...Object.entries(comparisonReviewLabels).map(([value, text]) => new Option(text, value)));
+  element("comparisonReviewKind").value = kind;
+  element("comparisonFrameOldModel").textContent = `旧版 · ${report.models.old.filename}`;
+  element("comparisonFrameNewModel").textContent = `新版 · ${report.models.new.filename}`;
+  element("comparisonFrameAllClasses").checked = false;
+  element("comparisonReviewDialog").showModal();
+  await loadComparisonReview();
 }
 
 async function startComparison(event) {
@@ -1442,7 +1646,7 @@ for(const id of ["batchSelect","statusSelect"])listen(id,"change",async()=>{
   localStorage.setItem(`labelpilot-batch-${state.project.id}`,element("batchSelect").value);
   state.offset=0;await refreshList();
   if(state.items[0])await loadItem(state.items[0].id);
-  else if(reviewModes.has(filters().status))finishReviewQueue();
+  else if(managedQueue())finishReviewQueue();
 });
 listen("reviewQueueButton", "click", async () => {
   if (!state.project || state.busy || !await ensureSaved()) return;
@@ -1476,7 +1680,7 @@ listen("previousImage","click",()=>navigateImage(-1));
 listen("nextImage","click",()=>navigateImage(1));
 listen("skipButton", "click", async () => {
   if (!await saveCurrent("skipped")) return;
-  if (reviewModes.has(filters().status) && !state.items.length) finishReviewQueue();
+  if (managedQueue() && !state.items.length) finishReviewQueue();
   else await navigateImage(1);
 });
 listen("undoButton","click",()=>undo());listen("redoButton","click",()=>undo(true));
@@ -1593,6 +1797,32 @@ listen("comparisonRunSelect", "change", event => {
   comparisonUi.selected = event.target.value;
   return showComparisonRun();
 });
+listen("comparisonClassRows", "click", event => {
+  const count = event.target.closest("[data-review-kind]");
+  if (count) return openComparisonReview(count.dataset.reviewLabel, count.dataset.reviewKind);
+});
+listen("openComparisonReview", "click", () => openComparisonReview());
+for (const id of ["comparisonReviewClass", "comparisonReviewKind"]) {
+  listen(id, "change", () => loadComparisonReview());
+}
+listen("comparisonReviewList", "click", event => {
+  const selected = event.target.closest("[data-review-frame]");
+  if (selected) return selectComparisonFrame(selected.dataset.reviewFrame);
+});
+listen("comparisonFrameAllClasses", "change", renderComparisonFrame);
+listen("comparisonReviewPrevious", "click", () => {
+  const page = comparisonReview.page;
+  if (page?.offset > 0) return loadComparisonReview(Math.max(0, page.offset - page.limit));
+});
+listen("comparisonReviewNext", "click", () => {
+  const page = comparisonReview.page;
+  if (page && page.offset + page.limit < page.total) return loadComparisonReview(page.offset + page.limit);
+});
+element("comparisonReviewDialog").addEventListener("close", () => {
+  if (element("comparisonReviewDialog").open) return;
+  comparisonReview.listSequence++;
+  clearComparisonFrame();
+});
 listen("stopComparison", "click", async () => {
   const run = comparisonUi.selected;
   if (!run) return;
@@ -1604,6 +1834,7 @@ listen("stopComparison", "click", async () => {
 });
 element("comparisonDialog").addEventListener("close", () => {
   if (element("comparisonDialog").open) return;
+  if (element("comparisonReviewDialog").open) element("comparisonReviewDialog").close();
   clearInterval(comparisonUi.timer);
   comparisonUi.session++;
   comparisonUi.read++;
@@ -1651,6 +1882,7 @@ document.addEventListener("keydown",event=>{
   if(state.busy)return;
   if((event.ctrlKey || event.metaKey) && key==="z"){event.preventDefault();undo(event.shiftKey);return;}
   if(event.ctrlKey || event.metaKey || event.altKey)return;
+  if(efficiency.keydown(event,key)){event.preventDefault();return;}
   if(event.repeat && ["a","d","e","q"].includes(key))return;
   if(key==="v")setTool("select");if(key==="r")setTool("rectangle");if(key==="p")setTool("polygon");if(key==="h")setTool("pan");if(key==="f")fitImage();
   if(key==="delete" || key==="backspace"){event.preventDefault();deleteShape();}
@@ -1672,4 +1904,8 @@ document.addEventListener("keydown",event=>{
 });
 
 toggleFocusMode(localStorage.getItem("labelpilot-focus")==="true");
+efficiency.install();
+efficiency.render();
+workspaceResume.install();
+automationUi.install();
 initialize().catch(error=>{toast(error.message,true);showCanvasMessage("工作区启动失败",error.message);});

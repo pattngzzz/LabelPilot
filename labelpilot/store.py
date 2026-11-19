@@ -14,6 +14,7 @@ from PIL import Image
 
 STATUSES = ("unstarted", "imported", "predicted", "draft", "reviewed", "skipped", "error")
 PENDING_REVIEW = ("imported", "predicted", "draft")
+AUDITABLE = ("imported", "draft", "reviewed")
 REVIEW_FILTERS = {"review": None, "review_empty": "empty", "review_difficult": "difficult", "review_low": "low_confidence"}
 REVIEW_CONFIDENCE = 0.5
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
@@ -107,11 +108,12 @@ def load_classes(config):
 
 
 class Project:
-    def __init__(self, config):
+    def __init__(self, config, intake=None):
         self.config = copy.deepcopy(config)
         self.id = config["id"]
         self.root = Path(config["image_root"]).resolve()
         self.names = load_classes(config)
+        self.intake = intake or {}
         self.items = []
         self.by_id = {}
         self.warnings = []
@@ -168,6 +170,11 @@ class Project:
             for path in sorted(self.root.rglob("*")):
                 if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES:
                     self.add_item(path.resolve(), {})
+        registered = {item["relative"] for item in self.items}
+        for relative in self.intake.keys() - registered:
+            path = (self.root / relative).resolve()
+            if path.is_file() and path.is_relative_to(self.root) and path.relative_to(self.root).as_posix() == relative:
+                self.add_item(path, {})
         self.photo_ids = {item["photo_id"] for item in self.items}
         native = self.source_map(self.config.get("annotation_root"))
         predicted = self.source_map(self.config.get("preannotation_root"))
@@ -200,16 +207,22 @@ class Project:
         if not path.is_relative_to(self.root):
             raise Problem("图片链接指向项目目录之外")
         relative = path.relative_to(self.root).as_posix()
+        receipt = self.intake.get(relative)
+        if receipt:
+            task = {**task, "batch": receipt["batch"], "sha256": receipt["sha256"],
+                    "width": receipt["width"], "height": receipt["height"]}
         item_id = hashlib.sha256(relative.encode("utf-8")).hexdigest()[:24]
         if item_id in self.by_id:
             raise Problem(f"图片清单重复：{relative}")
         self.by_id[item_id] = True
+        frame_index = task.get("frame_index")
         self.items.append({
             "id": item_id, "photo_id": task.get("photo_id", path.stem), "path": str(path),
             "relative": relative, "width": task.get("width"), "height": task.get("height"),
             "image_sha256": task.get("sha256"), "batch": task.get("batch") or path.parent.name,
             "source_group": source_group(task.get("source_group")) or "unassigned",
             "source_id": task.get("source_id", ""), "note": task.get("visual_note", ""),
+            "frame_index": frame_index if type(frame_index) is int and frame_index >= 0 else None,
             "status": "unstarted", "count": 0, "source": None, "source_kind": None,
         })
 
@@ -249,12 +262,31 @@ class Store:
                     status TEXT NOT NULL, document TEXT NOT NULL, updated TEXT NOT NULL,
                     PRIMARY KEY (project, item, version)
                 );
+                CREATE TABLE IF NOT EXISTS similarity_selection (
+                    project TEXT NOT NULL, batch TEXT NOT NULL, excluded TEXT NOT NULL,
+                    PRIMARY KEY (project, batch)
+                );
+                CREATE TABLE IF NOT EXISTS annotation_audits (
+                    project TEXT NOT NULL, item TEXT NOT NULL, version INTEGER NOT NULL,
+                    summary TEXT NOT NULL, evidence TEXT NOT NULL,
+                    PRIMARY KEY (project, item)
+                );
+                CREATE TABLE IF NOT EXISTS intake_receipts (
+                    project TEXT NOT NULL, relative TEXT NOT NULL, batch TEXT NOT NULL,
+                    sha256 TEXT NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL, included INTEGER NOT NULL,
+                    PRIMARY KEY (project, relative)
+                );
+                CREATE TABLE IF NOT EXISTS review_routes (
+                    project TEXT NOT NULL, item TEXT NOT NULL, version INTEGER NOT NULL,
+                    result TEXT NOT NULL, sample INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (project, item)
+                );
             """)
         self.configs = read_json(self.registry_path) if self.registry_path.exists() else []
         self.project_errors = []
         for config in self.configs:
             try:
-                self.projects[config["id"]] = Project(config)
+                self.projects[config["id"]] = self.build_project(config)
             except (Problem, OSError, ValueError, KeyError) as exc:
                 self.project_errors.append({"name": config.get("name"), "error": str(getattr(exc, "message", exc))})
 
@@ -274,6 +306,46 @@ class Store:
         if project_id not in self.projects:
             raise Problem("项目不存在", 404)
         return self.projects[project_id]
+
+    def intake_receipts(self, project_id):
+        with self.connect() as connection:
+            return {row["relative"]: dict(row) for row in connection.execute(
+                "SELECT relative, batch, sha256, width, height, included FROM intake_receipts WHERE project=?", (project_id,)
+            )}
+
+    def build_project(self, config):
+        intake = self.intake_receipts(config["id"])
+        return Project(config, {relative: row for relative, row in intake.items() if row["included"]})
+
+    def import_batch(self, project_id, batch, images):
+        with self.lock:
+            project = self.project(project_id)
+            receipts = self.intake_receipts(project_id)
+            overlay = self.overlay(project_id, include_documents=True)
+            known = {row["sha256"] for row in receipts.values()}
+            known.update(item["image_sha256"] for item in project.items
+                         if item["status"] != "unstarted" and item["image_sha256"])
+            known.update(row["document"].get("labelpilot", {}).get("image_sha256") for row in overlay.values())
+            existing = {item["relative"] for item in project.items
+                        if overlay.get(item["id"], item)["status"] != "unstarted"}
+            new = {}
+            for image in images:
+                relative, sha256 = image["relative"], image["sha256"]
+                if relative in receipts or relative in existing:
+                    continue
+                new[relative] = {**image, "batch": batch, "included": sha256 not in known}
+                known.add(sha256)
+            if new:
+                combined = {**receipts, **new}
+                replacement = Project(project.config, {relative: row for relative, row in combined.items() if row["included"]})
+                with self.connect() as connection:
+                    connection.executemany("INSERT OR IGNORE INTO intake_receipts VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                           ((project_id, relative, batch, row["sha256"], row["width"], row["height"], row["included"])
+                                            for relative, row in new.items()))
+                self.projects[project_id] = replacement
+                receipts = combined
+        imported = [row for row in receipts.values() if row["batch"] == batch]
+        return {"included": sum(row["included"] for row in imported), "duplicates": sum(not row["included"] for row in imported)}
 
     def register(self, config):
         config = copy.deepcopy(config)
@@ -314,7 +386,7 @@ class Store:
     def rescan(self, project_id):
         with self.lock:
             project = self.project(project_id)
-            replacement = Project(project.config)
+            replacement = self.build_project(project.config)
             self.projects[project_id] = replacement
         return replacement.summary()
 
@@ -360,6 +432,10 @@ class Store:
         review_queue = status in REVIEW_FILTERS
         reason = REVIEW_FILTERS.get(status)
         overlays = self.overlay(project_id, include_documents=include_documents, include_review=review_queue)
+        excluded = self.similarity_exclusions(project_id, batch) if status == "curated" else set()
+        audits = self.audit_summaries(project_id) if status == "audit" else {}
+        routed_queue = status in ("triage", "spot_review", "routable")
+        routes = self.review_routes(project_id) if routed_queue else {}
         counts = dict.fromkeys(STATUSES, 0)
         filtered = []
         for original in project.items:
@@ -375,13 +451,114 @@ class Store:
                     continue
             else:
                 item.pop("review", None)
-                if status and item["status"] != status:
+                if status == "curated":
+                    if item["status"] != "unstarted" or item["id"] in excluded:
+                        continue
+                elif status == "audit":
+                    finding = audits.get(item["id"])
+                    if not finding or item["status"] not in AUDITABLE or finding["version"] != item.get("version", 0):
+                        continue
+                    item["audit"] = finding
+                elif status == "auditable":
+                    if item["status"] not in AUDITABLE:
+                        continue
+                elif routed_queue:
+                    route = routes.get(item["id"])
+                    if item["status"] not in PENDING_REVIEW:
+                        continue
+                    if status == "routable":
+                        if route and route["version"] == item.get("version", 0):
+                            continue
+                    elif not route or (status == "spot_review" and not route["sample"]):
+                        continue
+                    if route:
+                        item["route"] = route
+                elif status and item["status"] != status:
                     continue
             filtered.append(item)
         if review_queue:
             filtered.sort(key=review_priority)
+        if status == "audit":
+            filtered.sort(key=lambda item: (-item["audit"]["confidence"], -item["audit"]["count"]))
+        if status == "triage":
+            filtered.sort(key=lambda item: -item["route"]["priority"])
         return {"items": filtered[offset:offset + limit], "filtered": len(filtered),
                 "total": len(project.items), "counts": counts, "offset": offset, "limit": limit}
+
+    def review_routes(self, project_id):
+        with self.connect() as connection:
+            return {row["item"]: {"version": row["version"], "sample": bool(row["sample"]), **json.loads(row["result"])}
+                    for row in connection.execute("SELECT item, version, result, sample FROM review_routes WHERE project=?", (project_id,))}
+
+    def save_review_route(self, project_id, item_id, version, result):
+        with self.connect() as connection:
+            connection.execute("INSERT OR REPLACE INTO review_routes VALUES (?, ?, ?, ?, 0)",
+                               (project_id, item_id, version, json.dumps(result, ensure_ascii=False)))
+
+    def set_review_sample(self, project_id, ids, samples):
+        with self.connect() as connection:
+            connection.executemany("UPDATE review_routes SET sample=? WHERE project=? AND item=?",
+                                   ((item_id in samples, project_id, item_id) for item_id in ids))
+
+    def similarity_exclusions(self, project_id, batch):
+        with self.connect() as connection:
+            row = connection.execute("SELECT excluded FROM similarity_selection WHERE project=? AND batch=?",
+                                     (project_id, batch)).fetchone()
+        return set(json.loads(row["excluded"])) if row else set()
+
+    def save_similarity_selection(self, project_id, batch, ids):
+        project = self.project(project_id)
+        if not isinstance(batch, str) or not isinstance(ids, list) or len(ids) > 10000:
+            raise Problem("相似图筛选范围无效", 422)
+        if any(not isinstance(item_id, str) or item_id not in project.by_id or
+               (batch and project.by_id[item_id]["batch"] != batch) for item_id in ids):
+            raise Problem("相似图不在所选批次内，请重新扫描", 422)
+        excluded = sorted(set(ids))
+        with self.connect() as connection:
+            connection.execute("INSERT OR REPLACE INTO similarity_selection VALUES (?, ?, ?)",
+                               (project_id, batch, json.dumps(excluded)))
+        return {"excluded": len(excluded)}
+
+    def audit_summaries(self, project_id):
+        with self.connect() as connection:
+            return {row["item"]: {"version": row["version"], **json.loads(row["summary"])}
+                    for row in connection.execute("SELECT item, version, summary FROM annotation_audits WHERE project=?", (project_id,))}
+
+    def audit_detail(self, project_id, item_id):
+        self.project(project_id).item(item_id)
+        with self.connect() as connection:
+            row = connection.execute("SELECT version, evidence FROM annotation_audits WHERE project=? AND item=?",
+                                     (project_id, item_id)).fetchone()
+        if not row:
+            return None
+        current = self.detail(project_id, item_id)
+        evidence = json.loads(row["evidence"])
+        if (current["version"], current["image_sha256"], current["source_fingerprint"]) != (
+            row["version"], evidence["image_sha256"], evidence["source_fingerprint"]
+        ):
+            return None
+        return evidence
+
+    def save_audit(self, project_id, item_id, evidence, summary):
+        with self.connect() as connection:
+            if summary:
+                connection.execute("INSERT OR REPLACE INTO annotation_audits VALUES (?, ?, ?, ?, ?)",
+                                   (project_id, item_id, evidence["version"], json.dumps(summary), json.dumps(evidence, ensure_ascii=False)))
+            else:
+                connection.execute("DELETE FROM annotation_audits WHERE project=? AND item=?", (project_id, item_id))
+
+    def dismiss_audit(self, project_id, item_id, evidence_id):
+        self.project(project_id).item(item_id)
+        if not isinstance(evidence_id, str):
+            raise Problem("请重新载入疑点结果", 422)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT evidence FROM annotation_audits WHERE project=? AND item=?",
+                                     (project_id, item_id)).fetchone()
+            if row and json.loads(row["evidence"]).get("id") != evidence_id:
+                raise Problem("疑点已重新扫描，请刷新后复核", 409)
+            connection.execute("DELETE FROM annotation_audits WHERE project=? AND item=?", (project_id, item_id))
+        return {"dismissed": True}
 
     def image_info(self, project, item, *, verify_image=False):
         path = Path(item["path"])
@@ -466,53 +643,63 @@ class Store:
             raise Problem("空标注不能自动作为负样本；请明确确认此图没有目标", 422)
 
     def save(self, project_id, item_id, payload, predicted=False):
+        return self.save_many(project_id, [(item_id, payload)], predicted=predicted)[0]
+
+    def prepare_save(self, project_id, item_id, payload, predicted):
         project = self.project(project_id)
         if payload.get("status") not in (("predicted",) if predicted else ("draft", "reviewed", "skipped")):
             raise Problem("无效的审核状态", 422)
+        current = self.detail(project_id, item_id)
+        if payload.get("expected_version") != current["version"]:
+            raise Problem("标注已在其他窗口更新，请重新载入后再编辑", 409)
+        if payload.get("image_sha256") != current["image_sha256"]:
+            raise Problem("原图指纹不一致", 409)
+        if current["version"] == 0 and payload.get("source_fingerprint") != current["source_fingerprint"]:
+            raise Problem("原生标注已被其他工具更新，请重新载入", 409)
+        if predicted and current["status"] != "unstarted":
+            raise Problem("批量预标注不能覆盖任何已有标注", 409)
+        document = copy.deepcopy(payload.get("document", {}))
+        status = payload["status"]
+        self.validate(project, document, current["width"], current["height"], status, payload.get("confirmed_empty", False))
+        version = current["version"] + 1
+        timestamp = now()
+        previous_meta = current["document"].get("labelpilot", {})
+        provenance = copy.deepcopy(document.get("labelpilot", {}).get("prediction"))
+        document["labelpilot"] = {**previous_meta, "status": status, "revision": version,
+                                  "updated_at": timestamp, "image_sha256": current["image_sha256"],
+                                  "source_annotation": current["item"].get("source"),
+                                  "source_fingerprint": current["source_fingerprint"],
+                                  "negative_sample_confirmed": status == "reviewed" and not document["shapes"],
+                                  "human_reviewed": status == "reviewed",
+                                  "prediction": provenance}
+        document["checked"] = status == "reviewed"
+        document["imageData"] = None
+        if isinstance(document.get("preannotation"), dict):
+            document["preannotation"]["human_reviewed"] = status == "reviewed"
+            document["preannotation"]["negative_sample_confirmed"] = status == "reviewed" and not document["shapes"]
+            document["preannotation"]["status"] = "human_reviewed" if status == "reviewed" else "model_prediction_unreviewed"
+        result = {"version": version, "status": status, "document": document, "updated": timestamp}
+        return current, result
+
+    def save_many(self, project_id, entries, *, predicted=False):
         with self.lock:
-            current = self.detail(project_id, item_id)
-            if payload.get("expected_version") != current["version"]:
-                raise Problem("标注已在其他窗口更新，请重新载入后再编辑", 409)
-            if payload.get("image_sha256") != current["image_sha256"]:
-                raise Problem("原图指纹不一致", 409)
-            if current["version"] == 0 and payload.get("source_fingerprint") != current["source_fingerprint"]:
-                raise Problem("原生标注已被其他工具更新，请重新载入", 409)
-            if predicted and current["status"] != "unstarted":
-                raise Problem("批量预标注不能覆盖任何已有标注", 409)
-            document = copy.deepcopy(payload.get("document", {}))
-            status = payload["status"]
-            self.validate(project, document, current["width"], current["height"], status, payload.get("confirmed_empty", False))
-            version = current["version"] + 1
-            timestamp = now()
-            previous_meta = current["document"].get("labelpilot", {})
-            provenance = copy.deepcopy(document.get("labelpilot", {}).get("prediction"))
-            document["labelpilot"] = {**previous_meta, "status": status, "revision": version,
-                                      "updated_at": timestamp, "image_sha256": current["image_sha256"],
-                                      "source_annotation": current["item"].get("source"),
-                                      "source_fingerprint": current["source_fingerprint"],
-                                      "negative_sample_confirmed": status == "reviewed" and not document["shapes"],
-                                      "human_reviewed": status == "reviewed",
-                                      "prediction": provenance}
-            document["checked"] = status == "reviewed"
-            document["imageData"] = None
-            if isinstance(document.get("preannotation"), dict):
-                document["preannotation"]["human_reviewed"] = status == "reviewed"
-                document["preannotation"]["negative_sample_confirmed"] = status == "reviewed" and not document["shapes"]
-                document["preannotation"]["status"] = "human_reviewed" if status == "reviewed" else "model_prediction_unreviewed"
-            encoded = json.dumps(document, ensure_ascii=False, allow_nan=False)
+            prepared = [(item_id, *self.prepare_save(project_id, item_id, payload, predicted)) for item_id, payload in entries]
             with self.connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                row = connection.execute("SELECT version FROM annotations WHERE project=? AND item=?", (project_id, item_id)).fetchone()
-                if (row["version"] if row else 0) != current["version"]:
-                    raise Problem("标注已被另一个进程更新，请重新载入", 409)
-                if not row:
-                    baseline = json.dumps(current["document"], ensure_ascii=False, allow_nan=False)
-                    connection.execute("INSERT INTO revisions VALUES (?, ?, ?, ?, ?, ?)",
-                                       (project_id, item_id, 0, current["status"], baseline, timestamp))
-                values = (project_id, item_id, version, status, encoded, timestamp)
-                connection.execute("INSERT OR REPLACE INTO annotations VALUES (?, ?, ?, ?, ?, ?)", values)
-                connection.execute("INSERT INTO revisions VALUES (?, ?, ?, ?, ?, ?)", values)
-            return {"version": version, "status": status, "document": document, "updated": timestamp}
+                for item_id, current, result in prepared:
+                    row = connection.execute("SELECT version FROM annotations WHERE project=? AND item=?",
+                                             (project_id, item_id)).fetchone()
+                    if (row["version"] if row else 0) != current["version"]:
+                        raise Problem("标注已被另一个进程更新，请重新载入", 409)
+                    if not row:
+                        baseline = json.dumps(current["document"], ensure_ascii=False, allow_nan=False)
+                        connection.execute("INSERT INTO revisions VALUES (?, ?, ?, ?, ?, ?)",
+                                           (project_id, item_id, 0, current["status"], baseline, result["updated"]))
+                    encoded = json.dumps(result["document"], ensure_ascii=False, allow_nan=False)
+                    values = (project_id, item_id, result["version"], result["status"], encoded, result["updated"])
+                    connection.execute("INSERT OR REPLACE INTO annotations VALUES (?, ?, ?, ?, ?, ?)", values)
+                    connection.execute("INSERT INTO revisions VALUES (?, ?, ?, ?, ?, ?)", values)
+        return [result for _, _, result in prepared]
 
     def history(self, project_id, item_id):
         self.project(project_id).item(item_id)

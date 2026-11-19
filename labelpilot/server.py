@@ -13,13 +13,18 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from .annotation_tools import inherit_next, interpolate_frames, prompt_box
 from .augmentation import augmentation_presets
-from .blindsets import freeze_blindset, list_blindsets
+from .automation import Automation
+from .blindsets import freeze_blindset, frozen_image_bytes, frozen_image_path, get_blindset, list_blindsets
+from .comparison_details import review_frame, review_frames
+from .curation import similar_frames
 from .evaluation import ComparisonJobs
 from .exporting import export_project, preview_export
 from .inference import Inference, Jobs
 from . import model_files
 from .store import IMAGE_SUFFIXES, Problem, Store
+from .tracking import track_frames
 from .training import TrainingJobs, has_training_dependencies
 
 
@@ -34,12 +39,15 @@ def create_app(home=None):
     jobs = Jobs(store, inference)
     training = TrainingJobs(store, inference, jobs)
     comparisons = ComparisonJobs(store, jobs)
+    automation = Automation(store, jobs, training, comparisons)
 
     @asynccontextmanager
     async def lifespan(app):
+        automation.begin()
         try:
             yield
         finally:
+            automation.shutdown()
             comparisons.shutdown()
             training.shutdown()
 
@@ -49,6 +57,7 @@ def create_app(home=None):
     app.state.jobs = jobs
     app.state.training = training
     app.state.comparisons = comparisons
+    app.state.automation = automation
     app.state.token = secrets.token_urlsafe(32)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"])
 
@@ -77,7 +86,7 @@ def create_app(home=None):
     @app.get("/", response_class=HTMLResponse)
     def index():
         version = hashlib.sha256(b"".join((ASSETS / name).read_bytes() for name in
-                                         ("index.html", "app.js", "style.css"))).hexdigest()[:16]
+                                         ("index.html", "efficiency.js", "resume.js", "automation.js", "app.js", "style.css"))).hexdigest()[:16]
         return (ASSETS / "index.html").read_text(encoding="utf-8").replace(
             "__SESSION_TOKEN__", app.state.token).replace("__ASSET_VERSION__", version)
 
@@ -191,6 +200,70 @@ def create_app(home=None):
     def predict(project_id: str, item_id: str, payload: dict):
         return inference.predict(project_id, item_id, payload)
 
+    @app.post("/api/projects/{project_id}/items/{item_id}/prompt-box")
+    def propose_box(project_id: str, item_id: str, payload: dict):
+        return prompt_box(store, project_id, item_id, payload)
+
+    @app.post("/api/projects/{project_id}/sequence/inherit")
+    def sequence_inherit(project_id: str, payload: dict):
+        return inherit_next(store, project_id, payload)
+
+    @app.post("/api/projects/{project_id}/sequence/preview")
+    def sequence_preview(project_id: str, payload: dict):
+        return interpolate_frames(store, project_id, payload)
+
+    @app.post("/api/projects/{project_id}/sequence/apply")
+    def sequence_apply(project_id: str, payload: dict):
+        return interpolate_frames(store, project_id, payload, apply=True)
+
+    @app.post("/api/projects/{project_id}/tracking/preview")
+    def tracking_preview(project_id: str, payload: dict):
+        return track_frames(store, project_id, payload)
+
+    @app.post("/api/projects/{project_id}/tracking/apply")
+    def tracking_apply(project_id: str, payload: dict):
+        return track_frames(store, project_id, payload, apply=True)
+
+    @app.get("/api/projects/{project_id}/automation")
+    def automation_status(project_id: str):
+        return automation.view(project_id)
+
+    @app.put("/api/projects/{project_id}/automation")
+    def automation_settings(project_id: str, payload: dict):
+        return automation.configure(project_id, payload)
+
+    @app.post("/api/projects/{project_id}/automation/runs", status_code=202)
+    def automation_run(project_id: str, payload: dict):
+        return automation.enqueue(project_id, payload.get("kind"), payload.get("batch", ""), configuration=payload.get("recipe"))
+
+    @app.post("/api/projects/{project_id}/automation/runs/{run_id}/retry", status_code=202)
+    def automation_retry(project_id: str, run_id: str):
+        return automation.retry(project_id, run_id)
+
+    @app.post("/api/projects/{project_id}/automation/runs/{run_id}/activate")
+    def automation_activate(project_id: str, run_id: str):
+        return automation.activate(project_id, run_id)
+
+    @app.post("/api/projects/{project_id}/similarity/scan")
+    def similarity_scan(project_id: str, payload: dict):
+        return similar_frames(store, project_id, payload.get("batch", ""), payload.get("level", "balanced"))
+
+    @app.post("/api/projects/{project_id}/similarity/selection")
+    def similarity_selection(project_id: str, payload: dict):
+        return store.save_similarity_selection(project_id, payload.get("batch", ""), payload.get("excluded"))
+
+    @app.post("/api/projects/{project_id}/audits", status_code=202)
+    def start_audit(project_id: str, payload: dict):
+        return jobs.start(project_id, payload, audit=True)
+
+    @app.get("/api/projects/{project_id}/items/{item_id}/audit")
+    def item_audit(project_id: str, item_id: str):
+        return store.audit_detail(project_id, item_id)
+
+    @app.post("/api/projects/{project_id}/items/{item_id}/audit/dismiss")
+    def dismiss_audit(project_id: str, item_id: str, payload: dict):
+        return store.dismiss_audit(project_id, item_id, payload.get("id"))
+
     @app.get("/api/projects/{project_id}/jobs")
     def list_jobs(project_id: str):
         store.project(project_id)
@@ -267,6 +340,32 @@ def create_app(home=None):
     def comparison_report(project_id: str, run_id: str):
         path = comparisons.report(project_id, run_id)
         return FileResponse(path, filename=f"labelpilot-compare-{run_id[:8]}.json")
+
+    @app.get("/api/projects/{project_id}/comparisons/{run_id}/frames")
+    def comparison_frames(project_id: str, run_id: str, label: str, kind: str,
+                          offset: int = Query(0, ge=0, le=10000), limit: int = Query(30, ge=1, le=100)):
+        _, database = comparisons.details(project_id, run_id)
+        return review_frames(database, label, kind, offset, limit)
+
+    @app.get("/api/projects/{project_id}/comparisons/{run_id}/frames/{frame_id}")
+    def comparison_frame(project_id: str, run_id: str, frame_id: str):
+        _, database = comparisons.details(project_id, run_id)
+        return review_frame(database, frame_id)
+
+    @app.get("/api/projects/{project_id}/comparisons/{run_id}/frames/{frame_id}/image")
+    def comparison_frame_image(project_id: str, run_id: str, frame_id: str):
+        record, database = comparisons.details(project_id, run_id)
+        item = review_frame(database, frame_id, image=True)
+        directory, _ = get_blindset(store, project_id, record["set_id"])
+        path = frozen_image_path(directory, item)
+        contents = frozen_image_bytes(path, item)
+        with Image.open(io.BytesIO(contents)) as original:
+            media = {"JPEG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp"}.get(original.format)
+            if media:
+                return Response(contents, media_type=media)
+            output = io.BytesIO()
+            original.convert("RGB").save(output, "PNG")
+        return Response(output.getvalue(), media_type="image/png")
 
     @app.post("/api/projects/{project_id}/export/preview")
     def export_preview(project_id: str, payload: dict):

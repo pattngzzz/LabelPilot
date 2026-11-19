@@ -18,7 +18,7 @@ async function eventually(callback) {
   throw new Error("Browser test timed out waiting for application state");
 }
 
-test("annotation, review, export, training and model comparison controls", {timeout:120000}, async context => {
+test("annotation, review, export, training and workbench efficiency workflows", {timeout:120000}, async context => {
   const root = path.resolve(__dirname, "..");
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "labelpilot-browser-test-"));
   const images = path.join(home, "images");
@@ -43,6 +43,20 @@ test("annotation, review, export, training and model comparison controls", {time
   fs.mkdirSync(path.join(selectionFolder, "子目录"));
   fs.copyFileSync(path.join(images,"image_0.png"), path.join(selectionFolder,"子目录","嵌套.PNG"));
   fs.writeFileSync(path.join(selectionFolder,"ignore.txt"), "not an image");
+  const efficiencyFrames = path.join(selectionHome, "连续帧");
+  fs.mkdirSync(efficiencyFrames);
+  const efficiencyFixture = spawnSync(python, ["-c", `
+from PIL import Image, ImageDraw
+from pathlib import Path
+import sys
+directory = Path(sys.argv[1])
+for index in range(6):
+    image = Image.new("RGB", (320, 220), "#13202f" if index < 4 else "#5c2178")
+    x = 35 + min(index, 4)*22
+    ImageDraw.Draw(image).rectangle((x, 50, x+79, 116), fill="#edc13b")
+    image.save(directory / f"part_{index:03}.png", "PNG" if index < 5 else "JPEG")
+`, efficiencyFrames], {windowsHide:true, encoding:"utf8"});
+  assert.equal(efficiencyFixture.status, 0, efficiencyFixture.stderr || efficiencyFixture.error?.message);
   const manifestPath = path.join(home, "capture-manifest.json");
   fs.writeFileSync(manifestPath, JSON.stringify({tasks:["capture-a", "capture-a", "capture-b", "capture-c"].map((group, index) => ({
     package_image:`image_${index}.png`, source_group:group
@@ -60,6 +74,7 @@ import uvicorn
 from fastapi.responses import HTMLResponse, Response
 from labelpilot import evaluation
 from labelpilot.blindsets import read_snapshot, verified_manifest
+from labelpilot.comparison_details import record_frame, write_details
 from labelpilot.evaluation_worker import frozen_frames
 from labelpilot.server import create_app
 from labelpilot.store import atomic_json, read_json
@@ -68,20 +83,36 @@ def comparison_fixture(run, stop, module, directory, copies):
     snapshot = read_snapshot(directory)
     manifest = verified_manifest(directory, snapshot)
     setup = read_json(run / "compare.json")
-    truths = [name for _, _, labels, _ in frozen_frames(directory, snapshot, manifest) for name, _ in labels]
-    rows = []
-    for name in manifest["classes"]:
-        count = truths.count(name)
-        rows.append({"name": name,
-                     "old": {"ground_truth": count, "matched": 0, "missed": count,
-                             "false_positives": 1, "recall": 0 if count else None},
-                     "new": {"ground_truth": count, "matched": count, "missed": 0,
-                             "false_positives": 0, "recall": 1 if count else None}})
-    atomic_json(run / "report.json", {"snapshot": snapshot, "classes": rows, **setup})
+    frames = frozen_frames(directory, snapshot, manifest)
+    negative = next(i for i, (_, _, labels, _) in enumerate(frames) if not labels)
+    results = {}
+    with write_details(run) as detail:
+        for role in ("old", "new"):
+            counts = {name: dict.fromkeys(("ground_truth", "matched", "missed", "false_positives"), 0)
+                      for name in manifest["classes"]}
+            for i, (_, item, labels, size) in enumerate(frames):
+                raw = [(name, .85, box) for name, box in labels if (name == "class_a") == (role == "old")]
+                if role == "old" and i == negative:
+                    raw.append(("class_b", .65, (10, 10, 100, 100)))
+                predictions = evaluation.count_detections(counts, labels, raw, .5)
+                record_frame(detail, role, i, item, labels, size, predictions)
+            for row in counts.values():
+                row["recall"] = row["matched"] / row["ground_truth"] if row["ground_truth"] else None
+            results[role] = counts
+    rows = [{"name": name, "old": results["old"][name], "new": results["new"][name]} for name in manifest["classes"]]
+    atomic_json(run / "report.json", {"snapshot": snapshot, "classes": rows, "has_details": True, **setup})
 
 evaluation.has_training_dependencies = lambda: True
 evaluation.run_local_worker = comparison_fixture
 app = create_app()
+def audit_prediction_fixture(project_id, item_id, options, **kwargs):
+    current = app.state.store.detail(project_id, item_id)
+    shapes = current["document"]["shapes"]
+    predictions = [{**shapes[0], "label": "another", "score": .92}] if current["item"]["photo_id"] == "part_002" and shapes else []
+    return {"base_version": current["version"], "image_sha256": current["image_sha256"], "shapes": predictions,
+            "provenance": {"confidence": options["confidence"]}}
+
+app.state.inference.predict = audit_prediction_fixture
 @app.middleware("http")
 async def legacy_assets(request, call_next):
     if request.url.path == "/__legacy_cache_test":
@@ -177,6 +208,7 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await cdp("Page.navigate", {url});
     await cdp("Emulation.setDeviceMetricsOverride", {width:1600, height:1000, deviceScaleFactor:1, mobile:false});
     await waitFor('typeof state!=="undefined" && state.current && !state.busy');
+    await evaluate('element("autoDraft").checked=false; element("autoDraft").dispatchEvent(new Event("change"));');
     await check('window.legacyAssetLoaded!==true && getComputedStyle(document.body).getPropertyValue("--legacy-style-loaded").trim()!=="1" && /[?&]v=[a-f0-9]{16}/.test(document.querySelector("script[src]").src) && /[?&]v=[a-f0-9]{16}/.test(document.querySelector("link[rel=stylesheet]").href)', "A normal navigation bypasses cached legacy assets and loads a matching versioned script and stylesheet");
     let cursor=await point([320,240]);
     await cdp("Input.dispatchMouseEvent", {type:"mouseMoved", buttons:0, ...cursor});
@@ -608,6 +640,31 @@ with zipfile.ZipFile(sys.argv[1]) as archive:
     assert.equal(comparisonReport.options.match_iou, .5);
     const comparisonScreenshot = await cdp("Page.captureScreenshot", {format:"png"});
     fs.writeFileSync(path.join(home,"comparison.png"), Buffer.from(comparisonScreenshot.data,"base64"));
+    const setReviewValue = (id, value) => evaluate(`(()=>{const field=element(${JSON.stringify(id)});field.value=${JSON.stringify(value)};field.dispatchEvent(new Event("change",{bubbles:true}));})()`);
+    await click('[data-review-label="class_a"][data-review-kind="new_missed"]');
+    await waitFor('element("comparisonReviewDialog").open && !element("comparisonFrame").hidden && element("comparisonFrameNewImage").querySelector("img")?.naturalWidth');
+    await check('element("comparisonReviewKind").value==="new_missed" && element("comparisonReviewClass").value==="class_a" && element("comparisonFrameOldImage").querySelectorAll(".comparison-frame-box.matched").length===1 && element("comparisonFrameNewImage").querySelector(".comparison-frame-box.truth").textContent.includes("漏检")', "A missed count opens the exact class and image with frozen truth and old/new predictions");
+    await setReviewValue("comparisonReviewKind", "newly_missed");
+    await waitFor('element("comparisonFrameNewImage").querySelector(".focused")?.textContent.includes("新增漏检")');
+    await check('element("comparisonReviewStatus").textContent.includes("1 张图 · 1 个漏检")', "The regression filter highlights the specific newly missed target");
+    const reviewScreenshot = await cdp("Page.captureScreenshot", {format:"png"});
+    fs.writeFileSync(path.join(home,"comparison-review.png"), Buffer.from(reviewScreenshot.data,"base64"));
+    for (const width of [1024, 760, 400]) {
+      await cdp("Emulation.setDeviceMetricsOverride", {width,height:850,deviceScaleFactor:1,mobile:false});
+      await sleep(100);
+      await check('(()=>{const dialog=element("comparisonReviewDialog");const rect=dialog.getBoundingClientRect();return rect.left>=0 && rect.right<=innerWidth && rect.top>=0 && rect.bottom<=innerHeight && dialog.scrollWidth<=dialog.clientWidth && element("comparisonFrameNewImage").querySelector("img").clientWidth>100;})()', `Per-image review stays usable at width ${width}`);
+    }
+    await cdp("Emulation.setDeviceMetricsOverride", {width:1600,height:1000,deviceScaleFactor:1,mobile:false});
+    await setReviewValue("comparisonReviewKind", "fixed_missed");
+    await waitFor('element("comparisonFrame").hidden && element("comparisonReviewStatus").textContent.includes("0 张图")');
+    const fixedClass = await evaluate('comparisonUi.reportData.classes.find(row=>row.old.missed>0 && row.new.matched>0).name');
+    await setReviewValue("comparisonReviewClass", fixedClass);
+    await waitFor('element("comparisonFrameNewImage").querySelector(".focused")?.textContent.includes("修复漏检")');
+    await evaluate('element("comparisonReviewDialog").close();');
+    await click('[data-review-label="class_b"][data-review-kind="old_false_positives"]');
+    await waitFor('element("comparisonFrameOldImage").querySelector(".comparison-frame-box.false-positive") && !element("comparisonFrame").hidden');
+    await check('element("comparisonReviewKind").value==="old_false_positives" && element("comparisonReviewStatus").textContent.includes("1 个误检") && !element("comparisonFrameOldImage").querySelector(".comparison-frame-box.truth")', "The false-positive count opens the negative image and renders its unmatched prediction");
+    await evaluate('element("comparisonReviewDialog").close();');
     for (const width of [1024, 760, 400]) {
       await cdp("Emulation.setDeviceMetricsOverride", {width,height:850,deviceScaleFactor:1,mobile:false});
       await sleep(100);
@@ -698,6 +755,119 @@ with zipfile.ZipFile(sys.argv[1]) as archive:
     await check('state.items.length===6 && state.items.some(item=>item.photo_id==="嵌套")', "Folder import includes nested images while excluding unsupported files");
     await check(`(async()=>JSON.stringify(await api("/api/projects/test/items/"+${JSON.stringify(originalItemId)}))===${JSON.stringify(originalStoredAnnotation)})()`, "Choosing new datasets never overwrites annotations in the original project");
     context.diagnostic("Real file multiselect, Chinese folders, cancellation, invalid paths, persistent imports, annotation saving and recursive folder selection passed");
+
+    await evaluate(`(async()=>{
+      const project=await api("/api/projects","POST",{name:"Efficiency modes",image_root:${JSON.stringify(efficiencyFrames)},
+        classes:["part","another"],model_path:${JSON.stringify(firstModel)}});
+      state.projects.push(project);
+      element("projectSelect").add(new Option(project.name,project.id));
+      await selectProject(project.id);
+    })()`);
+    await waitFor('state.current?.item.photo_id==="part_000" && !state.busy');
+    const changeMode = mode => setReviewValue("efficiencyMode", mode);
+    await changeMode("fourpoint");
+    await waitFor('state.tool==="fourpoint"');
+    for (const xy of [[75,50],[75,117],[35,80],[115,80]]) await mouseClick(await point(xy));
+    await waitFor('element("labelPicker").open');
+    await press("q","KeyQ");
+    await waitFor('!element("labelPicker").open && state.current.document.shapes.length===1');
+    await check('state.tool==="fourpoint" && Math.abs(bounds(state.current.document.shapes[0])[0]-35)<1 && Math.abs(bounds(state.current.document.shapes[0])[3]-117)<1', "Four edge clicks yield a labeled rectangle, and the mode stays ready for the next object");
+    for (const xy of [[217,150],[217,186],[198,168],[236,168]]) await mouseClick(await point(xy));
+    await waitFor('element("labelPicker").open');
+    await press("q","KeyQ");
+    await waitFor('!element("labelPicker").open && state.current.document.shapes.length===2');
+    await evaluate('selectShape(0)');
+    await changeMode("fast");
+    await waitFor('element("fastControls").hidden===false && state.selected===0');
+    await press("]","BracketRight");
+    await waitFor('state.selected===1');
+    await press("2","Digit2");
+    await check('(()=>{const [l,t,r,b]=bounds(state.current.document.shapes[1]),[x,y]=screenPoint([(l+r)/2,(t+b)/2]);return state.current.document.shapes[1].label==="another" && Math.abs(x-viewport().width/2)<2 && Math.abs(y-viewport().height/2)<2;})()', "Fast review centers the next box and reassigns its class from the keyboard");
+    await click("#fastFull");
+    await check('state.selected===-1 && state.dirty', "Returning to the whole frame preserves edits for its human review");
+    await changeMode("sequence");
+    await click('[data-shape="0"]');
+    await click("#markFirstFrame");
+    await waitFor('!state.busy && element("efficiencyHint").textContent.includes("起点 part_000")');
+    await click("#inheritNext");
+    await waitFor('state.current?.item.photo_id==="part_001" && !state.busy && state.current.status==="draft"');
+    await check('state.current.document.shapes.length===1 && state.current.document.shapes[0].annotation_origin==="inherit_previous"', "Inheriting the selected box lands on the next same-sequence frame with a draft");
+
+    const endpointFrame = await evaluate('state.items.find(item=>item.photo_id==="part_003").id');
+    await click(`[data-item="${endpointFrame}"]`);
+    await waitFor('state.current?.item.photo_id==="part_003" && !state.busy');
+    await changeMode("prompt");
+    await waitFor('state.tool==="prompt"');
+    await mouseClick(await point([125,78]));
+    await waitFor('!element("acceptPrompt").disabled');
+    await click("#promptNegative");
+    await mouseClick(await point([258,166]));
+    await waitFor('!element("acceptPrompt").disabled');
+    await click("#acceptPrompt");
+    await waitFor('element("labelPicker").open');
+    await press("q","KeyQ");
+    await waitFor('!element("labelPicker").open && state.current.document.shapes.length===1');
+    await check('bounds(state.current.document.shapes[0]).every((coord,index)=>Math.abs(coord-[101,50,181,117][index])<1)', "Real local point prompting proposes the target box and accepts it through the standard label picker");
+    await changeMode("sequence");
+    await click('[data-shape="0"]');
+    await click("#previewLastFrame");
+    await waitFor('element("sequenceDialog").open && element("sequenceTarget").options[0]?.text==="part_002"');
+    await check('element("sequenceSummary").textContent.includes("1 张草稿") && element("sequencePreview").querySelector(".comparison-frame-box")!==null', "Keyframe interpolation previews the intermediate box and skips the already inherited draft");
+    await click("#sequenceApply");
+    await waitFor('!element("sequenceDialog").open && state.items.find(item=>item.photo_id==="part_002")?.status==="draft"');
+
+    await click("#similarityButton");
+    await click("#scanSimilarity");
+    await waitFor('!element("similarityResults").hidden && element("similarityCards").querySelectorAll("input").length===2');
+    await click("#similarityKeepRecommended");
+    await check('element("similaritySelectionInfo").textContent.includes("队列保留 1 张") && element("similarityCards").querySelectorAll("input:checked").length===1', "Visual screening groups a PNG and its re-encoded JPEG and allows retaining the representative");
+    const similarityScreenshot = await cdp("Page.captureScreenshot", {format:"png"});
+    fs.writeFileSync(path.join(home,"similarity-review.png"), Buffer.from(similarityScreenshot.data,"base64"));
+    await click("#applySimilarity");
+    await waitFor('!element("similarityDialog").open && !state.busy && element("statusSelect").value==="curated" && state.items.length===1');
+
+    await click("#auditButton");
+    await click("#startAudit");
+    await waitFor('element("auditStatus").textContent.includes("扫描完成") && element("auditStatus").textContent.includes("疑点 1 张")');
+    await click("#openAuditQueue");
+    await waitFor('!element("auditFrameBar").hidden && state.current?.item.photo_id==="part_002"');
+    await check('element("auditFrameReasons").textContent.includes("类别冲突 1") && state.current.document.shapes[0].label==="part"', "Suspicion review opens the flagged frame next to its unchanged manual label");
+    await click("#toggleAuditOverlay");
+    await check('element("toggleAuditOverlay").getAttribute("aria-pressed")==="false"', "The audit hint overlay can be toggled while the frame stays editable");
+    await click("#dismissAuditFrame");
+    await waitFor('state.items.length===0 && element("auditFrameBar").hidden && !state.current');
+
+    await setReviewValue("statusSelect", "");
+    await waitFor('!state.busy && state.items.length===6 && state.current?.item.photo_id==="part_000"');
+    const resumeItem = await evaluate('state.items.find(item=>item.photo_id==="part_003").id');
+    const prefetchItem = await evaluate('state.items.find(item=>item.photo_id==="part_004").id');
+    await click(`[data-item="${resumeItem}"]`);
+    await waitFor('state.current?.item.photo_id==="part_003" && !state.busy');
+    await waitFor(`performance.getEntriesByType("resource").some(entry=>entry.name.endsWith("/items/${prefetchItem}/image"))`);
+    await check('!element("autoDraft").checked', "The draft preference survives workspace navigation");
+    await click("#autoDraft");
+    await box([21,158],[55,185]);
+    await press("q","KeyQ");
+    await waitFor('state.current.document.shapes.length===2 && !state.dirty && element("autoSaveStatus").textContent.includes("自动保存")');
+    const savedVersion = await evaluate('state.current.version');
+    await evaluate('zoom(1.35); window.beforeResumeReload=true;');
+    const savedZoom = await evaluate('state.scale');
+    await sleep(280);
+    await cdp("Page.reload");
+    await waitFor(`window.beforeResumeReload!==true && typeof state!=="undefined" && !state.busy && state.current?.item.id===${JSON.stringify(resumeItem)}`);
+    await check(`state.current.version===${savedVersion} && state.current.status==="draft" && state.selected===1 && Math.abs(state.scale-${savedZoom})<.001`, "Idle editing saves a draft and a reload restores the image, box selection and zoom");
+
+    await click("#automationButton");
+    await waitFor('element("automationDialog").open && !element("runIntake").disabled');
+    await click("#workflowRepresentatives");
+    await click("#runIntake");
+    await waitFor('document.querySelector("[data-workflow-run]")?.textContent.includes("待审核 1 张")');
+    await check('element("workflowRuns").textContent.includes("暂缓 1 张") && !!element("workflowRuns").querySelector("[data-workflow-action=triage]")', "The new batch pipeline groups similar images, prelabels the representative and exposes its review queue");
+    const workflowScreenshot = await cdp("Page.captureScreenshot", {format:"png"});
+    fs.writeFileSync(path.join(home,"automation.png"), Buffer.from(workflowScreenshot.data,"base64"));
+    await click('[data-workflow-action="triage"]');
+    await waitFor('!element("automationDialog").open && element("statusSelect").value==="triage" && state.items.length===1 && !state.busy');
+    await check('state.current.status==="predicted" && element("imageList").textContent.includes("无候选框")', "Automated routing keeps empty outputs pending for human review");
     assert.deepEqual(errors, [], "No browser runtime errors");
   } finally {
     if (socket?.readyState === WebSocket.OPEN && cdp) await cdp("Browser.close").catch(() => {});

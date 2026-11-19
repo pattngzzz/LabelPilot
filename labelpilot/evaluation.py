@@ -6,6 +6,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from .blindsets import ID, get_blindset, verified_manifest
+from .comparison_details import DETAILS_FILE
 from .store import Problem, atomic_json, digest, now
 from .training import LocalJobCancelled, has_training_dependencies, read_state, run_local_worker
 
@@ -22,28 +23,30 @@ def iou(first, second):
 
 
 def count_detections(counts, labels, detections, threshold):
-    truth_by_class, predicted_by_class = defaultdict(list), defaultdict(list)
-    for name, box in labels:
-        truth_by_class[name].append(box)
-    for name, score, box in detections:
-        if name in counts:
-            predicted_by_class[name].append((score, box))
-    for name in truth_by_class.keys() | predicted_by_class.keys():
-        truth = truth_by_class[name]
-        available = list(range(len(truth)))
-        predictions = sorted(predicted_by_class[name], key=lambda row: row[0], reverse=True)
-        for _, box in predictions:
-            if not available:
-                break
-            match = max(available, key=lambda index: iou(truth[index], box))
-            if iou(truth[match], box) >= threshold:
-                available.remove(match)
-        matched = len(truth) - len(available)
+    unmatched = defaultdict(list)
+    for index, (name, _) in enumerate(labels):
+        unmatched[name].append(index)
+        counts[name]["ground_truth"] += 1
+        counts[name]["missed"] += 1
+
+    predictions = sorted((row for row in detections if row[0] in counts), key=lambda row: row[1], reverse=True)
+    details = []
+    for name, confidence, box in predictions:
         row = counts[name]
-        row["ground_truth"] += len(truth)
-        row["matched"] += matched
-        row["missed"] += len(available)
-        row["false_positives"] += len(predictions) - matched
+        available = unmatched[name]
+        match, overlap = None, None
+        if available:
+            candidate, score = max(((index, iou(labels[index][1], box)) for index in available), key=lambda entry: entry[1])
+            if score >= threshold:
+                match, overlap = candidate, score
+                available.remove(match)
+        if match is None:
+            row["false_positives"] += 1
+        else:
+            row["matched"] += 1
+            row["missed"] -= 1
+        details.append({"label": name, "confidence": confidence, "box": box, "truth_index": match, "iou": overlap})
+    return details
 
 
 def comparison_options(payload):
@@ -125,7 +128,7 @@ class ComparisonJobs:
                 record["progress"] = read_state(self.directory / run_id / "progress.json")
         return sorted(records, key=lambda row: row["created_at"], reverse=True)[:20]
 
-    def start(self, project_id, payload):
+    def start(self, project_id, payload, *, task_id=None):
         directory, snapshot = get_blindset(self.store, project_id, payload.get("set_id"))
         options = comparison_options(payload)
         weights = {name: weight_path(payload.get(f"{name}_path")) for name in ("old", "new")}
@@ -135,7 +138,7 @@ class ComparisonJobs:
             raise Problem("当前 Python 缺少 PyTorch 或 Ultralytics", 422)
         self.prediction_jobs.reserve_model_slot()
         try:
-            run_id = uuid.uuid4().hex
+            run_id = task_id or uuid.uuid4().hex
             run = self.directory / run_id
             record = {"id": run_id, "project": project_id, "set_id": snapshot["id"], "set_name": snapshot["name"],
                       "images": snapshot["images"], "status": "preparing", "created_at": now(), "options": options,
@@ -172,6 +175,13 @@ class ComparisonJobs:
         if record["status"] != "completed" or not path.is_file():
             raise Problem("对比报告尚不可用", 404)
         return path
+
+    def details(self, project_id, run_id):
+        record = self.get(project_id, run_id)
+        path = self.directory / run_id / DETAILS_FILE
+        if record["status"] != "completed" or not path.is_file():
+            raise Problem("逐图记录尚不可用。早期记录可重新对比生成明细。", 404)
+        return record, path.resolve()
 
     def run(self, run, record, directory, snapshot, weights, stop):
         result = {"status": "failed"}

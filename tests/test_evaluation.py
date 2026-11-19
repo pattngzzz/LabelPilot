@@ -1,12 +1,15 @@
 import re
 import threading
 import time
+from io import BytesIO
 
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from labelpilot import evaluation, training
 from labelpilot.blindsets import freeze_blindset, get_blindset, verified_manifest
+from labelpilot.comparison_details import record_frame, write_details
 from labelpilot.evaluation_worker import frozen_frames
 from labelpilot.server import create_app
 from labelpilot.store import Problem, atomic_json, digest, read_json
@@ -17,10 +20,14 @@ def test_counts_use_one_to_one_same_class_matching_and_count_negatives():
     names = ("object", "other", "absent")
     counts = {name: dict.fromkeys(("ground_truth", "matched", "missed", "false_positives"), 0) for name in names}
     first, second, third = (0, 0, 10, 10), (20, 20, 30, 30), (40, 40, 50, 50)
-    evaluation.count_detections(counts, [("object", box) for box in (first, second, third)], [
+    details = evaluation.count_detections(counts, [("object", box) for box in (first, second, third)], [
         ("object", .4, first), ("object", .95, first), ("object", .8, (25, 25, 35, 35)),
         ("other", .9, second), ("object", .75, (40, 40, 45, 50)), ("out_of_scope", .9, second),
     ], .5)
+    assert [(box["label"], box["truth_index"], box["iou"]) for box in details] == [
+        ("object", 0, 1), ("other", None, None), ("object", None, None),
+        ("object", 2, .5), ("object", None, None),
+    ]
     evaluation.count_detections(counts, [], [("other", .9, first)], .5)
     assert counts == {
         "object": {"ground_truth": 3, "matched": 2, "missed": 1, "false_positives": 2},
@@ -157,5 +164,65 @@ def test_workbench_reserves_holdout_and_runs_comparison(tmp_path, monkeypatch, c
         else:
             assert report.status_code == 200 and report.json()["snapshot"] == frozen["id"]
             assert "attachment" in report.headers["content-disposition"]
+            assert client.get(f"{comparisons}/{run_id}/frames", params={"label": "object", "kind": "old_missed"}).status_code == 404
         assert client.get(f"/api/projects/other/comparisons/{run_id}/report").status_code == 404
         assert not app.state.inference.lock.locked()
+
+
+def test_image_review_tracks_targets_even_when_total_misses_are_the_same(tmp_path):
+    store, project, source = make_project(tmp_path, [
+        ("positive", "red", "held"), ("negative_a", "black", "other"), ("negative_b", "gray", "other"),
+    ])
+    first, second = (10, 15, 35, 39), (48, 50, 80, 85)
+    annotate(store, project, "positive", "reviewed", [
+        rectangle(points=[list(box[:2]), list(box[2:])]) for box in (first, second)
+    ])
+    for photo in ("negative_a", "negative_b"):
+        annotate(store, project, photo, "reviewed", [])
+    frozen = freeze_blindset(store, project, {"name": "Audit", "percent": 100})
+    directory, _ = get_blindset(store, project, frozen["id"])
+    frames = frozen_frames(directory, frozen, verified_manifest(directory, frozen))
+    positive_image, positive, *_ = next(frame for frame in frames if frame[1]["photo_id"] == "positive")
+    run_id = "a" * 32
+    run = store.data / "comparisons" / run_id
+    run.mkdir(parents=True)
+    owner = {"id": run_id, "project": project, "set_id": frozen["id"], "status": "completed"}
+    atomic_json(run / "job.json", owner)
+    with write_details(run) as detail:
+        for role, box in (("old", first), ("new", second)):
+            counts = {"object": dict.fromkeys(("ground_truth", "matched", "missed", "false_positives"), 0)}
+            for index, (_, item, labels, size) in enumerate(frames):
+                raw = [("object", .8, box)] if labels or role == "new" else []
+                predictions = evaluation.count_detections(counts, labels, raw, .5)
+                record_frame(detail, role, index, item, labels, size, predictions)
+            assert counts["object"]["missed"] == 1
+
+    # Change the live annotation and pixels after evaluation. The viewer uses the frozen pair.
+    annotate(store, project, "positive", "reviewed", [rectangle(label="other")])
+    Image.new("RGB", (96, 96), "blue").save(source / "positive.png")
+    url = f"/api/projects/{project}/comparisons/{run_id}/frames"
+    with TestClient(create_app(store.home)) as client:
+        for kind in ("old_missed", "new_missed", "newly_missed", "fixed_missed"):
+            page = client.get(url, params={"label": "object", "kind": kind}).json()
+            assert page["total"] == page["count"] == 1
+            assert page["items"] == [{"id": positive["id"], "photo_id": "positive", "count": 1}]
+        params = {"label": "object", "kind": "new_false_positives", "limit": 1}
+        page = client.get(url, params=params).json()
+        next_page = client.get(url, params={**params, "offset": 1}).json()
+        assert page["total"] == page["count"] == 2
+        assert page["items"][0]["photo_id"] == "negative_a" and next_page["items"][0]["photo_id"] == "negative_b"
+        assert client.get(url, params={**params, "kind": "anything"}).status_code == 422
+
+        endpoint = f"{url}/{positive['id']}"
+        frame = client.get(endpoint).json()
+        assert frame["truth"] == [{"label": "object", "box": list(box)} for box in (first, second)]
+        assert frame["old"][0]["truth_index"] == 0 and frame["new"][0]["truth_index"] == 1
+        response = client.get(f"{endpoint}/image")
+        assert response.headers["content-type"] == "image/png"
+        with Image.open(BytesIO(response.content)) as image:
+            assert image.getpixel((0, 0)) == (255, 0, 0)
+        assert client.get(f"{url}/unknown/image").status_code == 404
+        assert client.get(f"/api/projects/other/comparisons/{run_id}/frames/{positive['id']}/image").status_code == 404
+
+        positive_image.write_bytes((source / "positive.png").read_bytes())
+        assert client.get(f"{endpoint}/image").status_code == 409

@@ -1,5 +1,4 @@
 import gc
-import hashlib
 import io
 import math
 import os
@@ -9,7 +8,8 @@ from pathlib import Path
 
 from PIL import Image
 
-from .blindsets import read_snapshot, verified_manifest
+from .blindsets import frozen_image_bytes, frozen_image_path, read_snapshot, verified_manifest
+from .comparison_details import record_frame, write_details
 from .evaluation import count_detections
 from .inference import DISABLED_INTEGRATIONS
 from .store import Problem, atomic_json, digest, read_annotation_snapshot, read_json
@@ -20,10 +20,10 @@ def frozen_frames(directory, snapshot, manifest):
     root = (directory / "dataset").resolve()
     frames = []
     for item in manifest["items"]:
-        image = (root / item["image"]).resolve()
+        image = frozen_image_path(directory, item)
         annotation = f"annotations/{image.stem}.json"
         label_path = (root / annotation).resolve()
-        if not image.is_relative_to(root) or not label_path.is_relative_to(root):
+        if not label_path.is_relative_to(root / "annotations"):
             raise Problem("盲测快照路径无效", 409)
         document, fingerprint = read_annotation_snapshot(label_path)
         if fingerprint != snapshot["annotation_sha256"].get(annotation):
@@ -37,9 +37,7 @@ def frozen_frames(directory, snapshot, manifest):
 
 
 def predict_frame(model, names, image_path, item, size, options, device):
-    contents = image_path.read_bytes()
-    if hashlib.sha256(contents).hexdigest() != item["sha256"]:
-        raise Problem(f"{item['photo_id']} 的盲测图片与冻结版本不一致", 409)
+    contents = frozen_image_bytes(image_path, item)
     with Image.open(io.BytesIO(contents)) as image:
         output = model.predict(image.convert("RGB"), conf=options["confidence"], iou=options["nms_iou"],
                                imgsz=options["image_size"], device=device, max_det=options["max_det"],
@@ -76,34 +74,37 @@ def compare(run, directory, inputs):
     SETTINGS.update({name: False for name in DISABLED_INTEGRATIONS if name in SETTINGS})
     device = 0 if torch.cuda.is_available() else "cpu"
     results = {}
-    for model_index, role in enumerate(("old", "new")):
-        path = inputs / f"{role}.pt"
-        if digest(path) != models[role]["sha256"]:
-            raise Problem("评测权重副本的指纹已改变", 409)
-        model = YOLO(str(path))
-        if model.task != "detect":
-            raise Problem(f"{models[role]['filename']} 需要是 YOLO 目标检测权重", 422)
-        names = [model.names[index] for index in range(len(model.names))]
-        shared = min(len(names), len(classes))
-        if not shared or names[:shared] != classes[:shared]:
-            raise Problem(f"{models[role]['filename']} 的类别 ID / 名称与盲测集不匹配", 422)
-        models[role]["class_names"] = names
-        counts = {name: dict.fromkeys(("ground_truth", "matched", "missed", "false_positives"), 0) for name in classes}
-        for index, (image, item, labels, size) in enumerate(frames, 1):
-            predictions = predict_frame(model, names, image, item, size, options, device)
-            count_detections(counts, labels, predictions, options["match_iou"])
-            if index in (1, len(frames)) or index % 5 == 0:
-                atomic_json(run / "progress.json", {"model": role, "done": model_index * len(frames) + index,
-                                                     "total": 2 * len(frames)})
-        for row in counts.values():
-            row["recall"] = row["matched"] / row["ground_truth"] if row["ground_truth"] else None
-        results[role] = counts
-        del model
-        gc.collect()
-        if device == 0:
-            torch.cuda.empty_cache()
+    with write_details(run, working_directory=inputs) as details:
+        for model_index, role in enumerate(("old", "new")):
+            path = inputs / f"{role}.pt"
+            if digest(path) != models[role]["sha256"]:
+                raise Problem("评测权重副本的指纹已改变", 409)
+            model = YOLO(str(path))
+            if model.task != "detect":
+                raise Problem(f"{models[role]['filename']} 需要是 YOLO 目标检测权重", 422)
+            names = [model.names[index] for index in range(len(model.names))]
+            shared = min(len(names), len(classes))
+            if not shared or names[:shared] != classes[:shared]:
+                raise Problem(f"{models[role]['filename']} 的类别 ID / 名称与盲测集不匹配", 422)
+            models[role]["class_names"] = names
+            counts = {name: dict.fromkeys(("ground_truth", "matched", "missed", "false_positives"), 0) for name in classes}
+            for index, (image, item, labels, size) in enumerate(frames, 1):
+                predictions = predict_frame(model, names, image, item, size, options, device)
+                matches = count_detections(counts, labels, predictions, options["match_iou"])
+                record_frame(details, role, index, item, labels, size, matches)
+                if index in (1, len(frames)) or index % 5 == 0:
+                    atomic_json(run / "progress.json", {"model": role, "done": model_index * len(frames) + index,
+                                                         "total": 2 * len(frames)})
+            for row in counts.values():
+                row["recall"] = row["matched"] / row["ground_truth"] if row["ground_truth"] else None
+            results[role] = counts
+            del model
+            gc.collect()
+            if device == 0:
+                torch.cuda.empty_cache()
     atomic_json(run / "report.json", {"snapshot": {key: snapshot[key] for key in ("id", "name", "images", "manifest_sha256")},
                                       "models": models, "options": options, "runtime": {"device": device, "ultralytics": __version__, "torch": str(torch.__version__)},
+                                      "has_details": True,
                                       "classes": [{"name": name, "old": results["old"][name], "new": results["new"][name]} for name in classes]})
 
 

@@ -902,7 +902,7 @@ def test_model_allows_append_only_custom_labels():
 def test_asset_versions_change_with_frontend_content(dataset, tmp_path, monkeypatch):
     assets = tmp_path / "frontend"
     assets.mkdir()
-    for name in ("index.html", "app.js", "style.css"):
+    for name in ("index.html", "efficiency.js", "resume.js", "automation.js", "app.js", "style.css"):
         (assets / name).write_bytes((server.ASSETS / name).read_bytes())
     monkeypatch.setattr(server, "ASSETS", assets)
     with TestClient(create_app(dataset[0])) as client:
@@ -911,8 +911,9 @@ def test_asset_versions_change_with_frontend_content(dataset, tmp_path, monkeypa
         assert "__ASSET_VERSION__" not in page.text
         version = re.search(r'/static/app.js\?v=([a-f0-9]{16})', page.text).group(1)
         assert f'/static/style.css?v={version}' in page.text
+        assert f'/static/efficiency.js?v={version}' in page.text
         assert version in client.get("/").text
-        for name in ("app.js", "style.css"):
+        for name in ("efficiency.js", "resume.js", "automation.js", "app.js", "style.css"):
             for suffix in ("", f"?v={version}"):
                 response = client.get(f"/static/{name}{suffix}")
                 assert response.status_code == 200
@@ -923,6 +924,7 @@ def test_asset_versions_change_with_frontend_content(dataset, tmp_path, monkeypa
             new_version = re.search(r'/static/app.js\?v=([a-f0-9]{16})', updated).group(1)
             assert new_version != version
             assert f'/static/style.css?v={new_version}' in updated
+            assert f'/static/efficiency.js?v={new_version}' in updated
             version = new_version
 
 
