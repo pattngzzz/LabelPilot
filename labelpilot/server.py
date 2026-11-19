@@ -15,7 +15,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .exporting import export_project
 from .augmentation import augmentation_presets
 from .inference import Inference, Jobs
-from . import model_files
+from . import model_files, native_picker
 from .store import IMAGE_SUFFIXES, Problem, Store
 
 
@@ -90,6 +90,10 @@ def create_app(home=None):
     def browse_images(payload: dict):
         path = payload.get("path")
         return model_files.browse(str(Path.home()) if path is None else path, IMAGE_SUFFIXES)
+
+    @app.post("/api/images/select")
+    def select_images(payload: dict):
+        return native_picker.select_images(payload.get("mode"), payload.get("path"))
 
     @app.post("/api/projects/{project_id}/model")
     def model(project_id: str, payload: dict):

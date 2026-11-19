@@ -15,7 +15,7 @@ from PIL import Image
 
 from labelpilot.exporting import export_project, plan_splits
 from labelpilot.augmentation import PRESETS, augmented_variants, plan_augmentation, validate_augmented_sample
-from labelpilot import model_files
+from labelpilot import model_files, native_picker
 from labelpilot import server
 from labelpilot.inference import Inference, Jobs, model_class_names
 from labelpilot.server import create_app
@@ -756,6 +756,118 @@ def test_image_browser_api_filters_and_preserves_source_without_existing_project
                                                      "image_files": ["选择.PNG"], "classes": ["Raw_Label"]}, headers=headers)
         assert response.status_code == 200 and response.json()["total"] == 1
     assert all(digest(path) == fingerprint for path, fingerprint in sources.items())
+
+
+def test_native_image_picker_api_security_and_selection(dataset, monkeypatch):
+    home, images, native, predictions = dataset
+    chosen = images / "中文 选择.PNG"
+    Image.new("RGB", (24, 12)).save(chosen)
+    app = create_app(home)
+    before = {path: digest(path) for root in (home, images, native, predictions)
+              for path in root.rglob("*") if path.is_file()}
+    calls = []
+
+    def run(command, **options):
+        calls.append((command, options))
+        selected = [str(chosen), str(images / "human.jpg")]
+        return native_picker.subprocess.CompletedProcess(command, 0, json.dumps(selected, ensure_ascii=False), "")
+
+    monkeypatch.setattr(native_picker.subprocess, "run", run)
+    with TestClient(app) as client:
+        headers = {"X-LabelPilot-Token": app.state.token}
+        data = {"mode": "file", "path": str(images)}
+        assert client.post("/api/images/select", json=data).status_code == 403
+        assert client.post("/api/images/select", json=data,
+                           headers={**headers, "Origin": "https://evil.example"}).status_code == 403
+        assert not calls
+        response = client.post("/api/images/select", json=data, headers=headers)
+        assert response.status_code == 200
+        assert response.json() == {"cancelled": False, "image_root": str(images),
+                                   "image_files": [chosen.name, "human.jpg"]}
+        for invalid in ({}, {"mode": "other"}, {"mode": "file", "path": []},
+                        {"mode": "file", "path": "bad\x00path"}):
+            assert client.post("/api/images/select", json=invalid, headers=headers).status_code == 422
+    assert len(calls) == 1
+    command, options = calls[0]
+    assert command[-2:] == ["-m", "labelpilot.native_picker"]
+    assert json.loads(options["input"]) == {"mode": "file", "path": str(images)}
+    assert options["encoding"] == "utf-8" and options["timeout"] == native_picker.PICKER_TIMEOUT
+    assert options["capture_output"] and options["cwd"] == Path(native_picker.__file__).resolve().parent.parent
+    assert all(digest(path) == fingerprint for path, fingerprint in before.items())
+
+
+@pytest.mark.parametrize("mode,selected", [("file", []), ("folder", []), ("folder", ["folder"])])
+def test_native_image_picker_folder_and_cancel(dataset, monkeypatch, mode, selected):
+    images = dataset[1]
+    paths = [str(images)] if selected else []
+    monkeypatch.setattr(native_picker.subprocess, "run", lambda *args, **options:
+                        native_picker.subprocess.CompletedProcess(args[0], 0, json.dumps(paths), ""))
+    expected = {"cancelled": False, "image_root": str(images), "image_files": []} if selected else {"cancelled": True}
+    assert native_picker.select_images(mode, str(images / "missing")) == expected
+    assert not native_picker.PICKER_LOCK.locked()
+
+
+@pytest.mark.parametrize("selected", [None, {}, [123], [""], ["bad\x00path"], ["relative.jpg"],
+                                     ["missing.jpg"], ["unsupported.txt"], ["human.jpg", "human.jpg"],
+                                     ["human.jpg", "../native/human.json"], ["human.jpg"] * 10001])
+def test_native_image_picker_rejects_invalid_results(dataset, monkeypatch, selected):
+    images = dataset[1]
+    (images / "unsupported.txt").write_text("not an image", encoding="utf8")
+    if isinstance(selected, list):
+        selected = [str(images / value) if isinstance(value, str) and value and "\x00" not in value
+                    and value != "relative.jpg" else value for value in selected]
+    monkeypatch.setattr(native_picker.subprocess, "run", lambda *args, **options:
+                        native_picker.subprocess.CompletedProcess(args[0], 0, json.dumps(selected), ""))
+    with pytest.raises(Problem) as caught:
+        native_picker.select_images("file")
+    assert caught.value.status == 422
+    assert not native_picker.PICKER_LOCK.locked()
+
+
+@pytest.mark.parametrize("failure,status", [("timeout", 408), ("launch", 503), ("exit", 503), ("json", 503)])
+def test_native_image_picker_errors_release_lock(monkeypatch, failure, status):
+    def run(command, **options):
+        if failure == "timeout":
+            raise native_picker.subprocess.TimeoutExpired(command, options["timeout"])
+        if failure == "launch":
+            raise OSError("fixture")
+        return native_picker.subprocess.CompletedProcess(command, 1 if failure == "exit" else 0, "not json", "")
+
+    monkeypatch.setattr(native_picker.subprocess, "run", run)
+    with pytest.raises(Problem) as caught:
+        native_picker.select_images("folder")
+    assert caught.value.status == status
+    assert not native_picker.PICKER_LOCK.locked()
+
+
+def test_native_image_picker_prevents_duplicate_windows(dataset, monkeypatch):
+    calls = []
+    monkeypatch.setattr(native_picker.subprocess, "run", lambda *args, **options: calls.append(args))
+    with native_picker.PICKER_LOCK:
+        with pytest.raises(Problem) as caught:
+            native_picker.select_images("file")
+        assert caught.value.status == 409
+        assert not calls and native_picker.PICKER_LOCK.locked()
+    assert native_picker.initial_directory(str(dataset[1] / "human.jpg")) == str(dataset[1])
+    assert native_picker.initial_directory(str(dataset[1] / "missing")) == str(Path.home())
+
+
+def test_native_image_picker_rejects_cross_folder_files_and_invalid_folder_result(dataset, monkeypatch):
+    images = dataset[1]
+    nested = images / "nested"
+    nested.mkdir()
+    Image.new("RGB", (24, 12)).save(nested / "other.png")
+    selected = [str(images / "human.jpg"), str(nested / "other.png")]
+    monkeypatch.setattr(native_picker.subprocess, "run", lambda *args, **options:
+                        native_picker.subprocess.CompletedProcess(args[0], 0, json.dumps(selected), ""))
+    for mode in ("file", "folder"):
+        with pytest.raises(Problem) as caught:
+            native_picker.select_images(mode)
+        assert caught.value.status == 422
+    selected[:] = [str(images / "human.jpg")]
+    with pytest.raises(Problem) as caught:
+        native_picker.select_images("folder")
+    assert caught.value.status == 422 and not native_picker.PICKER_LOCK.locked()
 
 
 def test_original_label_names_not_translated(store, dataset):
