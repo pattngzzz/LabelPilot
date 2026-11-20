@@ -28,6 +28,18 @@ def reviewed(store, project, item, shapes, *, confirmed_empty=False):
                                         "expected_version": current["version"], "confirmed_empty": confirmed_empty})
 
 
+@pytest.mark.parametrize("labels", ["new_label\nbackground\n", "new_label\nexceeds_limit\n"])
+def test_semantic_label_file_import_rejects_reserved_or_excess_classes_atomically(tmp_path, labels):
+    store, project, _ = project_with_image(tmp_path, "semantic", [f"class_{index}" for index in range(253)])
+    registry = store.registry_path.read_bytes()
+    with pytest.raises(Problem, match="254"):
+        store.import_labels(project.id, "classes.txt", labels)
+    assert store.registry_path.read_bytes() == registry
+    assert len(project.names) == 253
+    assert store.import_labels(project.id, "classes.txt", "new_label\n")["added"] == 1
+    assert project.names[-1] == "new_label" and len(project.names) == 254
+
+
 def polygon(label, left, top, width, height):
     return {"label": label, "shape_type": "polygon", "points": [[left, top], [left + width, top],
             [left + width, top + height], [left, top + height]]}

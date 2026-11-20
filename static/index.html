@@ -120,7 +120,7 @@
       <aside class="inspector panel">
         <div class="inspector-tabs"><button class="selected" id="objectsTab">标注对象 <span id="objectCount">0</span></button><button id="classesTab">标签</button></div>
         <form class="label-composer" id="labelForm"><div><input id="newLabelInput" maxlength="160" placeholder="输入自定义标签" aria-label="自定义标签名称" autocomplete="off"><button class="button" id="addLabelButton" type="submit" title="新增标签；选中对象时同时赋给该对象">＋</button></div><small>保留原始名称 · 新标签追加 ID</small></form>
-        <div class="label-export"><button class="button" id="exportLabelsButton" type="button" title="导出当前项目完整类别表，保留原始名称与类别 ID">↓ 导出标签</button></div>
+        <div class="label-export"><button class="button" id="exportLabelsButton" type="button" title="导出当前项目完整类别表，保留原始名称与类别 ID">↓ 导出标签</button><button class="button" id="importLabelsButton" type="button" title="选择本机 classes.txt 或 class_map.json；只追加新标签，不改变已有 ID">↑ 导入标签</button><input id="importLabelsFile" type="file" accept=".txt,.json" aria-label="选择标签文件" hidden></div>
         <div class="inspector-content" id="objectsContent"><div class="annotation-summary"><span id="annotationSummary">请选择图片</span><button class="icon-button" id="toggleLabels" title="显示 / 隐藏类别文字 (L)">Aa</button></div><div class="object-list" id="objectList"></div><div class="shape-properties" id="shapeProperties" hidden><label>对象类别<select id="shapeClass"></select></label><div id="handPointEditor" class="hand-point-editor" hidden>
           <label>关键点<select id="jointSelect"></select></label>
           <label>可见性<select id="jointVisibility"><option value="2">可见</option><option value="1">遮挡</option><option value="0">未标注</option></select></label>

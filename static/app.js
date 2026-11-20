@@ -63,6 +63,7 @@ function setBusy(value, message="") {
   state.busy = value;
   for (const id of ["predictButton","singlePredict","batchPredict","saveModel","saveButton","reviewButton","skipButton","previousImage","nextImage","projectSelect","deleteShape","shapeClass","shapeDescription","shapeDifficult","newLabelInput","addLabelButton"]) element(id).disabled = value;
   element("exportLabelsButton").disabled = value || !state.project?.classes.length;
+  element("importLabelsButton").disabled = value || !state.project || element("addLabelButton").disabled;
   element("connectionStatus").textContent = value ? message || "正在处理…" : "本地工作区 · 仅本机可访问";
   efficiency.render();
   taskUi.render();
@@ -333,6 +334,7 @@ function classInfo(label) { return state.project.classes.find(item => item.name 
 function classCode(item) { return taskUi.type() === "semantic" ? "像素 " + (item.id + 1) : "ID " + item.id; }
 function renderClasses() {
   element("exportLabelsButton").disabled = state.busy || element("addLabelButton").disabled;
+  element("importLabelsButton").disabled = state.busy || element("addLabelButton").disabled;
   element("classList").innerHTML = state.project.classes.map((item,index) => `<button class="class-row ${state.activeClass === index ? "selected" : ""}" data-class="${index}" title="${escapeHtml(item.name)}"><span class="class-swatch" style="background:${item.color}"></span><span>${escapeHtml(item.name)}<small>${classCode(item)}</small></span>${index < 9 ? `<kbd>${index + 1}</kbd>` : ""}</button>`).join("");
   const previousLabel = element("shapeClass").value;
   element("shapeClass").innerHTML = state.project.classes.map(item => `<option value="${escapeHtml(item.name)}">${classCode(item)} · ${escapeHtml(item.name)}</option>`).join("");
@@ -358,6 +360,34 @@ function exportLabels() {
   }
 }
 
+async function importLabels() {
+  const input = element("importLabelsFile");
+  const file = input.files[0];
+  input.value = "";
+  if (!file || !state.project || state.busy || state.labelPickerSaving || element("addLabelButton").disabled) return;
+  if (!/\.(txt|json)$/i.test(file.name)) return toast("请选择 classes.txt 或 class_map.json 标签文件", true);
+  if (file.size > 1024 * 1024) return toast("标签文件不能超过 1 MB", true);
+  const projectId = state.project.id;
+  setBusy(true, "正在导入标签…");
+  try {
+    let content;
+    try {
+      content = new TextDecoder("utf-8", {fatal:true}).decode(await file.arrayBuffer());
+    } catch {
+      throw new Error("无法读取标签文件，请使用 UTF-8 编码的 TXT 或 JSON 文件");
+    }
+    const result = await api('/api/projects/' + projectId + '/labels/import', "POST", {filename:file.name, content});
+    if (state.project.id !== projectId) return;
+    Object.assign(state.project, result.project);
+    renderClasses();
+    renderObjects();
+    taskUi.projectSubtitle();
+    toast('标签导入完成 · 新增 ' + result.added + ' 个 · 已有或重复 ' + result.skipped + ' 个 · 原有 ID 和标注保持不变');
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function addCustomLabel() {
   if (!state.project || state.busy) return;
   const name = element("newLabelInput").value.trim();
@@ -365,6 +395,7 @@ async function addCustomLabel() {
   const projectId = state.project.id;
   element("addLabelButton").disabled = true;
   element("exportLabelsButton").disabled = true;
+  element("importLabelsButton").disabled = true;
   element("newLabelInput").disabled = true;
   try {
     const project = await api(projectUrl("/labels"), "POST", {name});
@@ -387,6 +418,7 @@ async function addCustomLabel() {
     element("addLabelButton").disabled = false;
     element("newLabelInput").disabled = false;
     element("exportLabelsButton").disabled = state.busy || !state.project?.classes.length;
+    element("importLabelsButton").disabled = state.busy || !state.project;
   }
 }
 
@@ -1796,6 +1828,11 @@ listen("zoomOut","click",()=>zoom(.8));listen("zoomIn","click",()=>zoom(1.25));l
 listen("focusButton","click",()=>toggleFocusMode());
 element("labelForm").addEventListener("submit",event=>{event.preventDefault();addCustomLabel().catch(error=>toast(error.message,true));});
 listen("exportLabelsButton","click",exportLabels);
+element("importLabelsButton").addEventListener("click",()=>{
+  if (!state.project || state.busy || state.labelPickerSaving || element("addLabelButton").disabled) return;
+  element("importLabelsFile").click();
+});
+listen("importLabelsFile","change",importLabels);
 element("pickerLabelForm").addEventListener("submit",event=>{event.preventDefault();applyPickedLabel().catch(error=>toast(error.message,true));});
 element("labelPicker").addEventListener("keydown",event=>{
   if(event.key.toLowerCase()!=="q" || event.ctrlKey || event.metaKey || event.altKey || event.isComposing)return;

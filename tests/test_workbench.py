@@ -1111,6 +1111,113 @@ def test_duplicate_custom_label_is_idempotent(store):
     assert store.project("test").names == ["object", "new_label"]
 
 
+def test_label_file_import_append_only_and_persistent(reviewed_store, dataset):
+    store = reviewed_store
+    sources = {path: digest(path) for folder in dataset[1:] for path in folder.rglob("*") if path.is_file()}
+    with store.connect() as connection:
+        before = {table: [tuple(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY item")]
+                  for table in ("annotations", "revisions")}
+    result = store.import_labels("test", "classes.txt", "\ufeffobject\r\nMixed_Name-v2\r\npanel\r\nMixed_Name-v2\r\n\r\n")
+    assert result["added"] == 2 and result["skipped"] == 2
+    assert [(label["id"], label["name"]) for label in result["project"]["classes"]] == [
+        (0, "object"), (1, "Mixed_Name-v2"), (2, "panel")]
+    repeated = store.import_labels("test", "classes.txt", "object\nMixed_Name-v2\npanel\n")
+    assert repeated["added"] == 0 and repeated["skipped"] == 3
+    reloaded = Store(store.home)
+    assert reloaded.project("test").names == ["object", "Mixed_Name-v2", "panel"]
+    exported = export_project(reloaded, "test", {"format": "yolo"})
+    with zipfile.ZipFile(store.home / "exports" / exported["filename"]) as archive:
+        assert archive.read("classes.txt").decode() == "object\nMixed_Name-v2\npanel\n"
+        for path in archive.namelist():
+            if path.startswith("labels/"):
+                assert all(line.startswith("0 ") for line in archive.read(path).decode().splitlines())
+    with store.connect() as connection:
+        after = {table: [tuple(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY item")]
+                 for table in ("annotations", "revisions")}
+    assert before == after
+    assert all(digest(path) == fingerprint for path, fingerprint in sources.items())
+
+
+@pytest.mark.parametrize("filename,content", [
+    ("classes.TXT", "object\nRaw_Label-v2\nPanel\n"),
+    ("classes.txt", "Raw_Label-v2\nobject\nPanel\n"),
+    ("class_map.json", '["Raw_Label-v2", "Panel"]'),
+    ("class_map.JSON", '\ufeff{"names": ["Raw_Label-v2", "Panel"]}'),
+    ("class_map.json", '{"names": {"1": "Panel", "0": "Raw_Label-v2"}}'),
+    ("class_map.json", '{"0": "Raw_Label-v2", "1": "Panel"}'),
+])
+def test_label_file_import_formats(store, filename, content):
+    result = store.import_labels("test", filename, content)
+    assert result["added"] == 2
+    assert store.project("test").names == ["object", "Raw_Label-v2", "Panel"]
+
+
+@pytest.mark.parametrize("filename,content", [
+    ("classes.txt", ""), ("classes.txt", " \n\r\n"), ("classes.txt", None),
+    ("classes.txt", "a" * (1024 * 1024 + 1)), ("classes.txt", "valid\n" + "a" * 161),
+    ("classes.txt", "valid\ncontrol\x00label"), ("classes.json", '["valid", 12]'),
+    ("classes.json", '["valid", ""]'), ("classes.json", '{"names": ["valid", "bad\\nlabel"]}'),
+    ("classes.json", '{"names": {"0": "valid", "2": "gap"}}'),
+    ("classes.json", '{"names": {"zero": "valid"}}'),
+    ("classes.json", '{"names": {"00": "valid"}}'),
+    ("classes.json", '{"names": {"-1": "valid"}}'),
+    ("classes.json", '{"names": []}'), ("classes.json", '{"names": "valid"}'),
+    ("classes.json", 'null'), ("classes.json", '["valid",'),
+    ("classes.yaml", "valid"), (None, "valid"),
+    ("classes.txt", "\ud800"), ("classes.json", '["valid", "\\ud800"]'),
+], ids=["empty", "whitespace", "non_text", "oversized", "long_label", "control_character",
+        "non_text_label", "empty_label", "newline_label", "id_gap", "non_numeric_id", "padded_id",
+        "negative_id", "empty_names", "non_list_names", "null_json", "malformed_json", "unsupported_type",
+        "missing_filename", "invalid_utf8", "invalid_json_unicode"])
+def test_invalid_label_file_import_is_atomic(store, filename, content):
+    registry = store.registry_path.read_bytes()
+    with pytest.raises(Problem) as caught:
+        store.import_labels("test", filename, content)
+    assert caught.value.status == 422
+    assert store.registry_path.read_bytes() == registry
+    assert store.project("test").names == ["object"]
+
+
+def test_label_file_import_preserves_source_mapping_and_other_project(store, dataset):
+    source = dataset[2] / "class_map.json"
+    source.write_text(json.dumps({"names": {"0": "object"}}), encoding="utf-8")
+    store.configs[0]["class_map_path"] = str(source)
+    store.registry_path.write_text(json.dumps(store.configs), encoding="utf-8")
+    store = Store(store.home)
+    other = store.register({"name": "Other", "image_root": str(dataset[1]), "classes": ["Other_Label"]})
+    fingerprint = digest(source)
+    store.import_labels("test", "classes.txt", "new_label\n")
+    reloaded = Store(store.home)
+    assert digest(source) == fingerprint
+    assert reloaded.project("test").names == ["object", "new_label"]
+    assert reloaded.configs[0]["imported_class_map_path"] == str(source)
+    assert "class_map_path" not in reloaded.configs[0]
+    assert reloaded.project(other["id"]).names == ["Other_Label"]
+
+
+def test_label_file_import_reuses_renamed_label(renamed_store):
+    result = renamed_store.import_labels("test", "classes.txt", "object\nobject_1\nNew_Label\n")
+    assert result["added"] == 1 and result["skipped"] == 2
+    assert renamed_store.project("test").names == ["object_1", "New_Label"]
+
+
+def test_label_file_import_http_security_and_validation(dataset):
+    app = create_app(dataset[0])
+    with TestClient(app) as client:
+        path = "/api/projects/test/labels/import"
+        data = {"filename": "classes.txt", "content": "object\nImported_Label\n"}
+        headers = {"X-LabelPilot-Token": app.state.token}
+        assert client.post(path, json=data).status_code == 403
+        assert client.post(path, json=data, headers={**headers, "Origin": "https://evil.example"}).status_code == 403
+        assert client.post(path, json={}, headers=headers).status_code == 422
+        assert client.post("/api/projects/missing/labels/import", json=data, headers=headers).status_code == 404
+        imported = client.post(path, json=data, headers=headers)
+        assert imported.status_code == 200
+        assert imported.json()["added"] == 1 and imported.json()["skipped"] == 1
+        assert imported.json()["project"]["classes"][-1] == {
+            "id": 1, "name": "Imported_Label", "display": "Imported_Label", "color": "#38bdf8"}
+
+
 @pytest.mark.parametrize("name", [None, "", "  ", "new\nlabel", "a" * 161])
 def test_invalid_custom_label_rejected(store, name):
     with pytest.raises(Problem):

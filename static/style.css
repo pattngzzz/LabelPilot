@@ -391,6 +391,8 @@ dialog.automation-dialog { width: min(1090px, calc(100vw - 24px)); }
 .task-tools .button { padding: 3px 7px; font-size: 10px; }
 .hand-point-editor > .button { margin-bottom: 12px; }
 .task-hint { padding: 8px 11px; color: var(--accent-text); border-left: 2px solid var(--accent-border); background: var(--accent-soft); font-size: 12px; }
+.label-export { display: flex; gap: 6px; }
+.label-export .button { flex: 1; min-width: 0; }
 
 @media (max-width: 780px) {
   .brand img { display: block; }

@@ -159,6 +159,10 @@ def create_app(home=None):
     def add_label(project_id: str, payload: dict):
         return store.add_label(project_id, payload.get("name"))
 
+    @app.post("/api/projects/{project_id}/labels/import")
+    def import_labels(project_id: str, payload: dict):
+        return store.import_labels(project_id, payload.get("filename"), payload.get("content"))
+
     @app.get("/api/projects/{project_id}/items")
     def items(project_id: str, query: str = "", batch: str = "", status: str = "",
               offset: int = Query(0, ge=0), limit: int = Query(80, ge=1, le=10000)):

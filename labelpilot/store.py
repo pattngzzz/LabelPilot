@@ -429,30 +429,70 @@ class Store:
         return replacement.summary()
 
     def add_label(self, project_id, name):
-        if not isinstance(name, str):
-            raise Problem("标签名称必须是文本", 422)
-        name = name.strip()
-        if not name or len(name) > 160 or any(ord(character) < 32 for character in name):
-            raise Problem("标签名称必须为 1 到 160 个字符，不能包含换行或控制字符", 422)
+        return self._add_labels(project_id, [name])["project"]
+
+    def import_labels(self, project_id, filename, content):
+        if not isinstance(filename, str) or Path(filename).suffix.lower() not in (".txt", ".json"):
+            raise Problem("请选择 classes.txt 或 class_map.json 标签文件", 422)
+        if not isinstance(content, str):
+            raise Problem("标签文件必须为 UTF-8 文本，且不能超过 1 MB", 422)
+        try:
+            size = len(content.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise Problem("标签文件必须为有效的 UTF-8 文本", 422)
+        if size > 1024 * 1024:
+            raise Problem("标签文件不能超过 1 MB", 422)
+        content = content.lstrip("\ufeff")
+        if Path(filename).suffix.lower() == ".txt":
+            names = [line.strip() for line in content.splitlines() if line.strip()]
+        else:
+            try:
+                value = json.loads(content)
+            except (ValueError, RecursionError):
+                raise Problem("标签 JSON 格式无效", 422)
+            names = value.get("names", value) if isinstance(value, dict) else value
+            if isinstance(names, dict):
+                if set(names) != {str(index) for index in range(len(names))}:
+                    raise Problem("类别 ID 必须从 0 连续排列", 422)
+                names = [names[str(index)] for index in range(len(names))]
+        if not isinstance(names, list) or not names:
+            raise Problem("标签文件为空或格式无效；请使用每行一个标签的 TXT 或 names 格式的 JSON", 422)
+        return self._add_labels(project_id, names, allow_aliases=True)
+
+    def _add_labels(self, project_id, names, *, allow_aliases=False):
+        normalized = []
+        for name in names:
+            if not isinstance(name, str):
+                raise Problem("标签名称必须是文本", 422)
+            name = name.strip()
+            if not name or len(name) > 160 or any(ord(character) < 32 or 0xD800 <= ord(character) <= 0xDFFF for character in name):
+                raise Problem("标签名称必须为 1 到 160 个字符，不能包含换行或控制字符", 422)
+            normalized.append(name)
         with self.lock:
             project = self.project(project_id)
-            if name in project.label_aliases:
-                raise Problem(f"该标签已更名为 {project.label_aliases[name]}，请使用新名称", 422)
-            if name in project.names:
-                return project.summary()
-            if project.task_type == "semantic" and (name == BACKGROUND or len(project.names) >= 254):
+            added = []
+            existing = set(project.names)
+            for name in normalized:
+                if name in project.label_aliases:
+                    if not allow_aliases:
+                        raise Problem(f"该标签已更名为 {project.label_aliases[name]}，请使用新名称", 422)
+                    name = project.label_aliases[name]
+                if name not in existing:
+                    added.append(name)
+                    existing.add(name)
+            if project.task_type == "semantic" and (BACKGROUND in added or len(existing) > 254):
                 raise Problem("语义分割最多支持 254 个前景类别，background 为保留类别", 422)
-            names = project.names + [name]
-            configs = copy.deepcopy(self.configs)
-            config = next(config for config in configs if config["id"] == project_id)
-            if config.get("class_map_path"):
-                config["imported_class_map_path"] = config.pop("class_map_path")
-            config["classes"] = names
-            atomic_json(self.registry_path, configs)
-            self.configs = configs
-            project.config = copy.deepcopy(config)
-            project.names = names
-        return project.summary()
+            if added:
+                configs = copy.deepcopy(self.configs)
+                config = next(config for config in configs if config["id"] == project_id)
+                if config.get("class_map_path"):
+                    config["imported_class_map_path"] = config.pop("class_map_path")
+                config["classes"] = project.names + added
+                atomic_json(self.registry_path, configs)
+                self.configs = configs
+                project.config = copy.deepcopy(config)
+                project.names = config["classes"]
+            return {"project": project.summary(), "added": len(added), "skipped": len(normalized) - len(added)}
 
     def overlay(self, project_id, include_documents=False, include_review=False):
         overlays = {}

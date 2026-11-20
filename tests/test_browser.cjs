@@ -142,6 +142,7 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     socket = new WebSocket(targets.find(target => target.type === "page").webSocketDebuggerUrl);
     await new Promise((resolve, reject) => {socket.onopen=resolve; socket.onerror=reject;});
     let sequence = 0;
+    let labelFileChooser = null;
     const pending = new Map();
     cdp = (method, params={}) => new Promise((resolve, reject) => {
       const id = ++sequence;
@@ -158,6 +159,7 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
         data.error ? request.reject(new Error(JSON.stringify(data.error))) : request.resolve(data.result);
       }
       if (data.method === "Runtime.exceptionThrown") errors.push(data.params);
+      if (data.method === "Page.fileChooserOpened") labelFileChooser = data.params;
       if (data.method === "Page.javascriptDialogOpening") cdp("Page.handleJavaScriptDialog", {accept:false});
     };
     const evaluate = async expression => {
@@ -845,6 +847,59 @@ print('Rotation ZIP: all angles, dimensions, exact normalized boxes and train-on
     assert.equal(fs.readFileSync(labelsAfterReload, "utf8"), expectedLabelText, "Standalone label export still includes persisted new classes after a reload");
     assert.equal(fs.readFileSync(downloadedLabels, "utf8"), expectedLabelText, "Reuse and later exports never overwrite the original class file");
     context.diagnostic("Standalone classes.txt download, unused custom classes, Unicode, ID order, pending input, busy guards, annotation preservation, real reimport and reload passed");
+
+    await check('!element("importLabelsButton").disabled && element("importLabelsButton").parentElement===element("exportLabelsButton").parentElement', "Label import is available beside label export in the right inspector");
+    await evaluate('setBusy(true);');
+    await check('element("importLabelsButton").disabled', "Label import is disabled while the workbench is busy");
+    await evaluate('setBusy(false);addShape([[20,20],[80,20],[80,80],[20,80]],"rectangle");');
+    const beforeLabelImport = await evaluate('JSON.stringify({current:state.current,dirty:state.dirty,selected:state.selected,activeClass:state.activeClass,undo:state.undo,redo:state.redo})');
+    const beforeLabelImportSaved = await evaluate('(async()=>JSON.stringify(await api(itemUrl())))()');
+    const labelImportOriginalNames = await evaluate('state.project.classes.map(label=>label.name)');
+    const labelImportFile = path.join(home, "import-classes.txt");
+    const labelImportText = "\ufeffImported_Raw-v3\r\n" + labelImportOriginalNames[0] + "\r\nImported_Raw-v3\r\nImported_样本\r\n";
+    fs.writeFileSync(labelImportFile, labelImportText, "utf8");
+    await cdp("Page.setInterceptFileChooserDialog", {enabled:true});
+    await click("#importLabelsButton");
+    await eventually(() => labelFileChooser);
+    assert.equal(labelFileChooser.mode, "selectSingle", "The import button opens a real single-file chooser rather than asking for a path");
+    await cdp("DOM.setFileInputFiles", {backendNodeId:labelFileChooser.backendNodeId, files:[labelImportFile]});
+    await cdp("Page.setInterceptFileChooserDialog", {enabled:false});
+    await waitFor('state.project.classes.at(-1).name==="Imported_样本" && !state.busy');
+    const labelImportNames = [...labelImportOriginalNames, "Imported_Raw-v3", "Imported_样本"];
+    await check('JSON.stringify(state.project.classes.map(label=>label.name))===' + JSON.stringify(JSON.stringify(labelImportNames)), "File import appends new names in file order and skips existing and duplicate names without translating");
+    await check('JSON.stringify({current:state.current,dirty:state.dirty,selected:state.selected,activeClass:state.activeClass,undo:state.undo,redo:state.redo})===' + JSON.stringify(beforeLabelImport), "Import preserves unsaved boxes, selection, active class and undo history");
+    await check('(async()=>JSON.stringify(await api(itemUrl()))===' + JSON.stringify(beforeLabelImportSaved) + ')()', "Import does not save or review the current image");
+    const setLabelFile = async filename => {
+      const document = await cdp("DOM.getDocument");
+      const input = await cdp("DOM.querySelector", {nodeId:document.root.nodeId, selector:"#importLabelsFile"});
+      await cdp("DOM.setFileInputFiles", {nodeId:input.nodeId, files:[filename]});
+    };
+    await evaluate('document.querySelectorAll(".toast").forEach(node=>node.remove());');
+    await setLabelFile(labelImportFile);
+    await waitFor('!state.busy && Array.from(document.querySelectorAll(".toast")).some(node=>node.textContent.includes("新增 0 个"))');
+    await check('element("importLabelsFile").value==="" && state.project.classes.length===' + labelImportNames.length, "Reselecting the same file is supported and never duplicates labels");
+    const invalidLabelFile = path.join(home, "invalid-labels.json");
+    fs.writeFileSync(invalidLabelFile, '["Should_Not_Be_Added", 12]', "utf8");
+    await setLabelFile(invalidLabelFile);
+    await waitFor('!state.busy && !!document.querySelector(".toast.error")');
+    await check('JSON.stringify(state.project.classes.map(label=>label.name))===' + JSON.stringify(JSON.stringify(labelImportNames)), "An invalid label file reports an error without partial imports");
+    const unicodeLabelFile = path.join(home, "invalid-encoding.txt");
+    fs.writeFileSync(unicodeLabelFile, Buffer.from([0xff, 0xfe, 0x41]));
+    await setLabelFile(unicodeLabelFile);
+    await waitFor('!state.busy && Array.from(document.querySelectorAll(".toast.error")).some(node=>node.textContent.includes("UTF-8"))');
+    for (const width of [1600,1024,760]) {
+      await cdp("Emulation.setDeviceMetricsOverride", {width,height:1000,deviceScaleFactor:1,mobile:false});
+      await check('(()=>{const imported=element("importLabelsButton").getBoundingClientRect(),exported=element("exportLabelsButton").getBoundingClientRect(),panel=element("importLabelsButton").closest(".inspector").getBoundingClientRect();return imported.width>0 && imported.left>=exported.right && Math.abs(imported.top-exported.top)<2 && imported.right<=panel.right;})()', "Import and export buttons remain side by side within the inspector at width " + width);
+    }
+    await cdp("Emulation.setDeviceMetricsOverride", {width:1600,height:1000,deviceScaleFactor:1,mobile:false});
+    await click("#saveButton");
+    await waitFor('!state.dirty && !state.busy');
+    await evaluate('window.beforeLabelImportReload=true;');
+    await cdp("Page.reload");
+    await waitFor('window.beforeLabelImportReload!==true && typeof state!=="undefined" && state.current && !state.busy && state.project.classes.at(-1).name==="Imported_样本"');
+    await check('JSON.stringify(state.project.classes.map(label=>label.name))===' + JSON.stringify(JSON.stringify(labelImportNames)), "Imported labels persist after a real browser reload");
+    assert.equal(fs.readFileSync(labelImportFile, "utf8"), labelImportText, "Import never overwrites the selected source label file");
+    context.diagnostic("Real file chooser, UTF-8 file upload, append-only labels, duplicate and invalid files, annotation preservation, responsive layout and reload persistence passed");
 
     await evaluate(`(async()=>{
       const project=await api("/api/projects","POST",{name:"Efficiency modes",image_root:${JSON.stringify(efficiencyFrames)},
