@@ -41,7 +41,7 @@ const taskUi = (() => {
       if (node.tagName === "OPTION") node.disabled = !available;
     });
     element("canvasHint").textContent = instructions[task];
-    element("classesHint").textContent = instructions[task];
+    element("classesHint").textContent = instructions[task] + " · 右侧 × 删除未使用标签";
     element("modelTaskHint").textContent = {
       detect:"选择类别顺序一致的目标检测权重。",
       segment:"使用实例分割权重，模型输出各对象的轮廓。",

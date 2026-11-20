@@ -64,6 +64,7 @@ function setBusy(value, message="") {
   for (const id of ["predictButton","singlePredict","batchPredict","saveModel","saveButton","reviewButton","skipButton","previousImage","nextImage","projectSelect","deleteShape","shapeClass","shapeDescription","shapeDifficult","newLabelInput","addLabelButton"]) element(id).disabled = value;
   element("exportLabelsButton").disabled = value || !state.project?.classes.length;
   element("importLabelsButton").disabled = value || !state.project || element("addLabelButton").disabled;
+  updateLabelDeleteButtons();
   element("connectionStatus").textContent = value ? message || "正在处理…" : "本地工作区 · 仅本机可访问";
   efficiency.render();
   taskUi.render();
@@ -332,15 +333,49 @@ function undo(redo=false) {
 
 function classInfo(label) { return state.project.classes.find(item => item.name === label) || {name:label,display:label,color:"#f87171"}; }
 function classCode(item) { return taskUi.type() === "semantic" ? "像素 " + (item.id + 1) : "ID " + item.id; }
+function updateLabelDeleteButtons() {
+  const disabled = state.busy || state.labelPickerSaving || element("addLabelButton").disabled || !state.project || state.project.classes.length <= 1;
+  element("classList").querySelectorAll("[data-delete-label]").forEach(button => { button.disabled = disabled; });
+}
 function renderClasses() {
   element("exportLabelsButton").disabled = state.busy || element("addLabelButton").disabled;
   element("importLabelsButton").disabled = state.busy || element("addLabelButton").disabled;
-  element("classList").innerHTML = state.project.classes.map((item,index) => `<button class="class-row ${state.activeClass === index ? "selected" : ""}" data-class="${index}" title="${escapeHtml(item.name)}"><span class="class-swatch" style="background:${item.color}"></span><span>${escapeHtml(item.name)}<small>${classCode(item)}</small></span>${index < 9 ? `<kbd>${index + 1}</kbd>` : ""}</button>`).join("");
+  element("classList").innerHTML = state.project.classes.map((item,index) => `<div class="class-entry"><button class="class-row ${state.activeClass === index ? "selected" : ""}" data-class="${index}" title="${escapeHtml(item.name)}"><span class="class-swatch" style="background:${item.color}"></span><span>${escapeHtml(item.name)}<small>${classCode(item)}</small></span>${index < 9 ? `<kbd>${index + 1}</kbd>` : ""}</button><button class="icon-button class-delete" type="button" data-delete-label="${escapeHtml(item.name)}" aria-label="删除标签 ${escapeHtml(item.name)}" title="删除未使用标签；不会删除标注框">×</button></div>`).join("");
+  updateLabelDeleteButtons();
   const previousLabel = element("shapeClass").value;
   element("shapeClass").innerHTML = state.project.classes.map(item => `<option value="${escapeHtml(item.name)}">${classCode(item)} · ${escapeHtml(item.name)}</option>`).join("");
   const selectedLabel = state.current?.document.shapes[state.selected]?.label;
-  element("shapeClass").value = selectedLabel || previousLabel || state.project.classes[state.activeClass].name;
+  element("shapeClass").value = selectedLabel || (state.project.classes.some(item => item.name === previousLabel) ? previousLabel : state.project.classes[state.activeClass].name);
   element("activeClassText").textContent = `绘制标签：${state.project.classes[state.activeClass].name}`;
+}
+
+async function deleteLabel(name) {
+  if (!state.project || state.busy || state.labelPickerSaving || element("addLabelButton").disabled) return;
+  if (state.project.classes.length <= 1) return toast("项目至少需要保留一个标签", true);
+  if (state.pendingShape || state.rectangle || state.polygon.length) return toast("请先完成或取消当前绘制，再删除标签", true);
+  const documents = [state.current?.document, ...state.undo, ...state.redo, state.prediction];
+  if (documents.some(document => document?.shapes?.some(shape => shape.label === name))) {
+    return toast('标签 ' + name + ' 仍被当前标注、撤销记录或预标注引用，不能删除', true);
+  }
+  const projectId = state.project.id;
+  const expectedClasses = state.project.classes.map(item => item.name);
+  const activeName = expectedClasses[state.activeClass];
+  if (!confirm('确认删除标签「' + name + '」？\n只允许删除未使用标签，不会删除任何标注框或历史记录。\n其后类别 ID 会前移，后续训练请重新完整导出，不要与旧数据混用。\n旧模型若类别表不匹配，会阻止预标注，需要使用匹配的模型。')) return;
+  setBusy(true, "正在检查标签引用并删除…");
+  try {
+    const project = await api('/api/projects/' + projectId + '/labels/delete', "POST", {name, expected_classes:expectedClasses});
+    if (state.project.id !== projectId) return;
+    Object.assign(state.project, project);
+    const activeIndex = project.classes.findIndex(item => item.name === activeName);
+    state.activeClass = activeIndex >= 0 ? activeIndex : Math.min(state.activeClass, project.classes.length - 1);
+    renderClasses();
+    renderObjects();
+    draw();
+    taskUi.projectSubtitle();
+    toast('已删除未使用标签 ' + name + ' · 已有标注未改动 · 下次导出使用更新后的类别表');
+  } finally {
+    setBusy(false);
+  }
 }
 
 function exportLabels() {
@@ -396,6 +431,7 @@ async function addCustomLabel() {
   element("addLabelButton").disabled = true;
   element("exportLabelsButton").disabled = true;
   element("importLabelsButton").disabled = true;
+  updateLabelDeleteButtons();
   element("newLabelInput").disabled = true;
   try {
     const project = await api(projectUrl("/labels"), "POST", {name});
@@ -419,6 +455,7 @@ async function addCustomLabel() {
     element("newLabelInput").disabled = false;
     element("exportLabelsButton").disabled = state.busy || !state.project?.classes.length;
     element("importLabelsButton").disabled = state.busy || !state.project;
+    updateLabelDeleteButtons();
   }
 }
 
@@ -504,6 +541,7 @@ async function applyPickedLabel(name) {
   const label = (name ?? element("pickerLabelInput").value).trim() || state.project.classes[state.activeClass].name;
   const pending = state.pendingShape;
   state.labelPickerSaving = true;
+  updateLabelDeleteButtons();
   element("pickerLabelError").textContent = "";
   element("labelPicker").querySelectorAll("button,input").forEach(node => {node.disabled = true;});
   try {
@@ -525,6 +563,7 @@ async function applyPickedLabel(name) {
     positionLabelPicker();
   } finally {
     state.labelPickerSaving = false;
+    updateLabelDeleteButtons();
     element("labelPicker").querySelectorAll("button,input").forEach(node => {node.disabled = false;});
     if (element("labelPicker").open) element("pickerLabelInput").focus({preventScroll:true});
   }
@@ -1779,7 +1818,13 @@ async function createProject() {
 listen("projectSelect","change",event=>selectProject(event.target.value));
 listen("imageList","click",event=>{const button=event.target.closest("[data-item]");if(button)return loadItem(button.dataset.item);});
 listen("objectList","click",event=>{const button=event.target.closest("[data-shape]");if(button && !state.busy)selectShape(Number(button.dataset.shape));});
-listen("classList","click",event=>{const button=event.target.closest("[data-class]");if(button){state.activeClass=Number(button.dataset.class);renderClasses();}});
+listen("classList","click",event=>{
+  if (state.busy || state.labelPickerSaving || element("addLabelButton").disabled) return;
+  const remove = event.target.closest("[data-delete-label]");
+  if (remove) return deleteLabel(remove.dataset.deleteLabel);
+  const button = event.target.closest("[data-class]");
+  if (button) { state.activeClass = Number(button.dataset.class); renderClasses(); }
+});
 document.querySelectorAll("[data-tool]").forEach(button=>button.addEventListener("click",()=>{if(!state.busy)setTool(button.dataset.tool);}));
 for(const id of ["batchSelect","statusSelect"])listen(id,"change",async()=>{
   if(!state.project || state.busy || !await ensureSaved())return;

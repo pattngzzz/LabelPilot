@@ -135,7 +135,6 @@ class Inference:
     def predict(self, project_id, item_id, options, *, model_path=None, model_sha256=None):
         project = self.store.project(project_id)
         task = project.task_type
-        project_names = model_labels(task, project.names)
         path = Path(model_path or project.config.get("model_path", ""))
         if path.suffix.lower() != ".pt" or not path.is_file():
             raise Problem("未配置可信的本地 .pt 模型；不会联网下载权重", 422)
@@ -149,6 +148,7 @@ class Inference:
         if not isinstance(image_size, int) or image_size not in (320, 640, 960, 1280):
             raise Problem("输入尺寸必须为 320、640、960 或 1280", 422)
         with self.prediction_slot():
+            project_names = model_labels(task, project.names)
             import torch
             from ultralytics import YOLO
             from ultralytics.utils import SETTINGS

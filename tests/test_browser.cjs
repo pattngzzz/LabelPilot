@@ -143,6 +143,8 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await new Promise((resolve, reject) => {socket.onopen=resolve; socket.onerror=reject;});
     let sequence = 0;
     let labelFileChooser = null;
+    let acceptLabelDeletion = false;
+    let lastLabelDeletionPrompt = "";
     const pending = new Map();
     cdp = (method, params={}) => new Promise((resolve, reject) => {
       const id = ++sequence;
@@ -160,7 +162,11 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
       }
       if (data.method === "Runtime.exceptionThrown") errors.push(data.params);
       if (data.method === "Page.fileChooserOpened") labelFileChooser = data.params;
-      if (data.method === "Page.javascriptDialogOpening") cdp("Page.handleJavaScriptDialog", {accept:false});
+      if (data.method === "Page.javascriptDialogOpening") {
+        const deleting = data.params.type === "confirm" && data.params.message.startsWith("确认删除标签");
+        if (deleting) lastLabelDeletionPrompt = data.params.message;
+        cdp("Page.handleJavaScriptDialog", {accept:deleting && acceptLabelDeletion});
+      }
     };
     const evaluate = async expression => {
       const output = await cdp("Runtime.evaluate", {expression, awaitPromise:true, returnByValue:true});
@@ -900,6 +906,61 @@ print('Rotation ZIP: all angles, dimensions, exact normalized boxes and train-on
     await check('JSON.stringify(state.project.classes.map(label=>label.name))===' + JSON.stringify(JSON.stringify(labelImportNames)), "Imported labels persist after a real browser reload");
     assert.equal(fs.readFileSync(labelImportFile, "utf8"), labelImportText, "Import never overwrites the selected source label file");
     context.diagnostic("Real file chooser, UTF-8 file upload, append-only labels, duplicate and invalid files, annotation preservation, responsive layout and reload persistence passed");
+
+    await click("#classesTab");
+    await check('element("classList").querySelectorAll("[data-delete-label]").length===state.project.classes.length', "Every class has a standalone accessible delete button in the label list");
+    const removedLabel = "Imported_Raw-v3";
+    const deleteSelector = '[data-delete-label="' + removedLabel + '"]';
+    const retainedActive = "Imported_样本";
+    await evaluate('state.activeClass=state.project.classes.findIndex(label=>label.name===' + JSON.stringify(retainedActive) + ');renderClasses();');
+    const deletionSnapshot = await evaluate('JSON.stringify({current:state.current,dirty:state.dirty,selected:state.selected,undo:state.undo,redo:state.redo})');
+    const storedBeforeDeletion = await evaluate('(async()=>JSON.stringify(await api(itemUrl())))()');
+    await click(deleteSelector);
+    await eventually(() => lastLabelDeletionPrompt);
+    assert.ok(lastLabelDeletionPrompt.includes("ID") && lastLabelDeletionPrompt.includes("模型"), "Deletion confirmation explains ID shifts and old model compatibility");
+    await check('state.project.classes.some(label=>label.name===' + JSON.stringify(removedLabel) + ') && !state.busy', "Cancelling deletion preserves the complete class table");
+    await evaluate('setBusy(true);');
+    await check('Array.from(element("classList").querySelectorAll("[data-delete-label]")).every(button=>button.disabled)', "All label deletion buttons are disabled while busy");
+    await evaluate('setBusy(false);');
+    acceptLabelDeletion = true;
+    await click(deleteSelector);
+    await waitFor('!state.busy && !state.project.classes.some(label=>label.name===' + JSON.stringify(removedLabel) + ')');
+    await check('state.project.classes[state.activeClass].name===' + JSON.stringify(retainedActive) + ' && state.project.classes.every((label,index)=>label.id===index)', "Deleting a preceding unused class preserves the active label name and rebuilds contiguous IDs");
+    await check('JSON.stringify({current:state.current,dirty:state.dirty,selected:state.selected,undo:state.undo,redo:state.redo})===' + JSON.stringify(deletionSnapshot), "Deleting an unused label never edits boxes, saved versions or undo history");
+    await check('(async()=>JSON.stringify(await api(itemUrl()))===' + JSON.stringify(storedBeforeDeletion) + ')()', "Deletion leaves the stored image annotations unchanged");
+    await evaluate('document.querySelectorAll(".toast").forEach(node=>node.remove());');
+    const usedName = await evaluate('state.current.document.shapes[0].label');
+    await click('[data-delete-label="' + usedName + '"]');
+    await waitFor('Array.from(document.querySelectorAll(".toast.error")).some(node=>node.textContent.includes("引用"))');
+    await check('state.project.classes.some(label=>label.name===' + JSON.stringify(usedName) + ')', "A label referenced by current boxes cannot be deleted");
+    await evaluate('window.deletionApi=api;api=async(url,method,body)=>{if(url.endsWith("/labels/delete"))throw new Error("simulated delete failure");return deletionApi(url,method,body);};');
+    await click('[data-delete-label="' + retainedActive + '"]');
+    await waitFor('!state.busy && Array.from(document.querySelectorAll(".toast.error")).some(node=>node.textContent.includes("simulated delete failure"))');
+    await check('state.project.classes.some(label=>label.name===' + JSON.stringify(retainedActive) + ') && !element("importLabelsButton").disabled', "A failed deletion preserves classes and restores controls");
+    await evaluate('api=deletionApi;');
+    await evaluate('document.querySelectorAll(".toast").forEach(node=>node.remove());');
+    await evaluate('(async()=>{state.undo.push({shapes:[{label:' + JSON.stringify(retainedActive) + '}]});try{await deleteLabel(' + JSON.stringify(retainedActive) + ');}finally{state.undo.pop();}})()');
+    await check('state.project.classes.some(label=>label.name===' + JSON.stringify(retainedActive) + ') && Array.from(document.querySelectorAll(".toast.error")).some(node=>node.textContent.includes("撤销记录"))', "A label referenced only by local undo history is protected from deletion");
+    acceptLabelDeletion = false;
+    for (const width of [1600,1024,760]) {
+      await cdp("Emulation.setDeviceMetricsOverride", {width,height:1000,deviceScaleFactor:1,mobile:false});
+      await check('Array.from(element("classList").querySelectorAll("[data-delete-label]")).every(button=>{const rect=button.getBoundingClientRect(),panel=button.closest(".inspector").getBoundingClientRect();return rect.width>0 && rect.left>=panel.left && rect.right<=panel.right;})', "Label delete buttons fit the inspector at width " + width);
+    }
+    await cdp("Emulation.setDeviceMetricsOverride", {width:1600,height:1000,deviceScaleFactor:1,mobile:false});
+    fs.writeFileSync(path.join(home,"label-delete-workspace.png"), Buffer.from((await cdp("Page.captureScreenshot", {format:"png"})).data,"base64"));
+    await evaluate('window.beforeLabelDeleteReload=true;');
+    await cdp("Page.reload");
+    await waitFor('window.beforeLabelDeleteReload!==true && typeof state!=="undefined" && state.current && !state.busy');
+    await check('!state.project.classes.some(label=>label.name===' + JSON.stringify(removedLabel) + ') && state.project.classes.some(label=>label.name===' + JSON.stringify(retainedActive) + ')', "Deleted labels stay removed after a real reload while retained labels remain available");
+    context.diagnostic("Label deletion confirmation, cancellation, busy guards, data preservation, active label stability, failed requests, responsive layout and reload persistence passed");
+    await click("#classesTab");
+    await evaluate('state.activeClass=state.project.classes.findIndex(label=>label.name===' + JSON.stringify(retainedActive) + ');state.selected=-1;renderClasses();element("shapeClass").value=' + JSON.stringify(retainedActive) + ';');
+    acceptLabelDeletion = true;
+    await click('[data-delete-label="' + retainedActive + '"]');
+    await waitFor('!state.busy && !state.project.classes.some(label=>label.name===' + JSON.stringify(retainedActive) + ')');
+    await check('state.activeClass>=0 && state.activeClass<state.project.classes.length && state.project.classes.some(label=>label.name===element("shapeClass").value)', "Deleting the active unused label selects a valid replacement in both class controls");
+    acceptLabelDeletion = false;
+    await click("#objectsTab");
 
     await evaluate(`(async()=>{
       const project=await api("/api/projects","POST",{name:"Efficiency modes",image_root:${JSON.stringify(efficiencyFrames)},

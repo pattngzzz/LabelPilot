@@ -494,6 +494,58 @@ class Store:
                 project.names = config["classes"]
             return {"project": project.summary(), "added": len(added), "skipped": len(normalized) - len(added)}
 
+    def delete_label(self, project_id, name, expected_classes):
+        if not isinstance(name, str) or not name:
+            raise Problem("请选择要删除的标签", 422)
+        with self.lock:
+            project = self.project(project_id)
+            if expected_classes != project.names:
+                raise Problem("类别表已变化，请刷新页面后重试", 409)
+            if name not in project.names:
+                raise Problem("标签不存在", 404)
+            if len(project.names) <= 1:
+                raise Problem("项目至少需要保留一个标签，不能删除最后一个标签", 422)
+
+            def check_document(document, location):
+                if not isinstance(document, dict) or not isinstance(document.get("shapes"), list):
+                    raise Problem(f"{location}无法校验，已阻止删除标签", 409)
+                for shape in document["shapes"]:
+                    if not isinstance(shape, dict) or not isinstance(shape.get("label"), str):
+                        raise Problem(f"{location}含无效标注，已阻止删除标签", 409)
+                    if project.label_aliases.get(shape["label"], shape["label"]) == name:
+                        raise Problem(f"标签 {name} 仍被{location}引用，不能删除；只允许删除未使用标签，不会连带删除标注框", 409)
+
+            with self.connect() as connection:
+                for table, location in (("annotations", "已保存标注"), ("revisions", "历史标注")):
+                    for row in connection.execute(f"SELECT document FROM {table} WHERE project=?", (project_id,)):
+                        try:
+                            document = json.loads(row["document"])
+                        except (ValueError, TypeError):
+                            raise Problem(f"{location}无法读取，已阻止删除标签", 409)
+                        check_document(document, location)
+            try:
+                sources = set()
+                for field in ("annotation_root", "preannotation_root"):
+                    sources.update(project.source_map(project.config.get(field)).values())
+                for source in sources:
+                    check_document(read_json(source), "源标注")
+            except (OSError, ValueError, TypeError):
+                raise Problem("源标注无法读取，已阻止删除标签；请先检查源文件", 409)
+            configs = copy.deepcopy(self.configs)
+            config = next(config for config in configs if config["id"] == project_id)
+            if config.get("class_map_path"):
+                config["imported_class_map_path"] = config.pop("class_map_path")
+            config["classes"] = [label for label in project.names if label != name]
+            aliases = {alias: target for alias, target in project.label_aliases.items() if target != name}
+            if "label_aliases" in config:
+                config["label_aliases"] = aliases
+            atomic_json(self.registry_path, configs)
+            self.configs = configs
+            project.config = copy.deepcopy(config)
+            project.names = list(config["classes"])
+            project.label_aliases = aliases
+            return project.summary()
+
     def overlay(self, project_id, include_documents=False, include_review=False):
         overlays = {}
         with self.connect() as connection:

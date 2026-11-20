@@ -1224,6 +1224,203 @@ def test_invalid_custom_label_rejected(store, name):
         store.add_label("test", name)
 
 
+@pytest.mark.parametrize("format_name", ["yolo", "labelme", "coco"])
+def test_delete_unused_label_preserves_annotations_and_reindexes_export(reviewed_store, dataset, format_name):
+    store = reviewed_store
+    store.configs[0]["classes"] = ["unused_before", "object", "unused_after"]
+    store.registry_path.write_text(json.dumps(store.configs), encoding="utf-8")
+    store = Store(store.home)
+    sources = {path: digest(path) for folder in dataset[1:] for path in folder.rglob("*") if path.is_file()}
+    with store.connect() as connection:
+        before = {table: [tuple(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY item, version")]
+                  for table in ("annotations", "revisions")}
+    result = store.delete_label("test", "unused_before", list(store.project("test").names))
+    assert [(row["id"], row["name"]) for row in result["classes"]] == [(0, "object"), (1, "unused_after")]
+    reloaded = Store(store.home)
+    assert reloaded.project("test").names == ["object", "unused_after"]
+    assert reloaded.rescan("test")["classes"] == result["classes"]
+    exported = export_project(reloaded, "test", {"format": format_name})
+    with zipfile.ZipFile(store.home / "exports" / exported["filename"]) as archive:
+        assert archive.read("classes.txt").decode() == "object\nunused_after\n"
+        if format_name == "yolo":
+            for path in archive.namelist():
+                if path.startswith("labels/"):
+                    assert all(line.startswith("0 ") for line in archive.read(path).decode().splitlines())
+        elif format_name == "labelme":
+            shapes = [shape for path in archive.namelist() if path.startswith("annotations/")
+                      for shape in json.loads(archive.read(path))["shapes"]]
+            assert shapes and all(shape["label"] == "object" for shape in shapes)
+        else:
+            document = json.loads(archive.read("annotations.json"))
+            assert document["categories"] == [{"id": 1, "name": "object"}, {"id": 2, "name": "unused_after"}]
+            assert document["annotations"] and all(shape["category_id"] == 1 for shape in document["annotations"])
+    with store.connect() as connection:
+        after = {table: [tuple(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY item, version")]
+                 for table in ("annotations", "revisions")}
+    assert before == after
+    assert all(digest(path) == fingerprint for path, fingerprint in sources.items())
+
+
+def test_delete_unused_label_preserves_source_mapping_and_other_project(store, dataset):
+    source = dataset[2] / "class_map.json"
+    source.write_text(json.dumps({"names": {"0": "object", "1": "unused"}}), encoding="utf-8")
+    store.configs[0]["class_map_path"] = str(source)
+    store.registry_path.write_text(json.dumps(store.configs), encoding="utf-8")
+    store = Store(store.home)
+    other = store.register({"name": "Other", "image_root": str(dataset[1]), "classes": ["object", "unused"]})
+    fingerprint = digest(source)
+    store.delete_label("test", "unused", ["object", "unused"])
+    reloaded = Store(store.home)
+    assert reloaded.project("test").names == ["object"]
+    assert reloaded.project(other["id"]).names == ["object", "unused"]
+    assert reloaded.configs[0]["imported_class_map_path"] == str(source)
+    assert "class_map_path" not in reloaded.configs[0]
+    assert digest(source) == fingerprint
+
+
+@pytest.mark.parametrize("location", ["annotations", "revisions", "native", "predictions"])
+def test_delete_label_rejects_current_historical_and_source_references(store, dataset, location):
+    store.add_label("test", "referenced")
+    if location in ("annotations", "revisions"):
+        data = payload(store, "another")
+        data["document"]["shapes"] = [{"label": "referenced", "shape_type": "rectangle", "points": [[1, 1], [20, 20]]}]
+        store.save("test", item(store, "another")["id"], data)
+        if location == "revisions":
+            data = payload(store, "another")
+            data["document"]["shapes"] = []
+            store.save("test", item(store, "another")["id"], data)
+    else:
+        folder = dataset[2] if location == "native" else dataset[3]
+        (folder / "another.json").write_text(json.dumps({"shapes": [{"label": "referenced"}]}), encoding="utf-8")
+    registry = store.registry_path.read_bytes()
+    with pytest.raises(Problem, match="引用") as caught:
+        store.delete_label("test", "referenced", ["object", "referenced"])
+    assert caught.value.status == 409
+    assert store.registry_path.read_bytes() == registry
+    assert store.project("test").names == ["object", "referenced"]
+
+
+def test_delete_label_rejects_legacy_alias_references(renamed_store):
+    renamed_store.add_label("test", "unused")
+    with pytest.raises(Problem, match="引用"):
+        renamed_store.delete_label("test", "object_1", ["object_1", "unused"])
+
+
+def test_delete_unused_aliased_label_keeps_project_valid(store):
+    store.configs[0].update(classes=["object", "new_unused"], label_aliases={"old_unused": "new_unused"})
+    store.registry_path.write_text(json.dumps(store.configs), encoding="utf-8")
+    store = Store(store.home)
+    store.delete_label("test", "new_unused", ["object", "new_unused"])
+    reloaded = Store(store.home)
+    assert reloaded.project("test").names == ["object"]
+    assert reloaded.project("test").label_aliases == {}
+
+
+@pytest.mark.parametrize("name,expected,status", [
+    (None, ["object", "unused"], 422), ("", ["object", "unused"], 422),
+    ("missing", ["object", "unused"], 404), ("unused", None, 409),
+    ("unused", ["unused", "object"], 409), ("unused", ["object"], 409),
+])
+def test_invalid_or_stale_label_deletion_is_atomic(store, name, expected, status):
+    store.add_label("test", "unused")
+    registry = store.registry_path.read_bytes()
+    with pytest.raises(Problem) as caught:
+        store.delete_label("test", name, expected)
+    assert caught.value.status == status
+    assert store.registry_path.read_bytes() == registry
+    assert store.project("test").names == ["object", "unused"]
+
+
+def test_delete_last_label_rejected(store):
+    with pytest.raises(Problem, match="至少") as caught:
+        store.delete_label("test", "object", ["object"])
+    assert caught.value.status == 422
+
+
+@pytest.mark.parametrize("content", ["not json", '{"shapes": null}', '{"shapes": [null]}'])
+def test_delete_label_rejects_unreadable_source_without_mutation(store, dataset, content):
+    store.add_label("test", "unused")
+    (dataset[2] / "another.json").write_text(content, encoding="utf-8")
+    registry = store.registry_path.read_bytes()
+    with pytest.raises(Problem, match="阻止删除"):
+        store.delete_label("test", "unused", ["object", "unused"])
+    assert store.registry_path.read_bytes() == registry
+
+
+def test_delete_label_write_failure_does_not_mutate_project(store, monkeypatch):
+    store.add_label("test", "unused")
+    registry = store.registry_path.read_bytes()
+
+    def fail_write(*args):
+        raise OSError("simulated registry write failure")
+
+    monkeypatch.setattr("labelpilot.store.atomic_json", fail_write)
+    with pytest.raises(OSError, match="simulated"):
+        store.delete_label("test", "unused", ["object", "unused"])
+    assert store.registry_path.read_bytes() == registry
+    assert store.project("test").names == ["object", "unused"]
+
+
+def test_delete_label_http_security_snapshot_and_retry(dataset):
+    app = create_app(dataset[0])
+    app.state.store.add_label("test", "unused")
+    with TestClient(app) as client:
+        path = "/api/projects/test/labels/delete"
+        data = {"name": "unused", "expected_classes": ["object", "unused"]}
+        headers = {"X-LabelPilot-Token": app.state.token}
+        assert client.post(path, json=data).status_code == 403
+        assert client.post(path, json=data, headers={**headers, "Origin": "https://evil.example"}).status_code == 403
+        assert client.post(path, json={}, headers=headers).status_code == 422
+        assert client.post(path, json={**data, "expected_classes": ["object"]}, headers=headers).status_code == 409
+        assert not app.state.inference.lock.locked() and not app.state.inference.exclusive.is_set()
+        response = client.post(path, json=data, headers=headers)
+        assert response.status_code == 200
+        assert [label["name"] for label in response.json()["classes"]] == ["object"]
+        assert client.post(path, json=data, headers=headers).status_code == 409
+        assert not app.state.inference.lock.locked() and not app.state.inference.exclusive.is_set()
+
+
+@pytest.mark.parametrize("kind", ["inference", "jobs", "training", "comparisons", "automation"])
+def test_delete_label_http_blocks_active_tasks(dataset, monkeypatch, kind):
+    app = create_app(dataset[0])
+    app.state.store.add_label("test", "unused")
+    if kind == "inference":
+        app.state.inference.lock.acquire()
+    elif kind == "automation":
+        monkeypatch.setattr(app.state.automation, "view", lambda project: {"runs": [{"status": "running"}]})
+    else:
+        component = getattr(app.state, kind)
+        monkeypatch.setattr(component, "list", lambda project: [{"status": "running"}])
+    try:
+        with TestClient(app) as client:
+            response = client.post("/api/projects/test/labels/delete",
+                                   json={"name": "unused", "expected_classes": ["object", "unused"]},
+                                   headers={"X-LabelPilot-Token": app.state.token})
+            assert response.status_code == 409
+            assert app.state.store.project("test").names == ["object", "unused"]
+    finally:
+        if kind == "inference":
+            app.state.inference.lock.release()
+
+
+def test_delete_label_invalidates_previous_export_preview(reviewed_store):
+    store = reviewed_store
+    store.add_label("test", "unused")
+    preview = preview_export(store, "test", {"format": "yolo"})
+    store.delete_label("test", "unused", ["object", "unused"])
+    with pytest.raises(Problem, match="数据已变化"):
+        export_project(store, "test", {"format": "yolo", "preview_token": preview["preview_token"]})
+
+
+def test_deleted_model_class_table_is_rejected_instead_of_mislabelled(store):
+    store.configs[0]["classes"] = ["unused", "object"]
+    store.registry_path.write_text(json.dumps(store.configs), encoding="utf-8")
+    store = Store(store.home)
+    store.delete_label("test", "unused", ["unused", "object"])
+    with pytest.raises(Problem, match="ID"):
+        model_class_names({0: "unused", 1: "object"}, store.project("test").names)
+
+
 def test_model_allows_append_only_custom_labels():
     assert model_class_names({0: "object", 1: "panel"}, ["object", "panel", "new_label"]) == ["object", "panel"]
     for project_names in (["panel", "object"], ["object"], ["renamed", "panel"]):

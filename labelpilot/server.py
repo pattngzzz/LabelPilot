@@ -163,6 +163,22 @@ def create_app(home=None):
     def import_labels(project_id: str, payload: dict):
         return store.import_labels(project_id, payload.get("filename"), payload.get("content"))
 
+    @app.post("/api/projects/{project_id}/labels/delete")
+    def delete_label(project_id: str, payload: dict):
+        store.project(project_id)
+        active = {"queued", "running", "waiting", "preparing", "cancelling"}
+        if (inference.lock.locked() or
+                any(job["status"] in active for job in jobs.list(project_id)) or
+                any(run["status"] in active for run in training.list(project_id)) or
+                any(run["status"] in active for run in comparisons.list(project_id)) or
+                any(run["status"] in active for run in automation.view(project_id)["runs"])):
+            raise Problem("项目有运行中的模型或自动任务，请等待任务完成后再删除标签", 409)
+        jobs.reserve_model_slot()
+        try:
+            return store.delete_label(project_id, payload.get("name"), payload.get("expected_classes"))
+        finally:
+            jobs.release_model_slot()
+
     @app.get("/api/projects/{project_id}/items")
     def items(project_id: str, query: str = "", batch: str = "", status: str = "",
               offset: int = Query(0, ge=0), limit: int = Query(80, ge=1, le=10000)):
