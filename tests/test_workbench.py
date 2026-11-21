@@ -5,6 +5,7 @@ import io
 import json
 import os
 import re
+import threading
 import time
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -15,6 +16,7 @@ from PIL import Image
 
 from labelpilot.augmentation import PRESETS, augmented_variants, plan_augmentation, validate_augmented_sample
 from labelpilot.exporting import export_project, plan_splits, preview_export
+from labelpilot.export_jobs import ExportJobs
 from labelpilot import model_files, native_picker
 from labelpilot import server
 from labelpilot.inference import Inference, Jobs, model_class_names
@@ -69,6 +71,197 @@ def reviewed_store(store):
         data["confirmed_empty"] = True
         store.save("test", row["id"], data)
     return store
+
+
+def finish_folder_export(jobs, record):
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        current = jobs.get("test", record["id"])
+        if current["status"] in ("completed", "failed", "cancelled"):
+            jobs.worker.join(timeout=2)
+            return current
+        time.sleep(0.01)
+    pytest.fail("Folder export did not finish")
+
+
+@pytest.mark.parametrize("format_name", ["yolo", "labelme", "coco"])
+@pytest.mark.parametrize("preset", [None, "all", "rotation"])
+def test_folder_export_verified_split_augmentation_and_preservation(reviewed_store, dataset, format_name, preset):
+    store = reviewed_store
+    destination = store.home / "导出 测试"
+    destination.mkdir()
+    existing = destination / "existing.txt"
+    existing.write_text("preserve", encoding="utf-8")
+    options = {"format": format_name, "destination": str(destination),
+               "split": {"train": 50, "val": 25, "test": 25}}
+    if preset:
+        options["augmentation"] = {"preset": preset, "copies": 3 if preset == "rotation" else 1, "seed": 42}
+    options["preview_token"] = preview_export(store, "test", options)["preview_token"]
+    before = {path: digest(path) for root in dataset[1:] for path in root.rglob("*") if path.is_file()}
+    versions = [(row["id"], store.detail("test", row["id"])["version"]) for row in store.project("test").items]
+    jobs = ExportJobs(store)
+    try:
+        result = finish_folder_export(jobs, jobs.start("test", options))
+        assert result["status"] == "completed", result
+        exported = result["result"]
+        root = Path(exported["directory"])
+        manifest = json.loads((root / "export_manifest.json").read_text(encoding="utf-8"))
+        assert root.parent == destination and root.is_dir()
+        extra = 10 if preset == "all" else 6 if preset == "rotation" else 0
+        assert exported["images"] == 4 + extra == result["completed"] == result["total"]
+        assert result["percent"] == 100 and exported["integrity_check"]["passed"]
+        assert manifest["split_counts"] == {"train": 2 + extra, "val": 1, "test": 1}
+        assert (root / "classes.txt").read_text(encoding="utf-8") == "object\n"
+        for entry in manifest["items"]:
+            assert digest(root / entry["image"]) == entry["sha256"]
+            if "augmentation" in entry:
+                assert entry["split"] == "train"
+            if format_name == "yolo":
+                label = root / entry["image"].replace("images/", "labels/", 1)
+                assert len(label.with_suffix(".txt").read_text().splitlines()) == entry["annotation_count"]
+        assert existing.read_text(encoding="utf-8") == "preserve"
+        assert not list(destination.glob("*.zip")) and not list(destination.glob("*.part"))
+        assert all(digest(path) == fingerprint for path, fingerprint in before.items())
+        assert all(store.detail("test", item_id)["version"] == version for item_id, version in versions)
+        repeated = finish_folder_export(jobs, jobs.start("test", options))
+        assert repeated["status"] == "completed" and repeated["result"]["directory"] != str(root)
+        assert (root / "export_manifest.json").is_file()
+    finally:
+        jobs.shutdown()
+
+
+def test_folder_export_snapshot_progress_and_concurrent_saving(reviewed_store, monkeypatch):
+    from labelpilot import export_jobs
+
+    store = reviewed_store
+    paused, release = threading.Event(), threading.Event()
+    writer = export_jobs.write_members
+    original = store.detail("test", item(store, "human")["id"])
+
+    def write(*args, **kwargs):
+        report = kwargs["progress"]
+
+        def progress(completed, total, image):
+            report(completed, total, image)
+            if completed == 1:
+                paused.set()
+                assert release.wait(5)
+
+        return writer(*args, **{**kwargs, "progress": progress})
+
+    monkeypatch.setattr(export_jobs, "write_members", write)
+    options = {"destination": str(store.home)}
+    jobs = ExportJobs(store)
+    try:
+        record = jobs.start("test", options)
+        assert paused.wait(5)
+        progress = jobs.get("test", record["id"])
+        assert progress["status"] == "writing" and progress["completed"] == 1 and 0 < progress["percent"] < 100
+        assert store.lock.acquire(blocking=False)
+        store.lock.release()
+        with pytest.raises(Problem) as caught:
+            jobs.start("test", options)
+        assert caught.value.status == 409
+        saved = payload(store, "human", "reviewed")
+        saved["document"]["shapes"][0]["points"] = [[20, 20], [100, 80]]
+        store.save("test", original["item"]["id"], saved)
+        store.add_label("test", "new_label_during_export")
+        release.set()
+        result = finish_folder_export(jobs, record)
+        assert result["status"] == "completed", result
+        root = Path(result["result"]["directory"])
+        assert (root / "classes.txt").read_text() == "object\n"
+        manifest = json.loads((root / "export_manifest.json").read_text(encoding="utf-8"))
+        exported = next(entry for entry in manifest["items"] if entry["photo_id"] == "human")
+        assert exported["revision"] == original["version"]
+        assert store.detail("test", original["item"]["id"])["version"] == original["version"] + 1
+    finally:
+        release.set()
+        jobs.shutdown()
+
+
+@pytest.mark.parametrize("failure", ["stale", "write", "image_changed", "cancel"])
+def test_folder_export_failure_cleanup(reviewed_store, monkeypatch, failure):
+    from labelpilot import export_jobs
+
+    store = reviewed_store
+    destination = store.home / "output"
+    destination.mkdir()
+    keep = destination / "keep.txt"
+    keep.write_text("untouched")
+    options = {"destination": str(destination)}
+    options["preview_token"] = preview_export(store, "test", options)["preview_token"]
+    if failure == "stale":
+        data = payload(store, "human", "reviewed")
+        store.save("test", data["item"]["id"], data)
+    elif failure in ("write", "cancel"):
+        def fail(*args, **kwargs):
+            raise export_jobs.ExportCancelled() if failure == "cancel" else OSError("disk full")
+        monkeypatch.setattr(export_jobs, "write_members", fail)
+    else:
+        original_write = export_jobs.write_members
+        def changed(snapshot, plan, *args, **kwargs):
+            source = Path(plan.project.item(plan.rows[0]["id"])["path"])
+            Image.new("RGB", (240, 120), "red").save(source)
+            return original_write(snapshot, plan, *args, **kwargs)
+        monkeypatch.setattr(export_jobs, "write_members", changed)
+    jobs = ExportJobs(store)
+    try:
+        result = finish_folder_export(jobs, jobs.start("test", options))
+        assert result["status"] == ("cancelled" if failure == "cancel" else "failed"), result
+        assert result["error"] and result["percent"] != 100
+        assert list(destination.iterdir()) == [keep] and keep.read_text() == "untouched"
+    finally:
+        jobs.shutdown()
+
+
+def test_folder_export_existing_staging_is_not_deleted(reviewed_store, monkeypatch):
+    from types import SimpleNamespace
+    from labelpilot import export_jobs
+
+    monkeypatch.setattr(export_jobs.uuid, "uuid4", lambda: SimpleNamespace(hex="existing"))
+    staging = reviewed_store.home / ".test_yolo_existing.part"
+    staging.mkdir()
+    keep = staging / "keep.txt"
+    keep.write_text("untouched")
+    jobs = ExportJobs(reviewed_store)
+    try:
+        result = finish_folder_export(jobs, jobs.start("test", {"destination": str(reviewed_store.home)}))
+        assert result["status"] == "failed" and keep.read_text() == "untouched"
+    finally:
+        jobs.shutdown()
+
+
+def test_folder_export_api_selection_security_and_labels_only(reviewed_store, monkeypatch):
+    app = create_app(reviewed_store.home)
+    calls = []
+    def run(command, **options):
+        calls.append(json.loads(options["input"]))
+        return native_picker.subprocess.CompletedProcess(command, 0, json.dumps([str(reviewed_store.home)]), "")
+    monkeypatch.setattr(native_picker.subprocess, "run", run)
+    with TestClient(app) as client:
+        headers = {"X-LabelPilot-Token": app.state.token}
+        assert client.post("/api/exports/select", json={}).status_code == 403
+        assert client.post("/api/exports/select", json={}, headers={**headers, "Origin": "https://evil.example"}).status_code == 403
+        assert not calls
+        response = client.post("/api/exports/select", json={}, headers=headers)
+        assert response.json() == {"cancelled": False, "directory": str(reviewed_store.home)}
+        assert calls[0]["mode"] == "export_folder"
+        route = "/api/projects/test/export"
+        for invalid in (None, "", "relative", str(reviewed_store.home / "missing"), str(reviewed_store.registry_path)):
+            assert client.post(route, json={"destination": invalid}, headers=headers).status_code == 422
+        response = client.post(route, json={"destination": str(reviewed_store.home), "include_images": False}, headers=headers)
+        assert response.status_code == 202
+        record = response.json()
+        result = finish_folder_export(app.state.exports, record)
+        assert result["status"] == "completed"
+        assert not (Path(result["result"]["directory"]) / "images").exists()
+        assert client.get(f"{route}/jobs/{record['id']}").json()["status"] == "completed"
+        assert client.get(f"{route}/jobs").json()[0]["id"] == record["id"]
+        assert client.get(f"{route}/jobs/missing").status_code == 404
+    monkeypatch.setattr(native_picker.subprocess, "run", lambda *args, **kwargs:
+                        native_picker.subprocess.CompletedProcess(args[0], 0, "[]", ""))
+    assert native_picker.select_images("export_folder") == {"cancelled": True}
 
 
 @pytest.mark.parametrize("format_name", ["yolo", "labelme", "coco"])

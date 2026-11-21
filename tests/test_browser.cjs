@@ -78,6 +78,17 @@ from labelpilot.comparison_details import record_frame, write_details
 from labelpilot.evaluation_worker import frozen_frames
 from labelpilot.server import create_app
 from labelpilot.store import atomic_json, read_json
+from labelpilot import export_jobs
+import time
+
+original_export_writer = export_jobs.write_members
+def export_progress_fixture(*args, **kwargs):
+    report = kwargs["progress"]
+    def progress(completed, total, image):
+        report(completed, total, image)
+        time.sleep(.3)
+    return original_export_writer(*args, **{**kwargs, "progress": progress})
+export_jobs.write_members = export_progress_fixture
 
 def comparison_fixture(run, stop, module, directory, copies):
     snapshot = read_snapshot(directory)
@@ -462,9 +473,23 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await waitFor('element("exportDialog").open && element("exportPreviewStatus").textContent.includes("可用分组")');
     await check('element("splitDataset").checked && element("splitTrain").value==="80" && element("splitVal").value==="10" && element("splitTest").value==="10" && element("exportSplitUnit").value==="source_group"', "Projects with capture groups default to grouped 80/10/10 splitting");
     await waitFor('exportAugmentation.loaded');
+    await check('element("exportDestination").readOnly && element("createExport").disabled', "Dataset export requires a native directory selection rather than typed paths");
+    await evaluate('window.pickerApi=api;window.exportPickerCalls=[];api=async(url,method,body)=>{if(url!=="/api/exports/select")return pickerApi(url,method,body);exportPickerCalls.push(body);return new Promise(resolve=>window.finishExportPicker=resolve);};');
+    await click("#chooseExportFolder");
+    await waitFor('exportPreview.selecting && exportPickerCalls.length===1');
+    await check('element("chooseExportFolder").disabled && element("createExport").disabled', "An open native picker prevents duplicate dialogs and exports");
+    await evaluate('selectExportFolder();finishExportPicker({cancelled:true});');
+    await waitFor('!exportPreview.selecting');
+    await check('exportPickerCalls.length===1 && element("exportDestination").value===""', "Cancelling the native dialog preserves the previous destination");
+    await click("#chooseExportFolder");
+    await waitFor('exportPreview.selecting && exportPickerCalls.length===2');
+    await evaluate('finishExportPicker({cancelled:false,directory:'+JSON.stringify(downloads)+'});');
+    await waitFor('!exportPreview.selecting');
+    await check('element("exportDestination").value==='+JSON.stringify(downloads), "The chosen local folder is displayed without manual path entry");
+    await evaluate('api=pickerApi;');
     await check('element("augmentationPreset").value==="none" && element("augmentationPreset").options.length===7 && element("augmentationCopies").disabled', "Export defaults to no augmentation and offers five presets plus all-presets mode");
     const setExportValue = (id, value) => evaluate(`element(${JSON.stringify(id)}).value=${JSON.stringify(String(value))};element(${JSON.stringify(id)}).dispatchEvent(new Event(element(${JSON.stringify(id)}).tagName==="SELECT" ? "change" : "input",{bubbles:true}));`);
-    await evaluate('window.exportApi=api;window.exportRequests=[];api=async(path,method,body)=>{if(path.endsWith("/export"))exportRequests.push(body);const result=await exportApi(path,method,body);if(path.endsWith("/export"))window.lastExportResult=result;return result;};');
+    await evaluate('window.exportApi=api;window.exportRequests=[];api=async(path,method,body)=>{if(path.endsWith("/export"))exportRequests.push(body);const result=await exportApi(path,method,body);if(path.includes("/export/jobs/") && result.status==="completed")window.lastExportResult=result.result;return result;};');
     await setExportValue("splitTrain", 70);
     await check('element("createExport").disabled && element("exportSplitSummary").textContent.includes("90%")', "Invalid total disables export and shows the actual percentage");
     await evaluate('exportDataset()');
@@ -489,13 +514,20 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await waitFor('element("exportResult").textContent.includes("数据已变化") && !element("createExport").disabled');
     assert.equal(fs.readdirSync(downloads).length, 0, "A stale preview never downloads a ZIP");
     await click("#createExport");
+    await waitFor('exportPreview.running && element("exportProgress").value>0 && element("exportProgress").value<100');
+    await check('!element("exportProgress").hidden && element("exportProgressDetail").textContent.includes("/ 4 张") && element("exportControls").disabled', "The browser displays live measured progress while the export worker is still running");
+    await evaluate('element("exportDialog").close()');
+    await click("#exportButton");
+    await check('element("exportDialog").open && exportPreview.running && element("createExport").disabled', "Closing and reopening the dialog preserves the running task and prevents duplicate exports");
     await waitFor('element("exportResult").textContent.includes("训练 2 张 / 验证 1 张 / 测试 1 张") && !element("createExport").disabled');
+    await check('element("exportProgress").value===100 && element("exportProgressDetail").textContent.includes("保存位置")', "Completed exports show 100 percent and the absolute output directory without triggering a download");
     await check('JSON.stringify(exportRequests.at(-1).split)===JSON.stringify({train:50,val:25,test:25,seed:42,unit:"source_group"}) && lastExportResult.images===4', "The refreshed preview supplies its exact grouped split to the export API");
-    await eventually(() => fs.readdirSync(downloads).filter(name => name.endsWith(".zip")).length === 1);
-    const splitExport = path.join(downloads, fs.readdirSync(downloads).find(name => name.endsWith(".zip")));
+    await eventually(() => fs.readdirSync(downloads).filter(name => fs.statSync(path.join(downloads,name)).isDirectory() && !name.startsWith(".")).length === 1);
+    const splitExport = path.join(downloads, fs.readdirSync(downloads).find(name => fs.statSync(path.join(downloads,name)).isDirectory() && !name.startsWith(".")));
     const exportCheck = spawnSync(python, ["-c", `
-import json, sys, zipfile
-with zipfile.ZipFile(sys.argv[1]) as archive:
+import json, sys, contextlib
+from pathlib import Path; root=Path(sys.argv[1]); archive=type('Folder',(),{'read':lambda self,name:(root/name).read_bytes(),'namelist':lambda self:[p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file()]})()
+with contextlib.nullcontext(archive) as archive:
     manifest = json.loads(archive.read('export_manifest.json'))
     assert manifest['split_counts'] == {'train': 2, 'val': 1, 'test': 1}
     assert manifest['split'] == 'grouped_by_source'
@@ -520,8 +552,8 @@ with zipfile.ZipFile(sys.argv[1]) as archive:
     await click("#createExport");
     await waitFor('element("exportResult").textContent.includes("未划分数据集") && !element("createExport").disabled');
     await check(`exportRequests.at(-1).split===null && JSON.stringify(state.current)===${JSON.stringify(beforeExport)}`, "Exports never change current annotations or their review state");
-    await eventually(() => fs.readdirSync(downloads).filter(name => name.endsWith(".zip")).length === 2);
-    context.diagnostic("Custom ratios, validation, actual ZIP download and unsplit export passed");
+    await eventually(() => fs.readdirSync(downloads).filter(name => fs.statSync(path.join(downloads,name)).isDirectory() && !name.startsWith(".")).length === 2);
+    context.diagnostic("Custom ratios, validation, actual dataset-folder output and unsplit export passed");
     await setExportValue("augmentationPreset", "gentle");
     await evaluate('element("augmentationPreset").dispatchEvent(new Event("change",{bubbles:true}));');
     await check('element("createExport").disabled && element("augmentationSummary").textContent.includes("先划分")', "Augmentation cannot export an unsplit dataset");
@@ -549,13 +581,13 @@ with zipfile.ZipFile(sys.argv[1]) as archive:
       await waitFor('!element("createExport").disabled');
       await check('element("augmentationDescription").textContent.length>20 && element("augmentationSummary").textContent.includes("3 倍")', `${preset} displays its limitations and added-copy summary`);
     }
-    const previousDownloads = fs.readdirSync(downloads).filter(name => name.endsWith(".zip"));
+    const previousDownloads = fs.readdirSync(downloads).filter(name => fs.statSync(path.join(downloads,name)).isDirectory() && !name.startsWith("."));
     await click("#createExport");
     await waitFor('element("exportResult").textContent.includes("训练增强 4 张") && !element("createExport").disabled');
     await check('lastExportResult.images===8 && lastExportResult.original_images===4 && lastExportResult.augmented_images===4 && JSON.stringify(exportRequests.at(-1).augmentation)===JSON.stringify({preset:"horizontal",copies:2,seed:43})', "Chosen augmentation reaches the backend and reports original plus augmented counts");
-    await eventually(() => fs.readdirSync(downloads).filter(name => name.endsWith(".zip")).length === 3);
-    const augmentedExport = path.join(downloads, fs.readdirSync(downloads).find(name => name.endsWith(".zip") && !previousDownloads.includes(name)));
-    const augmentationCheck = spawnSync(python, ["-c", "import io,json,sys,zipfile; from PIL import Image; archive=zipfile.ZipFile(sys.argv[1]); manifest=json.loads(archive.read('export_manifest.json')); assert manifest['split_counts']=={'train':6,'val':1,'test':1}; assert manifest['integrity_check']['passed'] and manifest['integrity_check']['augmented_images_checked']==4; assert manifest['integrity_check']['annotations_checked']==sum(item['annotation_count'] for item in manifest['items']); originals={item['id']:item for item in manifest['items'] if 'augmentation' not in item}; variants=[item for item in manifest['items'] if 'augmentation' in item]; assert len(originals)==len(variants)==4; assert len({item['image'] for item in manifest['items']})==8; assert all(item['split']==originals[item['source_id']]['split']=='train' and item['annotation_count']==originals[item['source_id']]['annotation_count'] for item in variants); assert all(not item['human_reviewed'] for item in variants); [Image.open(io.BytesIO(archive.read(item['image']))).load() for item in variants]; assert all(len(archive.read(item['image'].replace('images/','labels/',1).rsplit('.',1)[0]+'.txt').decode().splitlines())==item['annotation_count'] for item in manifest['items']); print('Augmented YOLO ZIP decoded; every image has verified box counts and matching provenance')", augmentedExport], {windowsHide:true, encoding:"utf8"});
+    await eventually(() => fs.readdirSync(downloads).filter(name => fs.statSync(path.join(downloads,name)).isDirectory() && !name.startsWith(".")).length === 3);
+    const augmentedExport = path.join(downloads, fs.readdirSync(downloads).find(name => fs.statSync(path.join(downloads,name)).isDirectory() && !name.startsWith(".") && !previousDownloads.includes(name)));
+    const augmentationCheck = spawnSync(python, ["-c", "import io,json,sys,zipfile; from PIL import Image; from pathlib import Path; root=Path(sys.argv[1]); archive=type('Folder',(),{'read':lambda self,name:(root/name).read_bytes(),'namelist':lambda self:[p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file()]})(); manifest=json.loads(archive.read('export_manifest.json')); assert manifest['split_counts']=={'train':6,'val':1,'test':1}; assert manifest['integrity_check']['passed'] and manifest['integrity_check']['augmented_images_checked']==4; assert manifest['integrity_check']['annotations_checked']==sum(item['annotation_count'] for item in manifest['items']); originals={item['id']:item for item in manifest['items'] if 'augmentation' not in item}; variants=[item for item in manifest['items'] if 'augmentation' in item]; assert len(originals)==len(variants)==4; assert len({item['image'] for item in manifest['items']})==8; assert all(item['split']==originals[item['source_id']]['split']=='train' and item['annotation_count']==originals[item['source_id']]['annotation_count'] for item in variants); assert all(not item['human_reviewed'] for item in variants); [Image.open(io.BytesIO(archive.read(item['image']))).load() for item in variants]; assert all(len(archive.read(item['image'].replace('images/','labels/',1).rsplit('.',1)[0]+'.txt').decode().splitlines())==item['annotation_count'] for item in manifest['items']); print('Augmented YOLO ZIP decoded; every image has verified box counts and matching provenance')", augmentedExport], {windowsHide:true, encoding:"utf8"});
     assert.equal(augmentationCheck.status, 0, augmentationCheck.stderr || augmentationCheck.error?.message);
     await check('element("exportResult").textContent.includes("标注完整性校验通过")', "Export displays the completed runtime image and object integrity checks");
     await check(`JSON.stringify(state.current)===${JSON.stringify(beforeExport)}`, "Augmented export never alters the current annotation or review state");
@@ -566,29 +598,29 @@ with zipfile.ZipFile(sys.argv[1]) as archive:
     await setExportValue("augmentationCopies", 1);
     await check('element("augmentationSummary").textContent.includes("每方案 1 张") && element("augmentationSummary").textContent.includes("含原图共 6 张") && element("augmentationDescription").textContent.includes("不连续叠加")', "All-presets mode explains independent generation and the recommended count");
     await waitFor('!element("createExport").disabled');
-    const downloadsBeforeAll = fs.readdirSync(downloads).filter(name => name.endsWith(".zip"));
+    const downloadsBeforeAll = fs.readdirSync(downloads).filter(name => fs.statSync(path.join(downloads,name)).isDirectory() && !name.startsWith("."));
     await click("#createExport");
     await waitFor('element("exportResult").textContent.includes("训练增强 10 张") && !element("createExport").disabled');
     await check('lastExportResult.images===14 && lastExportResult.augmented_images===10 && lastExportResult.split_counts.train===12 && JSON.stringify(exportRequests.at(-1).augmentation)===JSON.stringify({preset:"all",copies:1,seed:43})', "All-presets selection reaches the backend with correct train-only totals");
-    await eventually(() => fs.readdirSync(downloads).filter(name => name.endsWith(".zip")).length === 4);
-    const allExport = path.join(downloads, fs.readdirSync(downloads).find(name => name.endsWith(".zip") && !downloadsBeforeAll.includes(name)));
-    const allCheck = spawnSync(python, ["-c", "import io,json,sys,zipfile; from PIL import Image; archive=zipfile.ZipFile(sys.argv[1]); manifest=json.loads(archive.read('export_manifest.json')); assert manifest['split_counts']=={'train':12,'val':1,'test':1}; assert manifest['augmentation']['preset']=='all' and manifest['augmentation']['variants_per_image']==5; assert manifest['integrity_check']['passed'] and manifest['integrity_check']['augmented_images_checked']==10; originals={item['id']:item for item in manifest['items'] if 'augmentation' not in item}; variants=[item for item in manifest['items'] if 'augmentation' in item]; assert len(originals)==4 and len(variants)==10; assert len({item['image'] for item in manifest['items']})==14; assert len(archive.namelist())==len(set(archive.namelist())); assert all({entry['augmentation']['preset'] for entry in variants if entry['source_id']==item['id']}==({'gentle','lighting','quality','horizontal','rotation'} if item['split']=='train' else set()) for item in originals.values()); assert all(item['split']==originals[item['source_id']]['split']=='train' and item['annotation_count']==originals[item['source_id']]['annotation_count'] for item in variants); [Image.open(io.BytesIO(archive.read(item['image']))).load() for item in variants]; assert all(len(archive.read(item['image'].replace('images/','labels/',1).rsplit('.',1)[0]+'.txt').decode().splitlines())==item['annotation_count'] for item in manifest['items']); print('All five presets independently downloaded with matching boxes and unique paths')", allExport], {windowsHide:true, encoding:"utf8"});
+    await eventually(() => fs.readdirSync(downloads).filter(name => fs.statSync(path.join(downloads,name)).isDirectory() && !name.startsWith(".")).length === 4);
+    const allExport = path.join(downloads, fs.readdirSync(downloads).find(name => fs.statSync(path.join(downloads,name)).isDirectory() && !name.startsWith(".") && !downloadsBeforeAll.includes(name)));
+    const allCheck = spawnSync(python, ["-c", "import io,json,sys,zipfile; from PIL import Image; from pathlib import Path; root=Path(sys.argv[1]); archive=type('Folder',(),{'read':lambda self,name:(root/name).read_bytes(),'namelist':lambda self:[p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file()]})(); manifest=json.loads(archive.read('export_manifest.json')); assert manifest['split_counts']=={'train':12,'val':1,'test':1}; assert manifest['augmentation']['preset']=='all' and manifest['augmentation']['variants_per_image']==5; assert manifest['integrity_check']['passed'] and manifest['integrity_check']['augmented_images_checked']==10; originals={item['id']:item for item in manifest['items'] if 'augmentation' not in item}; variants=[item for item in manifest['items'] if 'augmentation' in item]; assert len(originals)==4 and len(variants)==10; assert len({item['image'] for item in manifest['items']})==14; assert len(archive.namelist())==len(set(archive.namelist())); assert all({entry['augmentation']['preset'] for entry in variants if entry['source_id']==item['id']}==({'gentle','lighting','quality','horizontal','rotation'} if item['split']=='train' else set()) for item in originals.values()); assert all(item['split']==originals[item['source_id']]['split']=='train' and item['annotation_count']==originals[item['source_id']]['annotation_count'] for item in variants); [Image.open(io.BytesIO(archive.read(item['image']))).load() for item in variants]; assert all(len(archive.read(item['image'].replace('images/','labels/',1).rsplit('.',1)[0]+'.txt').decode().splitlines())==item['annotation_count'] for item in manifest['items']); print('All five presets independently written with matching boxes and unique paths')", allExport], {windowsHide:true, encoding:"utf8"});
     assert.equal(allCheck.status, 0, allCheck.stderr || allCheck.error?.message);
     await check(`JSON.stringify(state.current)===${JSON.stringify(beforeExport)}`, "All-presets export preserves the current annotation and review state");
     await setExportValue("augmentationPreset", "rotation");
     await setExportValue("augmentationCopies", 3);
     await check('element("augmentationDescription").textContent.includes("90°") && element("augmentationDescription").textContent.includes("交换宽高") && element("augmentationSummary").textContent.includes("含原图共 4 张")', "Rotation explains its three angles, changed dimensions and independent copy count");
-    const downloadsBeforeRotation = fs.readdirSync(downloads).filter(name => name.endsWith(".zip"));
+    const downloadsBeforeRotation = fs.readdirSync(downloads).filter(name => fs.statSync(path.join(downloads,name)).isDirectory() && !name.startsWith("."));
     await waitFor('!element("createExport").disabled');
     await click("#createExport");
     await waitFor('element("exportResult").textContent.includes("训练增强 6 张") && !element("createExport").disabled');
     await check('lastExportResult.images===10 && lastExportResult.split_counts.train===8 && JSON.stringify(exportRequests.at(-1).augmentation)===JSON.stringify({preset:"rotation",copies:3,seed:43})', "Rotation exports three different angles for every training original without changing validation or test images");
-    await eventually(() => fs.readdirSync(downloads).filter(name => name.endsWith(".zip")).length === 5);
-    const rotationExport = path.join(downloads, fs.readdirSync(downloads).find(name => name.endsWith(".zip") && !downloadsBeforeRotation.includes(name)));
+    await eventually(() => fs.readdirSync(downloads).filter(name => fs.statSync(path.join(downloads,name)).isDirectory() && !name.startsWith(".")).length === 5);
+    const rotationExport = path.join(downloads, fs.readdirSync(downloads).find(name => fs.statSync(path.join(downloads,name)).isDirectory() && !name.startsWith(".") && !downloadsBeforeRotation.includes(name)));
     const rotationCheck = spawnSync(python, ["-c", `
 import io,json,math,sys,zipfile
 from PIL import Image
-archive=zipfile.ZipFile(sys.argv[1])
+from pathlib import Path; root=Path(sys.argv[1]); archive=type('Folder',(),{'read':lambda self,name:(root/name).read_bytes(),'namelist':lambda self:[p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file()]})()
 manifest=json.loads(archive.read('export_manifest.json'))
 assert manifest['split_counts']=={'train':8,'val':1,'test':1}
 assert manifest['integrity_check']['passed'] and manifest['integrity_check']['augmented_images_checked']==6
@@ -639,7 +671,7 @@ print('Rotation ZIP: all angles, dimensions, exact normalized boxes and train-on
     await check('element("exportImageCount").textContent==="3" && element("exportCleaningSummary").textContent.includes("重复副本 1 张")', "One-click cleaning previews identical duplicate removal");
     await click("#createExport");
     await waitFor('exportRequests.at(-1).clean===true && lastExportResult.images===3');
-    await eventually(() => fs.readdirSync(downloads).filter(name => name.endsWith(".zip")).length === 6);
+    await eventually(() => fs.readdirSync(downloads).filter(name => fs.statSync(path.join(downloads,name)).isDirectory() && !name.startsWith(".")).length === 6);
     const cleaningScreenshot = await cdp("Page.captureScreenshot", {format:"png"});
     fs.writeFileSync(path.join(home,"cleaning.png"), Buffer.from(cleaningScreenshot.data,"base64"));
     await evaluate('element("exportDialog").close();');

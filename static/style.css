@@ -181,6 +181,11 @@ dialog.export-dialog[open] { display: flex; flex-direction: column; }
 .export-class-table th:first-child { text-align: left; overflow-wrap: anywhere; }
 .export-class-table td[data-gap] { color: var(--amber); background: #e1a65512; }
 .export-actions { align-items: center; }
+.export-destination { display: grid; gap: 8px; margin-bottom: 16px; overflow-wrap: anywhere; }
+.export-destination p { line-height: 1.5; }
+.export-feedback { flex: 1 1 200px; min-width: 0; }
+#exportProgress { width: 100%; height: 10px; margin-top: 8px; accent-color: var(--accent); }
+#exportProgressDetail { margin-top: 6px; overflow-wrap: anywhere; }
 #exportResult { flex: 1 1 200px; line-height: 1.6; overflow-wrap: anywhere; }
 #exportResult a { white-space: nowrap; }
 #exportResult[data-error="true"] { color: var(--red); }

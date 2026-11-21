@@ -152,6 +152,11 @@
     </form>
     <div class="dialog-body export-layout">
       <fieldset class="export-controls" id="exportControls" aria-label="导出设置">
+        <div class="export-destination">
+          <label>导出到本机文件夹<input id="exportDestination" readonly placeholder="请点击按钮选择文件夹" aria-describedby="exportDestinationHint"></label>
+          <button class="button" type="button" id="chooseExportFolder">选择导出文件夹…</button>
+          <p id="exportDestinationHint" class="muted">弹出系统文件夹选择窗口。将在所选位置新建独立数据集目录，不覆盖已有文件，不生成 ZIP。</p>
+        </div>
         <label>导出格式<select id="exportFormat"><option value="yolo" data-tasks="detect segment hand_pose">YOLO</option><option value="labelme" data-tasks="detect segment">Labelme / X-AnyLabeling</option><option value="coco" data-tasks="detect segment hand_pose">COCO</option><option value="mask" data-tasks="semantic" hidden>PNG 类别掩膜</option></select></label>
         <label>批次<select id="exportBatch"><option value="">全部批次</option></select></label>
         <label class="check"><input type="checkbox" id="reviewedOnly" checked>仅纳入已人工确认的标注</label>
@@ -218,8 +223,12 @@
       </section>
     </div>
     <div class="dialog-actions export-actions">
-      <div id="exportResult" aria-live="polite"></div>
-      <button class="button primary" id="createExport" disabled>生成 ZIP 并下载</button>
+      <div class="export-feedback">
+        <div id="exportResult" role="status" aria-live="polite"></div>
+        <progress id="exportProgress" max="100" value="0" aria-label="数据集导出进度" hidden></progress>
+        <p id="exportProgressDetail" class="muted" hidden></p>
+      </div>
+      <button class="button primary" id="createExport" disabled>导出到文件夹</button>
     </div>
   </dialog>
   <dialog id="trainingDialog" class="export-dialog training-dialog" aria-labelledby="trainingTitle">

@@ -1,5 +1,6 @@
 import io
 import json
+import time
 import zipfile
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import pytest
 from PIL import Image
 
 from labelpilot.exporting import export_project, preview_export
+from labelpilot.export_jobs import ExportJobs
 from labelpilot.store import Problem, Store, atomic_json
 from labelpilot.tasks import HAND_COUNT, mask_shape
 
@@ -172,6 +174,42 @@ def test_hand_visibility_and_schema_survive_yolo_and_coco(tmp_path):
         assert data["annotations"][0]["num_keypoints"] == 2
         assert len(data["categories"][0]["keypoints"]) == HAND_COUNT
         assert data["categories"][0]["skeleton"][0] == [1, 2]
+
+
+@pytest.mark.parametrize("task,format_name", [("segment", "yolo"), ("segment", "coco"),
+                                               ("semantic", "mask"), ("hand_pose", "yolo"), ("hand_pose", "coco")])
+def test_task_folder_export_preserves_annotations(tmp_path, task, format_name):
+    store, project, item = project_with_image(tmp_path, task, ["part"] if task != "hand_pose" else None)
+    shapes = [polygon("part", 4, 5, 35, 30)]
+    if task == "hand_pose":
+        shapes = [{"label": "hand", "shape_type": "hand", "points": [[10, 10], [60, 55]],
+                   "keypoints": [[20, 20, 2], [30, 30, 1]] + [[0, 0, 0] for _ in range(HAND_COUNT - 2)]}]
+    reviewed(store, project, item, shapes)
+    jobs = ExportJobs(store)
+    try:
+        record = jobs.start(project.id, {"format": format_name, "destination": str(tmp_path)})
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            record = jobs.get(project.id, record["id"])
+            if record["status"] in ("completed", "failed"):
+                break
+            time.sleep(.01)
+        assert record["status"] == "completed", record
+        root = Path(record["result"]["directory"])
+        manifest = json.loads((root / "export_manifest.json").read_text(encoding="utf-8"))
+        assert manifest["task_type"] == task and manifest["integrity_check"]["passed"]
+        if task == "semantic":
+            mask_path = next((root / "masks").glob("*.png"))
+            with Image.open(mask_path) as mask:
+                assert mask.size == (80, 60) and mask.getpixel((8, 8)) == 1
+        elif format_name == "yolo":
+            values = next((root / "labels").glob("*.txt")).read_text().split()
+            assert len(values) == (5 + HAND_COUNT * 3 if task == "hand_pose" else 9)
+        else:
+            document = json.loads((root / "annotations.json").read_text(encoding="utf-8"))
+            assert len(document["annotations"]) == 1
+    finally:
+        jobs.shutdown()
 
 
 def test_atomic_json_retries_windows_sharing_violation(tmp_path, monkeypatch):

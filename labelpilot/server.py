@@ -21,6 +21,7 @@ from .comparison_details import review_frame, review_frames
 from .curation import similar_frames
 from .evaluation import ComparisonJobs
 from .exporting import export_project, preview_export
+from .export_jobs import ExportJobs
 from .inference import Inference, Jobs
 from . import model_files, native_picker
 from .store import IMAGE_SUFFIXES, Problem, Store
@@ -40,6 +41,7 @@ def create_app(home=None):
     training = TrainingJobs(store, inference, jobs)
     comparisons = ComparisonJobs(store, jobs)
     automation = Automation(store, jobs, training, comparisons)
+    exports = ExportJobs(store)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -47,6 +49,7 @@ def create_app(home=None):
         try:
             yield
         finally:
+            exports.shutdown()
             automation.shutdown()
             comparisons.shutdown()
             training.shutdown()
@@ -58,6 +61,7 @@ def create_app(home=None):
     app.state.training = training
     app.state.comparisons = comparisons
     app.state.automation = automation
+    app.state.exports = exports
     app.state.token = secrets.token_urlsafe(32)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"])
 
@@ -402,7 +406,21 @@ def create_app(home=None):
 
     @app.post("/api/projects/{project_id}/export")
     def export(project_id: str, payload: dict):
+        if "destination" in payload:
+            return JSONResponse(exports.start(project_id, payload), status_code=202)
         return export_project(store, project_id, payload)
+
+    @app.get("/api/projects/{project_id}/export/jobs")
+    def export_jobs(project_id: str):
+        return exports.list(project_id)
+
+    @app.get("/api/projects/{project_id}/export/jobs/{job_id}")
+    def export_progress(project_id: str, job_id: str):
+        return exports.get(project_id, job_id)
+
+    @app.post("/api/exports/select")
+    def select_export_directory(payload: dict):
+        return native_picker.select_images("export_folder", payload.get("path"))
 
     @app.get("/api/exports/{export_id}")
     def download(export_id: str):

@@ -31,7 +31,7 @@ def initial_directory(value):
 
 
 def select_images(mode, path=None):
-    if mode not in ("file", "folder"):
+    if mode not in ("file", "folder", "export_folder"):
         raise Problem("请选择图片文件或文件夹", 422)
     initial = initial_directory(path)
     if not PICKER_LOCK.acquire(blocking=False):
@@ -60,9 +60,11 @@ def select_images(mode, path=None):
             raise Problem("所选路径无效或图片超过 10000 张，请重新选择", 422)
         if not selected:
             return {"cancelled": True}
-        if mode == "folder":
+        if mode in ("folder", "export_folder"):
             if len(selected) != 1:
                 raise Problem("请只选择一个图片文件夹", 422)
+            if mode == "export_folder":
+                return {"cancelled": False, "directory": str(directory(selected[0]))}
             return {"cancelled": False, "image_root": str(directory(selected[0])), "image_files": []}
         files = []
         for value in selected:
@@ -95,8 +97,9 @@ def show_dialog(mode, path):
     root.update()
     try:
         options = {"parent": root, "initialdir": path}
-        if mode == "folder":
-            selected = filedialog.askdirectory(title="LabelPilot · 选择待标注图片文件夹", mustexist=True, **options)
+        if mode in ("folder", "export_folder"):
+            title = "LabelPilot · 选择数据集导出文件夹" if mode == "export_folder" else "LabelPilot · 选择待标注图片文件夹"
+            selected = filedialog.askdirectory(title=title, mustexist=True, **options)
             return [selected] if selected else []
         return list(filedialog.askopenfilenames(
             title="LabelPilot · 选择待标注图片（可多选）",

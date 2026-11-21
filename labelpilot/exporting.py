@@ -5,6 +5,7 @@ import json
 import math
 import random
 import re
+import shutil
 import uuid
 import zipfile
 from dataclasses import dataclass
@@ -276,19 +277,25 @@ def describe_export(store, plan):
 
 def export_project(store, project_id, options):
     with store.lock:
-        plan = prepare_export(store, project_id, options)
-        fingerprints = {}
-        expected = options.get("preview_token")
-        if expected is not None:
-            for row in plan.rows:
-                if "version" not in row:
-                    try:
-                        fingerprints[row["id"]] = digest(plan.project.item(row["id"])["source"])
-                    except OSError as exc:
-                        raise Problem(f"{row['photo_id']} 的原标注无法读取，请重新扫描数据", 409) from exc
-            if expected != export_fingerprint(plan, fingerprints):
-                raise Problem("数据已变化，请查看更新后的预检结果再导出", 409)
+        plan, fingerprints = validated_export_plan(store, project_id, options)
         return write_archive(store, plan, fingerprints)
+
+
+def validated_export_plan(store, project_id, options, *, checkpoint=None):
+    plan = prepare_export(store, project_id, options, checkpoint=checkpoint)
+    fingerprints = {}
+    expected = options.get("preview_token")
+    for row in plan.rows:
+        if checkpoint:
+            checkpoint()
+        if "version" not in row:
+            try:
+                fingerprints[row["id"]] = digest(plan.project.item(row["id"])["source"])
+            except OSError as exc:
+                raise Problem(f"{row['photo_id']} 的原标注无法读取，请重新扫描数据", 409) from exc
+    if expected is not None and expected != export_fingerprint(plan, fingerprints):
+        raise Problem("数据已变化，请查看更新后的预检结果再导出", 409)
+    return plan, fingerprints
 
 
 def write_archive(store, plan, fingerprints):
@@ -314,20 +321,30 @@ def write_archive(store, plan, fingerprints):
 class DatasetFolder:
     def __init__(self, root):
         self.root = root
+        self.members = []
+        self.member_names = set()
         root.mkdir(parents=True)
 
     def open(self, name, mode):
+        member = PurePosixPath(name)
+        if member.is_absolute() or ".." in member.parts or "\\" in name or name in self.member_names:
+            raise Problem("导出文件路径无效或重复，已中止导出", 422)
         path = self.root / name
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.members.append(name)
+        self.member_names.add(name)
         return path.open(mode + "b")
 
     def writestr(self, name, content):
-        path = self.root / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if isinstance(content, bytes):
-            path.write_bytes(content)
-        else:
-            path.write_text(content, encoding="utf-8")
+        with self.open(name, "w") as destination:
+            destination.write(content if isinstance(content, bytes) else content.encode("utf-8"))
+
+    def write(self, source, name):
+        with Path(source).open("rb") as original, self.open(name, "w") as destination:
+            shutil.copyfileobj(original, destination)
+
+    def namelist(self):
+        return list(self.members)
 
     def read(self, name):
         return (self.root / name).read_bytes()
@@ -464,7 +481,7 @@ def verify_export_annotation(archive, format_name, project, document, image_name
                 reject("COCO 关键点或可见性不一致")
 
 
-def write_members(store, plan, archive, fingerprints, *, checkpoint=None):
+def write_members(store, plan, archive, fingerprints, *, checkpoint=None, progress=None, verify=False):
     project, format_name, rows = plan.project, plan.format_name, plan.rows
     split_config = plan.split_config
     split_counts = copy.deepcopy(plan.split_counts)
@@ -490,7 +507,7 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None):
             category.update(keypoints=[name for name, _ in HAND_KEYPOINTS],
                             skeleton=[[start + 1, end + 1] for start, end in HAND_SKELETON])
     coco_documents = {name: {"images": [], "annotations": [], "categories": categories} for name in subsets}
-    verify_annotations = augmentation or project.task_type != "detect"
+    verify_annotations = verify or augmentation or project.task_type != "detect"
     if plan.cleaning is not None:
         manifest["cleaning"] = plan.cleaning
     for row in rows:
@@ -522,7 +539,7 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None):
             if augmentation:
                 source_contents = Path(item["path"]).read_bytes()
                 archive.writestr(image_name, source_contents)
-            elif plan.cleaning is not None:
+            elif verify or plan.cleaning is not None:
                 write_verified_image(archive, item["path"], image_name, current["image_sha256"])
             else:
                 archive.write(item["path"], image_name)
@@ -536,13 +553,18 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None):
         if augmentation:
             if hashlib.sha256(archive.read(image_name)).hexdigest() != current["image_sha256"]:
                 raise Problem("原图副本指纹与已保存标注不一致，已中止导出", 409)
+        if verify or augmentation:
             manifest["items"][-1]["annotation_count"] = len(source_document["shapes"])
+        if progress:
+            progress(len(manifest["items"]), len(rows) + augmented_images, row["photo_id"])
         if augmentation and subset == "train":
             for preset in augmentation["presets"]:
                 settings = {**augmentation, "preset": preset}
                 produced = 0
                 for index, contents, augmented, provenance in augmented_variants(
                         io.BytesIO(source_contents), copy.deepcopy(source_document), row["id"], current["image_sha256"], settings):
+                    if checkpoint:
+                        checkpoint()
                     if (index != produced + 1 or index > settings["copies"] or provenance.get("variant") != index
                             or provenance.get("source_id") != row["id"] or provenance.get("source_sha256") != current["image_sha256"]):
                         raise Problem("增强副本编号或来源不一致，已中止导出", 422)
@@ -552,7 +574,7 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None):
                     variant_name = f"images/train/{Path(filename).stem}__aug_{preset}_{index}.jpg"
                     archive.writestr(variant_name, contents)
                     if hashlib.sha256(archive.read(variant_name)).hexdigest() != augmented["labelpilot"]["image_sha256"]:
-                        raise Problem("增强图片 ZIP 回读指纹不匹配，已中止导出", 422)
+                        raise Problem("增强图片回读指纹不匹配，已中止导出", 422)
                     manifest["items"].append({"photo_id": row["photo_id"], "id": variant_id, "status": "augmented",
                                               "revision": 0, "sha256": augmented["labelpilot"]["image_sha256"],
                                               "source_group": item["source_group"], "image": variant_name,
@@ -566,6 +588,8 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None):
                                      coco_documents, len(manifest["items"]))
                     verify_export_annotation(archive, format_name, project, expected_document, variant_name, "train",
                                              split_config, coco_documents, len(manifest["items"]), annotation_offset)
+                    if progress:
+                        progress(len(manifest["items"]), len(rows) + augmented_images, variant_id)
                 if produced != settings["copies"]:
                     raise Problem("增强副本数量缺失，已中止导出", 422)
     names = model_labels(project.task_type, project.names)
@@ -585,8 +609,8 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None):
             filename = f"annotations/{name}.json" if split_config else "annotations.json"
             archive.writestr(filename, json.dumps(document, ensure_ascii=False))
             if verify_annotations and json.loads(archive.read(filename)) != document:
-                raise Problem("COCO ZIP 回读与已校验标注不一致，已中止导出", 422)
-    if augmentation:
+                raise Problem("COCO 回读与已校验标注不一致，已中止导出", 422)
+    if verify or augmentation:
         if len(manifest["items"]) != len(rows) + augmented_images:
             raise Problem("导出图片总数与计划不一致，已中止导出", 422)
         if len(archive.namelist()) != len(set(archive.namelist())):

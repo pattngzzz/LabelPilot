@@ -12,7 +12,7 @@ const canvas = element("canvas");
 const context = canvas.getContext("2d");
 const sessionToken = document.querySelector('meta[name="labelpilot-token"]').content;
 const modelBrowser = {mode:"file",target:"modelPath",listing:null,loading:false,sequence:0};
-const exportPreview = {sequence:0, timer:null, plan:null, running:false};
+const exportPreview = {sequence:0, timer:null, plan:null, running:false, selecting:false, job:null};
 const exportSplitLabels = {train:"训练", val:"验证", test:"测试"};
 const exportSplitHints = {
   source_group:"任务清单里同一来源组的图片会进入同一个集合。实际比例取决于各组的图片数量。",
@@ -51,7 +51,11 @@ async function api(path, method="GET", body) {
   const response = await fetch(path, {method, headers:{"Content-Type":"application/json","X-LabelPilot-Token":sessionToken},
     body:body === undefined ? undefined : JSON.stringify(body)});
   const data = await response.json().catch(() => ({detail:"服务返回异常，请查看启动窗口"}));
-  if (!response.ok) throw new Error(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail));
+  if (!response.ok) {
+    const error = new Error(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail));
+    error.status = response.status;
+    throw error;
+  }
   return data;
 }
 
@@ -1230,7 +1234,7 @@ function updateExportPreview() {
   const clean = element("cleanDataset").checked;
   element("reviewedOnly").disabled = clean;
   if (clean) element("reviewedOnly").checked = true;
-  element("createExport").textContent = clean ? "下载清洗版 ZIP" : "生成 ZIP 并下载";
+  element("createExport").textContent = clean ? "导出清洗版到文件夹" : "导出到文件夹";
   let split;
   try {
     split = exportSplitOptions();
@@ -1257,7 +1261,7 @@ function updateExportPreview() {
       if (sequence !== exportPreview.sequence || !element("exportDialog").open) return;
       renderExportPreview(data, options);
       exportPreview.plan = {url, options, data};
-      element("createExport").disabled = Boolean(data.blocking_issue);
+      updateExportButton();
     } catch (error) {
       if (sequence === exportPreview.sequence && element("exportDialog").open) setExportPreviewStatus(error.message, true);
     }
@@ -1266,8 +1270,14 @@ function updateExportPreview() {
 
 async function openExportDialog(clean=false) {
   if (!state.project) return;
-  if (exportPreview.running) return toast("正在生成上一次的导出包");
+  if (exportPreview.running) {
+    if (!element("exportDialog").open) element("exportDialog").showModal();
+    return;
+  }
   element("exportResult").textContent = "";
+  element("exportProgress").hidden = true;
+  element("exportProgressDetail").hidden = true;
+  try { element("exportDestination").value = localStorage.getItem("labelpilot-export-directory") || ""; } catch {}
   element("cleanDataset").checked = clean;
   if (clean) {
     element("augmentationPreset").value = "none";
@@ -1281,6 +1291,18 @@ async function openExportDialog(clean=false) {
   element("exportDialog").querySelector(".dialog-body").scrollTop = 0;
   updateExportPreview();
   await loadAugmentationCatalog();
+  try {
+    const url = projectUrl("/export");
+    const jobs = await api(`${url}/jobs`);
+    const active = jobs.find(job => ["preparing", "writing", "finalizing"].includes(job.status));
+    if (active && element("exportDialog").open && !exportPreview.running) {
+      element("exportDestination").value = active.destination;
+      monitorExport(active, url);
+    } else if (jobs.length && element("exportDialog").open && !exportPreview.running) {
+      renderExportJob(jobs[0]);
+      element("exportResult").prepend("最近一次导出：");
+    }
+  } catch (error) { toast(`无法读取导出任务：${error.message}`); }
 }
 
 const trainingStatuses = {preparing:"准备清洗版数据", running:"训练中", cancelling:"正在停止", cancelled:"已停止",
@@ -1764,37 +1786,116 @@ async function freezeBlindset(event) {
   }
 }
 
+function updateExportButton() {
+  element("createExport").disabled = exportPreview.running || exportPreview.selecting ||
+    !element("exportDestination").value || !exportPreview.plan || Boolean(exportPreview.plan.data.blocking_issue);
+}
+
+async function selectExportFolder() {
+  if (exportPreview.running || exportPreview.selecting) return;
+  exportPreview.selecting = true;
+  element("chooseExportFolder").disabled = true;
+  updateExportButton();
+  const hint = element("exportDestinationHint");
+  hint.textContent = "请在系统弹出的窗口中选择导出文件夹；取消不会更改原有选择。";
+  try {
+    const result = await api("/api/exports/select", "POST", {path:element("exportDestination").value});
+    if (!result.cancelled) {
+      element("exportDestination").value = result.directory;
+      element("exportResult").textContent = "";
+      element("exportProgress").hidden = true;
+      element("exportProgressDetail").hidden = true;
+      try { localStorage.setItem("labelpilot-export-directory", result.directory); } catch {}
+    }
+    hint.textContent = "将在所选位置新建独立数据集目录，不覆盖已有文件，不生成 ZIP。";
+  } catch (error) { hint.textContent = error.message; }
+  finally {
+    exportPreview.selecting = false;
+    element("chooseExportFolder").disabled = false;
+    updateExportButton();
+  }
+}
+
+function setExportBusy(busy) {
+  exportPreview.running = busy;
+  element("exportControls").disabled = busy;
+  element("refreshExportPreview").disabled = busy;
+  updateExportButton();
+}
+
+function renderExportJob(job) {
+  const status = element("exportResult");
+  const progress = element("exportProgress");
+  const detail = element("exportProgressDetail");
+  progress.hidden = false;
+  detail.hidden = false;
+  status.dataset.error = "false";
+  if (job.status === "preparing") {
+    progress.removeAttribute("value");
+    status.textContent = "正在创建只读标注快照、校验预检及划分数据…";
+    detail.textContent = "后台导出不修改原图或数据库；可以关闭此窗口继续标注。";
+  } else {
+    progress.value = job.percent;
+    detail.textContent = `${job.percent}% · ${job.completed} / ${job.total} 张（含增强副本）${job.current_image ? ` · ${job.current_image}` : ""}`;
+    status.textContent = job.status === "finalizing" ? "正在写入类别表和清单、完成校验…" : "正在写入图片和标注并校验完整性…";
+  }
+  if (job.status === "completed") {
+    const result = job.result, counts = result.split_counts;
+    const summary = counts ? `训练 ${counts.train} 张 / 验证 ${counts.val} 张 / 测试 ${counts.test} 张。` : "未划分数据集。";
+    status.textContent = `已导出 ${result.images} 张。${summary}原图 ${result.original_images} 张，训练增强 ${result.augmented_images} 张。` +
+      (result.integrity_check?.passed ? "标注完整性校验通过。" : "");
+    detail.textContent = `100% · 保存位置：${result.directory}`;
+  } else if (["failed", "cancelled"].includes(job.status)) {
+    status.dataset.error = "true";
+    status.textContent = job.error;
+    detail.textContent = "导出未完成。不会覆盖已有数据，原图和数据库均保持不变。";
+  }
+}
+
+async function monitorExport(job, url) {
+  exportPreview.job = job;
+  setExportBusy(true);
+  renderExportJob(job);
+  try {
+    while (["preparing", "writing", "finalizing"].includes(job.status)) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      try { job = await api(`${url}/jobs/${job.id}`); }
+      catch (error) {
+        if (error.status === 404 || error.status === 403) throw error;
+        element("exportResult").textContent = `暂时无法读取进度，正在重试：${error.message}`;
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        continue;
+      }
+      exportPreview.job = job;
+      renderExportJob(job);
+    }
+    if (job.status === "completed") toast(`已导出到文件夹，共 ${job.result.images} 张`);
+  } catch (error) {
+    element("exportResult").dataset.error = "true";
+    element("exportResult").textContent = error.message;
+  } finally {
+    setExportBusy(false);
+    if (element("exportDialog").open) updateExportPreview();
+  }
+}
+
 async function exportDataset() {
   const plan = exportPreview.plan;
-  if (!element("exportDialog").open || !plan || plan.data.blocking_issue || exportPreview.running) return;
-  if (plan.data.unreviewed && !window.confirm(`这次导出包含 ${plan.data.unreviewed} 张待审核图片。确定生成此导出包？`)) return;
-  exportPreview.running = true;
-  element("exportControls").disabled = true;
-  element("refreshExportPreview").disabled = true;
-  element("createExport").disabled = true;
+  if (!element("exportDialog").open || !plan || plan.data.blocking_issue || exportPreview.running || exportPreview.selecting) return;
+  const destination = element("exportDestination").value;
+  if (!destination) return toast("请先选择导出文件夹");
+  if (plan.data.unreviewed && !window.confirm(`这次导出包含 ${plan.data.unreviewed} 张待审核图片。确定导出？`)) return;
+  setExportBusy(true);
   const status = element("exportResult");
   status.dataset.error = "false";
-  status.textContent = "正在核对原图并生成 ZIP…";
-  let failed = false;
+  status.textContent = "正在启动后台导出任务…";
   try {
-    const result=await api(plan.url, "POST", {...plan.options, preview_token:plan.data.preview_token});
-    const counts=result.split_counts;
-    const summary=counts ? `训练 ${counts.train} 张 / 验证 ${counts.val} 张 / 测试 ${counts.test} 张。` : "未划分数据集。";
-    const augmented = result.augmented_images ? `原图 ${result.original_images} 张，训练增强 ${result.augmented_images} 张。` : "";
-    const verified = result.integrity_check?.passed ? "标注完整性校验通过。" : "";
-    status.innerHTML=`<p class="muted">已导出 ${result.images} 张。${summary}${augmented}${verified}<a href="${escapeHtml(result.url)}" download>再次下载 ZIP</a></p>`;
-    const link=document.createElement("a");link.href=result.url;link.download=result.filename;document.body.append(link);link.click();link.remove();
-    toast(`已生成 ${result.images} 张数据的导出包`);
+    const job = await api(plan.url, "POST", {...plan.options, destination, preview_token:plan.data.preview_token});
+    await monitorExport(job, plan.url);
   } catch (error) {
-    failed = true;
     status.dataset.error = "true";
     status.textContent = error.message;
-  } finally {
-    exportPreview.running = false;
-    element("exportControls").disabled = false;
-    element("refreshExportPreview").disabled = false;
-    if (failed) updateExportPreview();
-    else element("createExport").disabled = !exportPreview.plan;
+    setExportBusy(false);
   }
 }
 async function createProject() {
@@ -1930,6 +2031,8 @@ listen("cleanButton", "click", () => openExportDialog(true));
 for (const id of ["exportFormat", "exportBatch", "reviewedOnly", "includeImages", "cleanDataset", "splitDataset",
   "exportSplitUnit", "splitTrain", "splitVal", "splitTest", "splitSeed", "augmentationPreset", "augmentationCopies", "augmentationSeed"]) listen(id, "input", () => {
   element("exportResult").textContent = "";
+  element("exportProgress").hidden = true;
+  element("exportProgressDetail").hidden = true;
   updateExportPreview();
 });
 listen("augmentationPreset", "change", updateExportPreview);
@@ -1947,6 +2050,7 @@ element("exportDialog").addEventListener("close", () => {
   exportPreview.plan = null;
 });
 listen("createExport","click",exportDataset);
+listen("chooseExportFolder","click",selectExportFolder);
 listen("trainingButton", "click", openTrainingDialog);
 listen("trainingForm", "submit", startTraining);
 element("trainingDialog").addEventListener("close", () => {
