@@ -213,13 +213,14 @@ class TrainingJobs:
                 write_members(self.store, plan, DatasetFolder(run / "dataset"), {}, checkpoint=checkpoint)
                 names = list(plan.project.names)
                 label_aliases = copy.deepcopy(plan.project.label_aliases)
+                model_label_aliases = copy.deepcopy(plan.project.model_label_aliases)
             checkpoint()
             if weights is not None:
                 starting = run / "starting.pt"
                 shutil.copyfile(weights, starting)
                 updates["starting_sha256"] = digest(starting)
             atomic_json(run / "train.json", {"options": options, "classes": names, "task_type": plan.project.task_type,
-                                            "label_aliases": label_aliases})
+                                            "label_aliases": label_aliases, "model_label_aliases": model_label_aliases})
             checkpoint()
             updates.update(split_counts=plan.split_counts, cleaned_out=len(plan.cleaning))
             with self.lock:

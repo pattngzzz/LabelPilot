@@ -1543,6 +1543,78 @@ def test_model_label_alias_keeps_strict_class_id_validation():
             model_class_names(model_names, names, aliases)
 
 
+@pytest.mark.parametrize("format_name", ["yolo", "labelme", "coco"])
+def test_model_only_alias_allows_reused_label_and_independent_export(store, format_name):
+    config = store.configs[0]
+    config["classes"] = ["corrected", "panel"]
+    config["model_label_aliases"] = {"object": "corrected"}
+    store.registry_path.write_text(json.dumps([config]), encoding="utf-8")
+    app = create_app(store.home)
+    with TestClient(app) as client:
+        headers = {"X-LabelPilot-Token": app.state.token}
+        response = client.post("/api/projects/test/labels", json={"name": "object"}, headers=headers)
+        assert response.status_code == 200
+        assert [(label["id"], label["name"]) for label in response.json()["classes"]] == [
+            (0, "corrected"), (1, "panel"), (2, "object")]
+        active = app.state.store
+        data = payload(active, "empty", "reviewed")
+        data["document"]["shapes"] = [
+            {"label": label, "shape_type": "rectangle", "points": [[10, 10], [80, 60]]}
+            for label in ("corrected", "object")]
+        saved = client.put("/api/projects/test/items/" + data["item"]["id"], json=data, headers=headers)
+        assert saved.status_code == 200
+        original = saved.json()["document"]
+        assert [shape["label"] for shape in original["shapes"]] == ["corrected", "object"]
+        assert active.project("test").normalize_labels(original) == original
+        exported = export_project(active, "test", {"format": format_name})
+        with zipfile.ZipFile(active.home / "exports" / exported["filename"]) as archive:
+            if format_name == "yolo":
+                label_file = next(name for name in archive.namelist() if name.startswith("labels/"))
+                assert [line.split()[0] for line in archive.read(label_file).decode().splitlines()] == ["0", "2"]
+            elif format_name == "labelme":
+                label_file = next(name for name in archive.namelist() if name.startswith("annotations/"))
+                assert [shape["label"] for shape in json.loads(archive.read(label_file))["shapes"]] == ["corrected", "object"]
+            else:
+                assert [row["category_id"] for row in json.loads(archive.read("annotations.json"))["annotations"]] == [1, 3]
+        restored = active.restore("test", data["item"]["id"], 1, 1)
+        assert restored["document"]["shapes"] == original["shapes"]
+        reloaded = Store(store.home).project("test")
+        assert reloaded.names == ["corrected", "panel", "object"]
+        assert reloaded.model_label_aliases == {"object": "corrected"}
+        assert reloaded.label_aliases == {}
+
+
+@pytest.mark.parametrize("aliases", [None, [], {"": "object"}, {"old": "missing"},
+                                       {"old": []}, {"object": "object"}, {"old": "other"}])
+def test_invalid_model_only_alias_is_rejected(store, aliases):
+    config = {**store.configs[0], "classes": ["object", "other"],
+              "label_aliases": {"old": "object"}, "model_label_aliases": aliases}
+    with pytest.raises(Problem, match="模型标签别名"):
+        Project(config)
+
+
+def test_model_only_alias_preserves_reused_name_and_strict_ids():
+    classes = ["corrected", "panel", "object"]
+    aliases = {"object": "corrected"}
+    assert model_class_names({0: "object", 1: "panel"}, classes, model_label_aliases=aliases) == classes[:2]
+    assert model_class_names(dict(enumerate(classes)), classes, model_label_aliases=aliases) == classes
+    for names in ({0: "panel", 1: "object"}, {0: "corrected", 1: "panel", 2: "corrected"}):
+        with pytest.raises(Problem, match="ID"):
+            model_class_names(names, classes, model_label_aliases=aliases)
+
+
+def test_delete_label_removes_only_target_model_aliases(store):
+    config = store.configs[0]
+    config["classes"] = ["object", "unused", "panel"]
+    config["model_label_aliases"] = {"old_unused": "unused", "old_panel": "panel"}
+    store.registry_path.write_text(json.dumps([config]), encoding="utf-8")
+    active = Store(store.home)
+    active.delete_label("test", "unused", config["classes"])
+    project = Store(store.home).project("test")
+    assert project.names == ["object", "panel"]
+    assert project.model_label_aliases == {"old_panel": "panel"}
+
+
 def test_asset_versions_change_with_frontend_content(dataset, tmp_path, monkeypatch):
     assets = tmp_path / "frontend"
     assets.mkdir()

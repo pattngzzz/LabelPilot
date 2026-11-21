@@ -135,6 +135,13 @@ class Project:
                 not isinstance(target, str) or target not in self.names
                 for alias, target in self.label_aliases.items()):
             raise Problem("标签别名必须从旧名称直接映射到现有类别，且不能覆盖现有类别", 422)
+        self.model_label_aliases = copy.deepcopy(config.get("model_label_aliases", {}))
+        if not isinstance(self.model_label_aliases, dict) or any(
+                not isinstance(alias, str) or not alias.strip() or
+                not isinstance(target, str) or target not in self.names or alias == target or
+                (alias in self.label_aliases and self.label_aliases[alias] != target)
+                for alias, target in self.model_label_aliases.items()):
+            raise Problem("模型标签别名必须直接映射到现有类别，且不能与标注别名冲突", 422)
         if self.task_type == "semantic" and (BACKGROUND in self.names or len(self.names) > 254):
             raise Problem("语义分割最多支持 254 个前景类别，background 为保留类别", 422)
         self.intake = intake or {}
@@ -539,11 +546,15 @@ class Store:
             aliases = {alias: target for alias, target in project.label_aliases.items() if target != name}
             if "label_aliases" in config:
                 config["label_aliases"] = aliases
+            model_aliases = {alias: target for alias, target in project.model_label_aliases.items() if target != name}
+            if "model_label_aliases" in config:
+                config["model_label_aliases"] = model_aliases
             atomic_json(self.registry_path, configs)
             self.configs = configs
             project.config = copy.deepcopy(config)
             project.names = list(config["classes"])
             project.label_aliases = aliases
+            project.model_label_aliases = model_aliases
             return project.summary()
 
     def overlay(self, project_id, include_documents=False, include_review=False):

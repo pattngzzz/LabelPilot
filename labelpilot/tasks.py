@@ -45,6 +45,21 @@ def model_labels(task, labels):
     return [BACKGROUND, *labels] if task == "semantic" else list(labels)
 
 
+def mapped_model_names(names, project_names, label_aliases=None, model_label_aliases=None):
+    aliases = label_aliases or {}
+    model_aliases = model_label_aliases or {}
+    ordered = []
+    for index in range(len(names)):
+        name = names[index]
+        if index < len(project_names) and name == project_names[index]:
+            ordered.append(name)
+        elif index < len(project_names):
+            ordered.append(model_aliases.get(name, aliases.get(name, name)))
+        else:
+            ordered.append(aliases.get(name, name))
+    return ordered
+
+
 def polygon_area(points):
     return abs(sum(x * following[1] - following[0] * y
                    for (x, y), following in zip(points, points[1:] + points[:1]))) / 2

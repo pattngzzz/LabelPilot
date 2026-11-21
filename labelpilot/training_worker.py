@@ -83,7 +83,8 @@ def train(run):
         raise Problem(f"训练需要 {MODEL_TASK[task]} 权重，当前模型为 {model.task}")
     if fine_tune:
         validate_model_task(model, task)
-        model_class_names(model.names, model_labels(task, config["classes"]), config.get("label_aliases"))
+        model_class_names(model.names, model_labels(task, config["classes"]), config.get("label_aliases"),
+                          config.get("model_label_aliases"))
 
     progress = {"epoch": 0, "epochs": options["epochs"], "device": torch.cuda.get_device_name(0) if use_cuda else "CPU",
                 "ultralytics": __version__, "torch": str(torch.__version__), "metrics": {}}

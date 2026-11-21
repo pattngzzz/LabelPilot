@@ -107,7 +107,8 @@ def test_clean_preview_reports_conflicts_when_no_image_can_be_retained(tmp_path)
 
 @pytest.mark.parametrize("cancel", [False, True])
 @pytest.mark.parametrize("renamed", [False, True])
-def test_training_api_stages_reviewed_snapshot_and_serializes_local_model_tasks(tmp_path, monkeypatch, cancel, renamed):
+@pytest.mark.parametrize("model_only", [False, True])
+def test_training_api_stages_reviewed_snapshot_and_serializes_local_model_tasks(tmp_path, monkeypatch, cancel, renamed, model_only):
     store, project, _ = make_project(tmp_path, [("a", "red", "first"), ("b", "blue", "first"),
                                                 ("c", "white", "second"), ("pending", "black", "second")])
     for name in ("a", "b", "c"):
@@ -116,6 +117,9 @@ def test_training_api_stages_reviewed_snapshot_and_serializes_local_model_tasks(
         store.configs[0]["classes"][0] = "object_1"
         store.configs[0]["label_aliases"] = {"object": "object_1"}
         atomic_json(store.registry_path, store.configs)
+    model_aliases = {"legacy_object": "object_1" if renamed else "object"} if model_only else {}
+    store.configs[0]["model_label_aliases"] = model_aliases
+    atomic_json(store.registry_path, store.configs)
     app = create_app(store.home)
     monkeypatch.setattr(training, "has_training_dependencies", lambda: True)
     release = threading.Event()
@@ -123,6 +127,7 @@ def test_training_api_stages_reviewed_snapshot_and_serializes_local_model_tasks(
     def worker(run, stop):
         setup = json.loads((run / "train.json").read_text(encoding="utf-8"))
         assert setup["label_aliases"] == ({"object": "object_1"} if renamed else {})
+        assert setup["model_label_aliases"] == model_aliases
         assert setup["classes"][0] == ("object_1" if renamed else "object")
         if cancel:
             assert stop.wait(5)

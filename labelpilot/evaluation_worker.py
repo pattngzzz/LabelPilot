@@ -82,7 +82,8 @@ def compare(run, directory, inputs):
             model = YOLO(str(path))
             if model.task != "detect":
                 raise Problem(f"{models[role]['filename']} 需要是 YOLO 目标检测权重", 422)
-            names = comparison_class_names(model.names, classes, setup.get("label_aliases"))
+            names = comparison_class_names(model.names, classes, setup.get("label_aliases"),
+                                           setup.get("model_label_aliases"))
             models[role]["class_names"] = names
             counts = {name: dict.fromkeys(("ground_truth", "matched", "missed", "false_positives"), 0) for name in classes}
             for index, (image, item, labels, size) in enumerate(frames, 1):

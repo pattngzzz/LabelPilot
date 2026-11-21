@@ -11,15 +11,14 @@ from PIL import Image
 from .curation import save_findings
 from .intake import rare_labels, route_review
 from .store import AUDITABLE, PENDING_REVIEW, Problem, atomic_json, digest, now, read_json
-from .tasks import HAND_COUNT, MAX_MASK_PIXELS, MODEL_TASK, mask_shape, model_labels, polygon_area
+from .tasks import HAND_COUNT, MAX_MASK_PIXELS, MODEL_TASK, mapped_model_names, mask_shape, model_labels, polygon_area
 
 
 DISABLED_INTEGRATIONS = ("sync", "hub", "wandb", "mlflow", "comet", "clearml", "dvc", "neptune", "raytune", "tensorboard")
 
 
-def model_class_names(names, project_names, label_aliases=None):
-    aliases = label_aliases or {}
-    ordered = [aliases.get(names[index], names[index]) for index in range(len(names))]
+def model_class_names(names, project_names, label_aliases=None, model_label_aliases=None):
+    ordered = mapped_model_names(names, project_names, label_aliases, model_label_aliases)
     if not ordered or ordered != project_names[:len(ordered)]:
         raise Problem("模型类别 ID / 名称与项目既有标签不一致；仅允许末尾追加标签或显式配置的同 ID 更名", 422)
     return ordered
@@ -162,7 +161,7 @@ class Inference:
                     raise Problem("工作流所选权重已变化，请恢复该版本或新建任务", 422)
                 candidate = YOLO(str(path))
                 validate_model_task(candidate, task)
-                model_class_names(candidate.names, project_names, project.label_aliases)
+                model_class_names(candidate.names, project_names, project.label_aliases, project.model_label_aliases)
                 self.model = candidate
                 self.model_digest = fingerprint
                 self.signature = signature
@@ -170,7 +169,7 @@ class Inference:
             if model_sha256 and self.model_digest != model_sha256:
                 raise Problem("工作流所选权重已变化，请恢复该版本或新建任务", 422)
             validate_model_task(self.model, task)
-            names = model_class_names(self.model.names, project_names, project.label_aliases)
+            names = model_class_names(self.model.names, project_names, project.label_aliases, project.model_label_aliases)
             current = self.store.detail(project_id, item_id)
             width, height = current["width"], current["height"]
             if task == "semantic" and width * height > MAX_MASK_PIXELS:

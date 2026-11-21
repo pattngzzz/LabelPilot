@@ -67,7 +67,8 @@ def test_freeze_repeats_group_selection_and_pins_annotations(tmp_path):
 
 @pytest.mark.parametrize("cancel", [False, True])
 @pytest.mark.parametrize("renamed", [False, True])
-def test_workbench_reserves_holdout_and_runs_comparison(tmp_path, monkeypatch, cancel, renamed):
+@pytest.mark.parametrize("model_only", [False, True])
+def test_workbench_reserves_holdout_and_runs_comparison(tmp_path, monkeypatch, cancel, renamed, model_only):
     store, project, _ = make_project(tmp_path, [
         ("blind", "red", "held"), ("negative", "black", "held"),
         ("same_source", "green", "held"), ("copied", "red", "copy_group"),
@@ -86,6 +87,9 @@ def test_workbench_reserves_holdout_and_runs_comparison(tmp_path, monkeypatch, c
         store.configs[0]["classes"][0] = "object_1"
         store.configs[0]["label_aliases"] = {"object": "object_1"}
         atomic_json(store.registry_path, store.configs)
+    model_aliases = {"legacy_object": "object_1" if renamed else "object"} if model_only else {}
+    store.configs[0]["model_label_aliases"] = model_aliases
+    atomic_json(store.registry_path, store.configs)
     app = create_app(store.home)
     monkeypatch.setattr(training, "has_training_dependencies", lambda: True)
     monkeypatch.setattr(evaluation, "has_training_dependencies", lambda: True)
@@ -105,6 +109,7 @@ def test_workbench_reserves_holdout_and_runs_comparison(tmp_path, monkeypatch, c
         assert {item["photo_id"] for item in manifest["items"]} == {"blind", "negative"}
         setup = read_json(run / "compare.json")
         assert setup["label_aliases"] == ({"object": "object_1"} if renamed else {})
+        assert setup["model_label_aliases"] == model_aliases
         assert setup["models"]["old"]["sha256"] == digest(copies / "old.pt")
         assert setup["models"]["new"]["sha256"] == digest(copies / "new.pt")
         assert setup["models"]["old"]["recorded_overlap"] == {"images": 0, "groups": 0, "folders": 0}
@@ -183,6 +188,19 @@ def test_comparison_label_aliases_preserve_class_order():
     assert evaluation.comparison_class_names({0: "object", 1: "other", 2: "extra"}, classes, aliases) == classes + ["extra"]
     with pytest.raises(Problem, match="ID"):
         evaluation.comparison_class_names({0: "other", 1: "object"}, classes, aliases)
+
+
+def test_comparison_model_only_alias_does_not_merge_reused_or_extra_class():
+    classes = ["corrected", "panel", "object"]
+    aliases = {"object": "corrected"}
+    assert evaluation.comparison_class_names({0: "object", 1: "panel"}, classes,
+                                             model_label_aliases=aliases) == classes[:2]
+    assert evaluation.comparison_class_names(dict(enumerate(classes)), classes,
+                                             model_label_aliases=aliases) == classes
+    assert evaluation.comparison_class_names(dict(enumerate(classes)), classes[:2],
+                                             model_label_aliases=aliases) == classes
+    with pytest.raises(Problem, match="ID"):
+        evaluation.comparison_class_names({0: "panel", 1: "object"}, classes, model_label_aliases=aliases)
 
 
 def test_image_review_tracks_targets_even_when_total_misses_are_the_same(tmp_path):

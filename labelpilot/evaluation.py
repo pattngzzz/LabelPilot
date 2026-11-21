@@ -9,6 +9,7 @@ from pathlib import Path
 from .blindsets import ID, get_blindset, verified_manifest
 from .comparison_details import DETAILS_FILE
 from .store import Problem, atomic_json, digest, now
+from .tasks import mapped_model_names
 from .training import LocalJobCancelled, has_training_dependencies, read_state, run_local_worker
 
 
@@ -50,9 +51,8 @@ def count_detections(counts, labels, detections, threshold):
     return details
 
 
-def comparison_class_names(names, classes, label_aliases=None):
-    aliases = label_aliases or {}
-    ordered = [aliases.get(names[index], names[index]) for index in range(len(names))]
+def comparison_class_names(names, classes, label_aliases=None, model_label_aliases=None):
+    ordered = mapped_model_names(names, classes, label_aliases, model_label_aliases)
     shared = min(len(ordered), len(classes))
     if not shared or ordered[:shared] != classes[:shared]:
         raise Problem("模型类别 ID / 名称与盲测集不匹配", 422)
@@ -214,7 +214,8 @@ class ComparisonJobs:
                 if stop.is_set():
                     raise LocalJobCancelled()
                 atomic_json(run / "compare.json", {"models": models, "options": record["options"],
-                                                  "label_aliases": copy.deepcopy(self.store.project(record["project"]).label_aliases)})
+                                                  "label_aliases": copy.deepcopy(self.store.project(record["project"]).label_aliases),
+                                                  "model_label_aliases": copy.deepcopy(self.store.project(record["project"]).model_label_aliases)})
                 atomic_json(run / "job.json", {**record, "status": "running"})
                 self.prediction_jobs.inference.release_cached_model()
                 run_local_worker(run, stop, "labelpilot.evaluation_worker", directory, inputs)
