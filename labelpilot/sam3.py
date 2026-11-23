@@ -50,6 +50,9 @@ class Sam3Assistant:
 
     def configure(self, payload):
         with self.lock:
+            if any(record.get("kind") == "sam3_contours" and record["status"] in ("queued", "running")
+                   for record in getattr(self.jobs, "records", {}).values()):
+                raise Problem("请先完成或取消批量轮廓任务，再修改 SAM3 配置", 409)
             self._reap_worker()
             if self.process is not None:
                 raise Problem("请先释放 SAM3 显存，再修改配置", 409)
@@ -145,7 +148,7 @@ class Sam3Assistant:
             sock.bind(("127.0.0.1", 0))
             return sock.getsockname()[1]
 
-    def _start_worker(self):
+    def _start_worker(self, owner_job_id=None):
         self._reap_worker()
         if self.process is not None and (self._health() or {}).get("ready"):
             return
@@ -153,7 +156,7 @@ class Sam3Assistant:
         backend = self.config().get("backend", "pytorch")
         if not self._installed(python, backend):
             raise Problem("SAM3 尚未安装在所选 Python 环境；请按 README 安装隔离环境", 503)
-        self.jobs.reserve_model_slot()
+        self.jobs.reserve_model_slot(owner_job_id=owner_job_id)
         self.slot_reserved = True
         try:
             self.inference.release_cached_model()
@@ -182,16 +185,21 @@ class Sam3Assistant:
             self._stop_worker()
             raise
 
-    def predict(self, image_path, payload):
+    def predict(self, image_path, payload, *, owner_job_id=None):
         prompt = payload.get("prompt")
+        targets = payload.get("targets")
         threshold = payload.get("threshold", 0.35)
-        if not isinstance(prompt, str) or not prompt.strip() or len(prompt.strip()) > 160:
+        if targets is None and (not isinstance(prompt, str) or not prompt.strip() or len(prompt.strip()) > 160):
             raise Problem("请输入 1 到 160 个字符的对象描述", 422)
         if not isinstance(threshold, (int, float)) or isinstance(threshold, bool) or not 0.05 <= threshold <= 0.95:
             raise Problem("置信度阈值必须在 0.05 到 0.95 之间", 422)
         with self.lock:
-            self._start_worker()
-            body = json.dumps({"image_path": str(Path(image_path).resolve()), "prompt": prompt.strip(),
+            active = list(getattr(self.jobs, "records", {}).values())
+            if any(job["status"] in ("queued", "running") and job["id"] != owner_job_id for job in active):
+                raise Problem("请等待当前批量任务完成或取消后再推理", 409)
+            self._start_worker(owner_job_id)
+            body = json.dumps({"image_path": str(Path(image_path).resolve()), "prompt": prompt.strip() if isinstance(prompt, str) else "",
+                               **({"targets": targets} if targets is not None else {}),
                                "threshold": float(threshold)}, ensure_ascii=False).encode("utf-8")
             request = urllib.request.Request(f"http://127.0.0.1:{self.port}/predict", data=body,
                                              headers={"Content-Type": "application/json",
@@ -234,8 +242,12 @@ class Sam3Assistant:
 
     def release(self):
         with self.lock:
+            if any(record.get("kind") == "sam3_contours" and record["status"] in ("queued", "running")
+                   for record in getattr(self.jobs, "records", {}).values()):
+                raise Problem("请先取消批量轮廓任务，等待当前图片完成后再释放显存", 409)
             self._stop_worker()
             return self.status()
 
     def shutdown(self):
-        self.release()
+        with self.lock:
+            self._stop_worker()

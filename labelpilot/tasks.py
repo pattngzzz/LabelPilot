@@ -8,7 +8,7 @@ from PIL import Image, ImageDraw
 
 SHAPE_TYPES = {
     "detect": ("rectangle", "polygon"),
-    "segment": ("polygon",),
+    "segment": ("rectangle", "polygon"),
     "semantic": ("polygon", "brush", "mask"),
     "hand_pose": ("hand",),
 }

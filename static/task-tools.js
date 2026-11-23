@@ -4,7 +4,7 @@ const taskUi = (() => {
   const names = {detect:"目标检测", segment:"实例分割", semantic:"语义分割", hand_pose:"手部姿态"};
   const instructions = {
     detect:"R 两次点击画框 · Esc 取消 · A / D 翻页",
-    segment:"P 标实例轮廓 · Q 完成 · 点选辅助可生成轮廓",
+    segment:"R 画定位框 · SAM3 按框生成轮廓 · P 描轮廓 · Q 完成",
     semantic:"P 圈区域 · B 画笔 · X 橡皮 · 按类别生成像素掩膜",
     hand_pose:"K 添加手部 · 按提示标关键点 · 可跳过不可见点",
   };
@@ -44,12 +44,13 @@ const taskUi = (() => {
     element("classesHint").textContent = instructions[task] + " · 右侧 × 删除未使用标签";
     element("modelTaskHint").textContent = {
       detect:"选择类别顺序一致的目标检测权重。",
-      segment:"使用实例分割权重，模型输出各对象的轮廓。",
+      segment:"可用检测权重先定位，再由 SAM3 按框生成轮廓；也可直接使用实例分割权重。矩形框可存草稿，补全轮廓后才能审核。",
       semantic:"使用语义分割权重。背景 ID 为 0，前景类别按项目顺序从 1 开始。",
       hand_pose:"使用 21 关键点的手部姿态权重。模板顺序从手腕到小指。",
     }[task];
     const formats = element("exportFormat");
-    formats.querySelector('[value="yolo"]').textContent = {detect:"YOLO · 检测框", segment:"YOLO · 实例轮廓", hand_pose:"YOLO Pose · 21 关键点"}[task] || "YOLO";
+    element("exportOutputTask").value = task === "segment" ? "segment" : "detect";
+    formats.querySelector('[value="yolo"]').textContent = {detect:"YOLO · 按标注用途导出", segment:"YOLO · 按标注用途导出", hand_pose:"YOLO Pose · 21 关键点"}[task] || "YOLO";
     formats.querySelector('[value="coco"]').textContent = task === "hand_pose" ? "COCO Keypoints" : "COCO";
     if (!formats.selectedOptions.length || formats.selectedOptions[0].disabled) {
       formats.value = Array.from(formats.options).find(option => !option.disabled).value;

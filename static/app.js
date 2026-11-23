@@ -730,6 +730,13 @@ function draw() {
     for(const point of state.polygon){const position=screenPoint(point);context.fillStyle=color;context.beginPath();context.arc(...position,3,0,Math.PI*2);context.fill();}
   }
   taskUi.drawDraft();
+  if (state.sam3PreviewIndex >= 0 && state.sam3Candidates[state.sam3PreviewIndex]) {
+    const candidate = state.sam3Candidates[state.sam3PreviewIndex];
+    const color = classInfo(candidate.label || state.project.classes[state.activeClass]?.name).color;
+    pathPoints(candidate.points);
+    context.save(); context.globalAlpha=.2; context.fillStyle=color; context.fill(); context.globalAlpha=1;
+    context.strokeStyle=color; context.lineWidth=2; context.setLineDash([6,4]); context.stroke(); context.restore();
+  }
   efficiency.drawExtras();
   workspaceResume.observe();
   element("fitButton").textContent=`${Math.round(state.scale*100)}%`;
@@ -856,7 +863,7 @@ canvas.addEventListener("wheel",event=>{event.preventDefault();if(state.busy)ret
 new ResizeObserver(resizeCanvas).observe(element("canvasWrap"));
 
 function modelOptions() {
-  return {confidence:Number(element("confidence").value),iou:Number(element("iou").value),image_size:Number(element("imageSize").value)};
+  return {confidence:Number(element("confidence").value),iou:Number(element("iou").value),image_size:Number(element("imageSize").value),duplicate_iou:Number(element("duplicateIou").value)};
 }
 async function saveModelConfig() {
   const path=element("modelPath").value.trim();
@@ -1043,13 +1050,31 @@ function applyPrediction(append) {
   if(!state.prediction || !state.current)return;
   if(state.prediction.base_version!==state.current.version || state.prediction.image_sha256!==state.current.image_sha256)throw new Error("标注版本或图片已变化，请重新推理");
   checkpoint();
-  state.current.document.shapes=append ? state.current.document.shapes.concat(copy(state.prediction.shapes)) : copy(state.prediction.shapes);
+  const incoming = copy(state.prediction.shapes);
+  const prior = append ? state.current.document.shapes : [];
+  const threshold = state.prediction.provenance.duplicate_filter?.iou || Number(element("duplicateIou").value);
+  const accepted = incoming.filter(shape => shape.shape_type !== "rectangle" || !prior.some(other => {
+    if (other.shape_type !== "rectangle" || shape.label !== other.label) return false;
+    const [left,top,right,bottom] = bounds(shape), [otherLeft,otherTop,otherRight,otherBottom] = bounds(other);
+    const overlap = Math.max(0,Math.min(right,otherRight)-Math.max(left,otherLeft))*Math.max(0,Math.min(bottom,otherBottom)-Math.max(top,otherTop));
+    const union = (right-left)*(bottom-top)+(otherRight-otherLeft)*(otherBottom-otherTop)-overlap;
+    return union > 0 && overlap/union >= threshold;
+  }));
+  state.current.document.shapes = prior.concat(accepted);
   state.current.document.labelpilot={...(state.current.document.labelpilot || {}),prediction:copy(state.prediction.provenance)};
   state.selected=-1;
   state.prediction=null;
   element("predictionDialog").close();
   changed();
-  toast("模型建议已应用，尚未保存 / 审核"+(append?"；追加可能存在重叠框，请检查":""));
+  toast(`模型建议已应用，尚未保存 / 审核；过滤 ${incoming.length-accepted.length} 个与现有对象重复的模型框`);
+}
+
+async function cleanupDuplicates() {
+  if (state.busy || !await ensureSaved()) return;
+  if (!window.confirm("仅清理当前批次 / 搜索范围内模型待审核图片的同类高重叠预测框；人工对象及已审核图片不变，每次修改保留历史并作为草稿待复核。继续？")) return;
+  await api(projectUrl("/duplicates/jobs"), "POST", {...modelOptions(),...filters(),limit:Number(element("batchLimit").value)});
+  toast("重复框清理已启动，结果可在保存历史中恢复");
+  await pollJobs();
 }
 async function startBatch() {
   if(state.busy)return;
@@ -1069,12 +1094,14 @@ async function pollJobs() {
   const jobs=await api(projectUrl("/jobs"));
   if (state.project?.id !== project) return;
   efficiency.updateJobs(jobs);
+  if (element("sam3Jobs")) element("sam3Jobs").textContent = jobs.filter(job => job.kind === "sam3_contours").slice(0,3).map(job =>
+    `${({queued:"等待",running:"生成中",completed:"完成",completed_with_errors:"完成含失败",cancelled:"已取消",failed:"失败",interrupted:"已中断"})[job.status] || job.status}：${job.done+job.skipped+job.failed}/${job.total} 张 · ${job.candidates || 0} 个轮廓 · ${job.unmatched || 0} 个框未匹配 · 失败 ${job.failed}`).join("\n");
   const jobNames={queued:"等待中",running:"推理中",completed:"已完成",completed_with_errors:"完成，含失败",cancelled:"已取消",interrupted:"启动前任务已中断",failed:"失败"};
   const running=jobs.find(job=>["running","queued"].includes(job.status));
   element("jobStatus").hidden=!running;
-  const jobStages = {audit:"疑点扫描", routing:"智能审核分流"};
+  const jobStages = {audit:"疑点扫描", routing:"智能审核分流", sam3_contours:"批量轮廓候选", duplicate_cleanup:"重复框清理"};
   if(running)element("jobStatus").textContent=`✦ ${jobStages[running.kind] || "批量预标注"} ${running.done+running.skipped+running.failed} / ${running.total}`;
-  element("jobsList").innerHTML=jobs.slice(0,4).map(job=>`<div class="job-row"><div><strong>${jobStages[job.kind] ? jobStages[job.kind] + " · " : ""}${jobNames[job.status] || escapeHtml(job.status)} · ${job.done} / ${job.total}</strong><small>跳过 ${job.skipped} · 失败 ${job.failed}${job.errors?.length ? " · "+escapeHtml(job.errors.at(-1).error) : ""}</small></div>${["running","queued"].includes(job.status) ? `<button class="button" data-cancel-job="${job.id}">取消</button>`:""}</div>`).join("");
+  element("jobsList").innerHTML=jobs.slice(0,4).map(job=>`<div class="job-row"><div><strong>${jobStages[job.kind] ? jobStages[job.kind] + " · " : ""}${jobNames[job.status] || escapeHtml(job.status)} · ${job.done} / ${job.total}</strong><small>跳过 ${job.skipped} · 失败 ${job.failed}${job.kind==="duplicate_cleanup" ? " · 已移除 "+(job.removed || 0)+" 个重复框" : ""}${job.kind==="sam3_contours" ? " · "+(job.candidates || 0)+" 个轮廓 · "+(job.unmatched || 0)+" 个框未匹配" : ""}${job.errors?.length ? " · "+escapeHtml(job.errors.at(-1).error) : ""}</small></div>${["running","queued"].includes(job.status) ? `<button class="button" data-cancel-job="${job.id}">取消</button>`:""}</div>`).join("");
   const signature=jobs.map(job=>`${job.id}:${job.status}:${job.done}`).join("|");
   if(state.jobSignature && state.jobSignature!==signature && !state.busy)await refreshList();
   state.jobSignature=signature;
@@ -1253,6 +1280,7 @@ function updateExportPreview() {
   catch (error) { setExportPreviewStatus(error.message, true); return; }
 
   const options = {format:element("exportFormat").value, batch:element("exportBatch").value,
+    ...(["detect","segment"].includes(taskUi.type()) ? {output_task:element("exportOutputTask").value} : {}),
     reviewed_only:element("reviewedOnly").checked, include_images:element("includeImages").checked, clean, split, augmentation};
   const url = projectUrl("/export");
   setExportPreviewStatus(clean ? "正在读取原图并检查重复和标注异常…" : "正在统计本次导出的标注…");
@@ -1274,13 +1302,6 @@ async function openExportDialog(clean=false) {
   if (exportPreview.running) {
     if (!element("exportDialog").open) element("exportDialog").showModal();
     return;
-  }
-  if (state.sam3PreviewIndex >= 0 && state.sam3Candidates[state.sam3PreviewIndex]) {
-    const candidate=state.sam3Candidates[state.sam3PreviewIndex];
-    const color=state.project.classes[state.activeClass].color;
-    pathPoints(candidate.points);
-    context.save(); context.globalAlpha=.2; context.fillStyle=color; context.fill(); context.globalAlpha=1;
-    context.strokeStyle=color; context.lineWidth=2; context.setLineDash([6,4]); context.stroke(); context.setLineDash([]); context.restore();
   }
   element("exportResult").textContent = "";
   element("exportProgress").hidden = true;
@@ -2036,7 +2057,8 @@ listen("appendPrediction","click",()=>applyPrediction(true));listen("replacePred
 listen("jobsList","click",async event=>{const button=event.target.closest("[data-cancel-job]");if(button){await api(`/api/jobs/${button.dataset.cancelJob}/cancel`,"POST",{});toast("已请求取消；当前推理结束后停止，不会写入该张结果");}});
 for (const id of ["railExport", "exportButton"]) listen(id, "click", () => openExportDialog());
 listen("cleanButton", "click", () => openExportDialog(true));
-for (const id of ["exportFormat", "exportBatch", "reviewedOnly", "includeImages", "cleanDataset", "splitDataset",
+listen("cleanupDuplicates", "click", cleanupDuplicates);
+for (const id of ["exportFormat", "exportOutputTask", "exportBatch", "reviewedOnly", "includeImages", "cleanDataset", "splitDataset",
   "exportSplitUnit", "splitTrain", "splitVal", "splitTest", "splitSeed", "augmentationPreset", "augmentationCopies", "augmentationSeed"]) listen(id, "input", () => {
   element("exportResult").textContent = "";
   element("exportProgress").hidden = true;

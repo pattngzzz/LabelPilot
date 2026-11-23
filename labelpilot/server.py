@@ -25,6 +25,7 @@ from .export_jobs import ExportJobs
 from .inference import Inference, Jobs
 from . import model_files, native_picker
 from .sam3 import Sam3Assistant
+from .suggestions import AssistanceJobs, load_contours, predict_contours, save_contours
 from .store import IMAGE_SUFFIXES, Problem, Store
 from .tracking import track_frames
 from .training import TrainingJobs, has_training_dependencies
@@ -44,6 +45,7 @@ def create_app(home=None):
     automation = Automation(store, jobs, training, comparisons)
     exports = ExportJobs(store)
     sam3 = Sam3Assistant(store, inference, jobs)
+    assistance = AssistanceJobs(store, jobs, sam3)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -51,6 +53,9 @@ def create_app(home=None):
         try:
             yield
         finally:
+            for job_id, record in list(jobs.records.items()):
+                if record.get("kind") in ("sam3_contours", "duplicate_cleanup") and record["status"] in ("queued", "running"):
+                    jobs.cancel(job_id)
             sam3.shutdown()
             exports.shutdown()
             automation.shutdown()
@@ -66,6 +71,7 @@ def create_app(home=None):
     app.state.automation = automation
     app.state.exports = exports
     app.state.sam3 = sam3
+    app.state.assistance = assistance
     app.state.token = secrets.token_urlsafe(32)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"])
 
@@ -255,8 +261,8 @@ def create_app(home=None):
     @app.post("/api/projects/{project_id}/items/{item_id}/sam3")
     def sam3_predict(project_id: str, item_id: str, payload: dict):
         project = store.project(project_id)
-        if project.task_type != "segment":
-            raise Problem("SAM3 辅助只用于实例分割项目", 422)
+        if project.task_type not in ("detect", "segment"):
+            raise Problem("SAM3 辅助用于目标检测和实例分割项目", 422)
         label = payload.get("label")
         if not isinstance(label, str) or label not in project.names:
             raise Problem("请选择当前项目已有标签", 422)
@@ -272,6 +278,24 @@ def create_app(home=None):
             raise Problem("SAM3 推理期间原图发生改变，已拒绝候选", 409)
         result["label"] = label
         return result
+
+    @app.get("/api/projects/{project_id}/items/{item_id}/contours")
+    def item_contours(project_id: str, item_id: str):
+        return load_contours(store, project_id, item_id)
+
+    @app.post("/api/projects/{project_id}/items/{item_id}/contours")
+    def generate_contours(project_id: str, item_id: str, payload: dict):
+        result = predict_contours(store, sam3, project_id, item_id, payload)
+        save_contours(store, project_id, item_id, result)
+        return result
+
+    @app.post("/api/projects/{project_id}/contours/jobs", status_code=202)
+    def start_contours(project_id: str, payload: dict):
+        return assistance.start(project_id, payload)
+
+    @app.post("/api/projects/{project_id}/duplicates/jobs", status_code=202)
+    def start_duplicate_cleanup(project_id: str, payload: dict):
+        return assistance.start(project_id, payload, cleanup=True)
 
     @app.post("/api/projects/{project_id}/items/{item_id}/prompt-box")
     def propose_box(project_id: str, item_id: str, payload: dict):

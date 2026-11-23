@@ -64,6 +64,8 @@ def has_training_dependencies():
 def training_selection(store, project_id, options, checkpoint=None):
     task = store.project(project_id).task_type
     data_options = {"format": EXPORT_FORMATS[task][0], "batch": options["batch"], "clean": True}
+    if task in ("detect", "segment"):
+        data_options["output_task"] = task
     plan = prepare_export(store, project_id, data_options, include_documents=True, checkpoint=checkpoint)
     return plan, reserve_blind_images(store, project_id, plan.rows)
 

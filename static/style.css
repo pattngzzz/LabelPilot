@@ -40,6 +40,9 @@
 .label-composer small { display: block; margin-top: 6px; color: var(--muted); font-size: 9px; }
 .sam3-button { border-color: var(--accent-border); color: var(--accent-text); white-space: nowrap; }
 .sam3-dialog { width: min(780px, calc(100vw - 32px)); }
+.sam3-dialog .dialog-actions { flex-wrap: wrap; gap: 8px; }
+#modelDialog .dialog-actions { flex-wrap: wrap; }
+.sam3-dialog .dialog-body { max-height: 65vh; overflow-y: auto; }
 .sam3-config-grid, .sam3-prompt-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 12px 0; }
 .sam3-config-grid label, .sam3-prompt-row label { min-width: 0; }
 .sam3-path-row { display: flex; gap: 6px; margin-top: 6px; }

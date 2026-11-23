@@ -109,7 +109,7 @@ class Sam3OnnxRuntime:
                 raise RuntimeError(f"{name} 未成功启用 CUDA，已拒绝 CPU 回退")
             self.sessions[name] = session
 
-    def predict(self, image_path, prompt, threshold):
+    def encode_image(self, image_path):
         import numpy as np
         from PIL import Image
 
@@ -117,23 +117,34 @@ class Sam3OnnxRuntime:
             if source.getexif().get(274, 1) != 1:
                 raise ValueError("原图包含 EXIF 旋转，已拒绝应用以避免坐标偏移")
             image = source.convert("RGB")
-        language = self.sessions["sam3_language_encoder.onnx"]
-        language_outputs = dict(zip((value.name for value in language.get_outputs()),
-                                    language.run(None, {"tokens": text_tokens(self.tokenizer, prompt)})))
         encoder = self.sessions["sam3_image_encoder.onnx"]
         image_input = encoder.get_inputs()[0]
         pixels = prepare_image(image, image_input.shape, image_input.type)
         image_outputs = dict(zip((value.name for value in encoder.get_outputs()),
                                 encoder.run(None, {image_input.name: pixels})))
+        return image_outputs, image.width, image.height
+
+    def predict(self, image_path, prompt, threshold, *, box=None, encoded=None):
+        import numpy as np
+
+        image_outputs, width, height = encoded if encoded is not None else self.encode_image(image_path)
+        language = self.sessions["sam3_language_encoder.onnx"]
+        language_outputs = dict(zip((value.name for value in language.get_outputs()),
+                                    language.run(None, {"tokens": text_tokens(self.tokenizer, prompt)})))
+        coordinates = np.zeros((1, 1, 4), dtype=np.float32)
+        if box is not None:
+            left, top, right, bottom = box
+            coordinates[0, 0] = [(left + right) / (2 * width), (top + bottom) / (2 * height),
+                                 (right - left) / width, (bottom - top) / height]
         decoder = self.sessions["sam3_decoder.onnx"]
-        inputs = {**image_outputs, "original_height": np.array(image.height, dtype=np.int64),
-                  "original_width": np.array(image.width, dtype=np.int64),
+        inputs = {**image_outputs, "original_height": np.array(height, dtype=np.int64),
+                  "original_width": np.array(width, dtype=np.int64),
                   "language_mask": language_outputs["text_attention_mask"],
                   "language_features": language_outputs["text_memory"],
                   "language_embeds": language_outputs["text_embeds"],
-                  "box_coords": np.zeros((1, 1, 4), dtype=np.float32),
+                  "box_coords": coordinates,
                   "box_labels": np.ones((1, 1), dtype=np.int64),
-                  "box_masks": np.ones((1, 1), dtype=np.bool_)}
+                  "box_masks": np.full((1, 1), box is None, dtype=np.bool_)}
         output = dict(zip((value.name for value in decoder.get_outputs()),
                           decoder.run(None, {value.name: inputs[value.name] for value in decoder.get_inputs()})))
-        return output["masks"], output["scores"], image.width, image.height
+        return output["masks"], output["scores"], width, height

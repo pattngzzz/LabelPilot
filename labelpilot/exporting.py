@@ -125,14 +125,38 @@ class ExportPlan:
     split_counts: Optional[dict]
     cleaning: Optional[list]
     augmentation: Optional[dict] = None
+    output_task: Optional[str] = None
 
     @property
     def augmented_images(self):
         return self.split_counts["train"] * self.augmentation["variants_per_image"] if self.split_counts and self.augmentation else 0
 
 
+def output_document(plan, document):
+    document = copy.deepcopy(document)
+    if plan.output_task == "detect":
+        for shape in document["shapes"]:
+            xs, ys = zip(*shape["points"])
+            shape.update(shape_type="rectangle", points=[[min(xs), min(ys)], [max(xs), max(ys)]])
+            shape.pop("contour_source", None)
+    elif plan.output_task == "segment" or plan.project.task_type == "segment" and plan.format_name == "yolo":
+        if any(shape["shape_type"] != "polygon" for shape in document["shapes"]):
+            raise Problem("实例分割导出仍有未生成轮廓的检测框；请补全轮廓后导出，不会静默丢弃对象", 422)
+    return document
+
+
+def output_project(plan):
+    project = copy.copy(plan.project)
+    if plan.output_task:
+        project.task_type = plan.output_task
+    return project
+
+
 def prepare_export(store, project_id, options, *, include_documents=False, checkpoint=None, allow_empty_cleaning=False):
     project = store.project(project_id)
+    output_task = options.get("output_task")
+    if output_task is not None and (project.task_type not in ("detect", "segment") or output_task not in ("detect", "segment")):
+        raise Problem("检测 / 实例分割导出仅支持框和轮廓项目", 422)
     formats = EXPORT_FORMATS[project.task_type]
     format_name = options.get("format", formats[0])
     if format_name not in formats:
@@ -168,7 +192,7 @@ def prepare_export(store, project_id, options, *, include_documents=False, check
             raise Problem(f"清洗后没有可用图片。图片不可用 {counts['unreadable']} 张，标注异常 {counts['annotation']} 张，冲突副本 {counts['conflict']} 张", 422)
     assignments, split_config, split_counts = plan_splits(rows, options) if rows else ({}, None, None)
     plan = ExportPlan(project, format_name, batch, reviewed_only, include_images, rows,
-                      listing["filtered"] - len(rows), assignments, split_config, split_counts, cleaning, augmentation)
+                      listing["filtered"] - len(rows), assignments, split_config, split_counts, cleaning, augmentation, output_task)
     if len(rows) + plan.augmented_images > 20000:
         raise Problem("增强后每次导出最多 20000 张，请减少副本数量或按批次导出", 422)
     return plan
@@ -191,7 +215,7 @@ def export_fingerprint(plan, sources):
          row["image_sha256"], plan.assignments[row["id"]], sources.get(row["id"])) for row in plan.rows
     ]
     snapshot = (plan.project.id, plan.project.names, plan.format_name, plan.batch, plan.reviewed_only,
-                plan.include_images, plan.excluded, plan.split_config, plan.cleaning, plan.augmentation, item_versions)
+                plan.include_images, plan.excluded, plan.split_config, plan.cleaning, plan.augmentation, plan.output_task, item_versions)
     return hashlib.sha256(json.dumps(snapshot, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
@@ -213,6 +237,7 @@ def describe_export(store, plan):
     source_splits = {}
     fingerprints = {}
     objects = confirmed_empty = unreviewed = unreviewed_empty = polygons = missing_sources = 0
+    projection_issue = None
     for row in plan.rows:
         item_id = row["id"]
         subset = plan.assignments[item_id]
@@ -235,6 +260,10 @@ def describe_export(store, plan):
         except Problem as exc:
             raise Problem(f"{row['photo_id']}：{exc.message}", exc.status) from exc
         shapes = document["shapes"]
+        try:
+            shapes = output_document(plan, document)["shapes"]
+        except Problem as error:
+            projection_issue = error.message
         labels = [shape["label"] for shape in shapes]
         if plan.project.task_type == "semantic":
             mask = semantic_mask(shapes, plan.project.names, width, height)
@@ -255,9 +284,11 @@ def describe_export(store, plan):
             source_splits.setdefault(group, set()).add(subset)
 
     blocking_issue = None
-    if not plan.rows:
+    if projection_issue:
+        blocking_issue = projection_issue
+    elif not plan.rows:
         blocking_issue = "清洗后没有可用图片。请检查排除示例或扩大批次范围"
-    elif plan.format_name == "yolo" and plan.project.task_type == "detect" and polygons:
+    elif plan.format_name == "yolo" and (plan.output_task or plan.project.task_type) == "detect" and polygons:
         blocking_issue = f"{polygons} 张图片包含多边形。{YOLO_POLYGON_ERROR}"
     return {
         "images": len(plan.rows), "excluded": plan.excluded, "annotations": objects,
@@ -482,7 +513,7 @@ def verify_export_annotation(archive, format_name, project, document, image_name
 
 
 def write_members(store, plan, archive, fingerprints, *, checkpoint=None, progress=None, verify=False):
-    project, format_name, rows = plan.project, plan.format_name, plan.rows
+    project, format_name, rows = output_project(plan), plan.format_name, plan.rows
     split_config = plan.split_config
     split_counts = copy.deepcopy(plan.split_counts)
     augmentation, augmented_images = plan.augmentation, plan.augmented_images
@@ -490,7 +521,8 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None, progre
         split_counts["train"] += augmented_images
     unit = split_config["unit"] if split_config else None
     project_id = project.id
-    manifest = {"project": project_id, "task_type": project.task_type, "format": format_name, "created_at": now(),
+    manifest = {"project": project_id, "task_type": project.task_type, "source_task_type": plan.project.task_type,
+                "format": format_name, "created_at": now(),
                 "reviewed_only": plan.reviewed_only, "include_images": plan.include_images,
                 "classes": project.names, "split": {"image": "random_by_image", "source_group": "grouped_by_source",
                                                      "directory": "grouped_by_directory"}.get(unit, "unassigned"),
@@ -522,7 +554,8 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None, progre
         if plan.cleaning is not None and current["image_sha256"] != row["image_sha256"]:
             raise Problem("图像在清洗后发生变化，请重新预检", 409)
         document = copy.deepcopy(current["document"])
-        validate_export_document(store, project, document, current["width"], current["height"], current["status"])
+        validate_export_document(store, plan.project, document, current["width"], current["height"], current["status"])
+        document = output_document(plan, document)
         item = project.item(row["id"])
         safe_photo_id = re.sub(r"[^\w.-]", "_", row["photo_id"])
         filename = f"{safe_photo_id}_{row['id'][:8]}{Path(item['path']).suffix.lower()}"

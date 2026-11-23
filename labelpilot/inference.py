@@ -9,6 +9,7 @@ from pathlib import Path
 from PIL import Image
 
 from .curation import save_findings
+from .duplicates import duplicate_threshold, filter_duplicates
 from .intake import rare_labels, route_review
 from .store import AUDITABLE, PENDING_REVIEW, Problem, atomic_json, digest, now, read_json
 from .tasks import HAND_COUNT, MAX_MASK_PIXELS, MODEL_TASK, mapped_model_names, mask_shape, model_labels, polygon_area
@@ -24,8 +25,8 @@ def model_class_names(names, project_names, label_aliases=None, model_label_alia
     return ordered
 
 
-def validate_model_task(model, task):
-    if model.task != MODEL_TASK[task]:
+def validate_model_task(model, task, *, allow_detection=False):
+    if model.task != MODEL_TASK[task] and not (allow_detection and task == "segment" and model.task == "detect"):
         raise Problem(f"项目需要 {MODEL_TASK[task]} 权重，当前模型为 {model.task}", 422)
     if task == "hand_pose" and tuple(getattr(model.model, "kpt_shape", ())) not in ((HAND_COUNT, 2), (HAND_COUNT, 3)):
         raise Problem("手部姿态需要 21 个手部关键点的权重", 422)
@@ -140,6 +141,7 @@ class Inference:
         confidence = options.get("confidence", 0.25)
         iou = options.get("iou", 0.7)
         image_size = options.get("image_size", 960)
+        dedup_iou = duplicate_threshold(options)
         if not isinstance(confidence, (int, float)) or not 0.01 <= confidence <= 1:
             raise Problem("置信度必须在 0.01 到 1 之间", 422)
         if not isinstance(iou, (int, float)) or not 0.01 <= iou <= 1:
@@ -160,7 +162,7 @@ class Inference:
                 if model_sha256 and model_sha256 != fingerprint:
                     raise Problem("工作流所选权重已变化，请恢复该版本或新建任务", 422)
                 candidate = YOLO(str(path))
-                validate_model_task(candidate, task)
+                validate_model_task(candidate, task, allow_detection=True)
                 model_class_names(candidate.names, project_names, project.label_aliases, project.model_label_aliases)
                 self.model = candidate
                 self.model_digest = fingerprint
@@ -168,7 +170,7 @@ class Inference:
                 self.device = 0 if torch.cuda.is_available() else "cpu"
             if model_sha256 and self.model_digest != model_sha256:
                 raise Problem("工作流所选权重已变化，请恢复该版本或新建任务", 422)
-            validate_model_task(self.model, task)
+            validate_model_task(self.model, task, allow_detection=True)
             names = model_class_names(self.model.names, project_names, project.label_aliases, project.model_label_aliases)
             current = self.store.detail(project_id, item_id)
             width, height = current["width"], current["height"]
@@ -181,17 +183,21 @@ class Inference:
                                             verbose=False, save=False, half=False)[0]
             if tuple(result.orig_shape) != (height, width):
                 raise Problem("模型返回尺寸与原图不一致", 422)
+            prediction_task = "detect" if task == "segment" and self.model.task == "detect" else task
             shapes = [{**shape, "group_id": None, "description": "", "flags": {}, "attributes": {},
                        "difficult": False, "prediction_origin": "model_prediction",
                        "prediction_id": f"{item_id}:{index}:{self.model_digest[:12]}"}
-                      for index, shape in enumerate(prediction_shapes(result, task, names, width, height))]
+                      for index, shape in enumerate(prediction_shapes(result, prediction_task, names, width, height))]
+            shapes, removed = filter_duplicates(shapes, dedup_iou)
             output = result.semantic_mask if task == "semantic" else result.boxes
             provenance = {"model_path": str(path), "model_sha256": self.model_digest,
                           "class_names": names, "project_class_names": list(project.names),
-                          "task_type": task, "confidence": confidence, "iou": iou,
+                          "task_type": task, "model_task": self.model.task, "requires_contours": prediction_task != task,
+                          "confidence": confidence, "iou": iou,
                           "image_size": image_size, "device": str(output.data.device),
                           "image_sha256": current["image_sha256"], "created_at": now(),
                           "human_reviewed": False, "speed_ms": result.speed}
+            provenance["duplicate_filter"] = {"iou": dedup_iou, "removed": len(removed), "same_class_only": True}
             return {"shapes": shapes, "provenance": provenance, "base_version": current["version"],
                     "image_sha256": current["image_sha256"]}
 
@@ -230,9 +236,9 @@ class Jobs:
             record = self.records.get(job_id)
             return copy.deepcopy(record) if record and record["project"] == project_id else None
 
-    def reserve_model_slot(self):
+    def reserve_model_slot(self, *, owner_job_id=None):
         with self.lock:
-            if any(job["status"] in ("queued", "running") for job in self.records.values()):
+            if any(job["status"] in ("queued", "running") and job["id"] != owner_job_id for job in self.records.values()):
                 raise Problem("请等待批量预标注或疑点扫描完成，或先取消任务", 409)
             if not self.inference.lock.acquire(blocking=False):
                 raise Problem("模型运行环境正在使用，请等待当前任务结束", 409)

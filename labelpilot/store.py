@@ -309,6 +309,11 @@ class Store:
                     project TEXT NOT NULL, batch TEXT NOT NULL, excluded TEXT NOT NULL,
                     PRIMARY KEY (project, batch)
                 );
+                CREATE TABLE IF NOT EXISTS contour_suggestions (
+                    project TEXT NOT NULL, item TEXT NOT NULL, version INTEGER NOT NULL,
+                    snapshot TEXT NOT NULL, image_sha256 TEXT NOT NULL, result TEXT NOT NULL,
+                    PRIMARY KEY (project, item)
+                );
                 CREATE TABLE IF NOT EXISTS annotation_audits (
                     project TEXT NOT NULL, item TEXT NOT NULL, version INTEGER NOT NULL,
                     summary TEXT NOT NULL, evidence TEXT NOT NULL,
@@ -771,6 +776,8 @@ class Store:
             if not isinstance(shape, dict) or shape.get("label") not in project.names:
                 raise Problem("存在项目字典之外的类别；不会自动改类", 422)
             kind = shape.get("shape_type")
+            if task == "segment" and kind == "rectangle" and status == "reviewed":
+                raise Problem("实例分割审核不支持此标注形状：请先将矩形框补成轮廓，或保存为草稿", 422)
             points = shape.get("points")
             if kind not in SHAPE_TYPES[task] or not isinstance(points, list):
                 raise Problem("当前项目任务不支持此标注形状", 422)
@@ -843,6 +850,10 @@ class Store:
                                   "negative_sample_confirmed": status == "reviewed" and empty,
                                   "human_reviewed": status == "reviewed",
                                   "prediction": provenance}
+        incoming_meta = payload.get("document", {}).get("labelpilot", {})
+        for key in ("sam3_suggestions", "duplicate_cleanup"):
+            if key in incoming_meta:
+                document["labelpilot"][key] = copy.deepcopy(incoming_meta[key])
         if project.task_type == "semantic":
             document["labelpilot"]["semantic_empty"] = empty
         document["checked"] = status == "reviewed"

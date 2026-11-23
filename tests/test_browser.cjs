@@ -1137,8 +1137,8 @@ print('Rotation ZIP: all angles, dimensions, exact normalized boxes and train-on
     await cdp("Emulation.setDeviceMetricsOverride", {width:1600,height:1000,deviceScaleFactor:1,mobile:false});
     await evaluate('element("projectDialog").close()');
     await createTask("segment", "part");
-    await check(`element("projectTask").textContent==="实例分割" && document.querySelector('[data-tool="rectangle"]').hidden`,
-      "Instance projects show contour tools and a task-specific header");
+    await check(`element("projectTask").textContent==="实例分割" && !document.querySelector('[data-tool="rectangle"]').hidden`,
+      "Instance projects expose both box prompts and contour tools with a task-specific header");
     await check('!element("sam3Button").hidden', "Instance projects expose the local SAM3 assistant");
     await click("#sam3Button");
     await waitFor('element("sam3Dialog").open && element("sam3Status").textContent.includes("选择 SAM3")');
@@ -1188,6 +1188,65 @@ print('Rotation ZIP: all angles, dimensions, exact normalized boxes and train-on
       "Manual contours and point-assisted proposals both create independent instance polygons");
     await click("#saveButton");
     await waitFor('!state.busy && !state.dirty');
+
+    await evaluate(`addShape([[220,140],[300,200]],"rectangle",{label:"part",score:.8,prediction_origin:"model_prediction"})`);
+    await evaluate(`state.prediction={base_version:state.current.version,image_sha256:state.current.image_sha256,
+      shapes:[copy(state.current.document.shapes[3])],provenance:{duplicate_filter:{iou:.65}}};applyPrediction(true)`);
+    await check('state.current.document.shapes.length===4 && state.current.document.shapes[3].shape_type==="rectangle"',
+      "Appending a second model prediction does not duplicate an existing same-class box");
+    await click("#saveButton");
+    await waitFor('!state.busy && !state.dirty');
+    await evaluate(`window.contourBaseApi=api;window.contourCalls=[];api=async(path,method,body)=>{
+      if(path.endsWith("/contours/jobs")){contourCalls.push(body);return{id:"browser-contours",status:"queued"};}
+      if(path.endsWith("/contours")){
+        contourCalls.push(body);
+        const index=state.current.document.shapes.findIndex(shape=>shape.shape_type==="rectangle");
+        return{base_version:state.current.version,image_sha256:state.current.image_sha256,backend:"onnx",unmatched:0,
+          candidates:index<0?[]:[{source_index:index,source_shape:copy(state.current.document.shapes[index]),source_key:"test",label:"part",score:.94,
+          prompt:"part",box_iou:.9,points:[[222,142],[298,142],[298,198],[222,198]]}]};
+      }
+      return contourBaseApi(path,method,body);
+    };`);
+    await click("#sam3Button");
+    await waitFor('element("sam3Dialog").open && !element("sam3Generate").disabled');
+    await setExportValue("sam3Mode", "boxes");
+    await click("#sam3Generate");
+    await waitFor('state.sam3Candidates.length===1 && !element("sam3Generate").disabled');
+    await check('contourCalls.some(call=>call?.expected_version===state.current.version && call.all_labels===true)',
+      "Box-to-contour generation pins the annotation version and selected scope");
+    await click("#sam3LoadCandidates");
+    await waitFor('state.sam3Candidates.length===1 && element("sam3Status").textContent.includes("读取到")');
+    await check('element("sam3Dialog").scrollWidth<=element("sam3Dialog").clientWidth',
+      "The expanded SAM3 controls and wrapped action buttons fit the dialog");
+    fs.writeFileSync(path.join(home,"sam3-contours.png"), Buffer.from((await cdp("Page.captureScreenshot", {format:"png"})).data,"base64"));
+    await click(".sam3-candidate .button:not(.primary)");
+    await waitFor('!element("sam3Dialog").open && !element("sam3PreviewBar").hidden && state.sam3PreviewIndex===0');
+    await check('!!state.sam3Candidates[state.sam3PreviewIndex]',
+      "Contour preview uses the unobstructed full canvas rather than the blurred modal backdrop");
+    await click("#sam3PreviewReturn");
+    await waitFor('element("sam3Dialog").open && element("sam3PreviewBar").hidden');
+    await evaluate('state.current.document.shapes[3].points[0][0] += 1');
+    await click(".sam3-candidate .button.primary");
+    await check('state.current.document.shapes[3].shape_type==="rectangle" && element("sam3Status").textContent.includes("已被修改")',
+      "A contour cannot overwrite a box changed after inference");
+    await evaluate('state.current.document.shapes[3].points[0][0] -= 1');
+    await click(".sam3-candidate .button.primary");
+    await check('state.current.document.shapes.length===4 && state.current.document.shapes[3].shape_type==="polygon" && state.current.document.shapes[3].contour_source.shape.shape_type==="rectangle" && state.current.document.shapes[3].prediction_origin==="sam3_prediction"',
+      "Accepting a box-linked contour replaces only its source box and retains its provenance");
+    await evaluate('element("sam3Dialog").close()');
+    await click("#saveButton");
+    await waitFor('!state.busy && !state.dirty');
+    await check('api(itemUrl()).then(value=>value.document.shapes[3].contour_source.shape.shape_type==="rectangle")',
+      "The contour-box link survives saving and reloading from the backend");
+    await click("#sam3Button");
+    await waitFor('element("sam3Dialog").open && !element("sam3Batch").disabled');
+    await evaluate('window.contourConfirm=window.confirm;window.confirm=()=>true');
+    await click("#sam3Batch");
+    await waitFor('contourCalls.some(call=>call?.limit===100 && call.all_labels===true)');
+    await evaluate('window.confirm=window.contourConfirm');
+    await evaluate('element("sam3Dialog").close()');
+    await check('Promise.all(["detect","segment"].map(output_task=>api(projectUrl("/export/preview"),"POST",{format:"yolo",output_task,reviewed_only:false}))).then(values=>values.every(value=>value.blocking_issue===null))',
+      "One contour project can preview either bounding-box or instance-segmentation exports");
 
     await createTask("semantic", "region");
     await click('[data-tool="brush"]');

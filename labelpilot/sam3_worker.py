@@ -60,6 +60,41 @@ class Sam3Runtime:
             raise RuntimeError("SAM3 返回的掩膜数量与分数不一致")
         return mask_candidates(masks, scores, image.width, image.height, threshold)
 
+    def predict_boxes(self, image_path, targets, threshold):
+        from PIL import Image
+
+        with Image.open(image_path) as source:
+            if source.getexif().get(274, 1) != 1:
+                raise ValueError("原图包含 EXIF 旋转，已拒绝应用")
+            image = source.convert("RGB")
+        validate_targets(targets, image.width, image.height)
+        state = self.processor.set_image(image)
+        candidates = []
+        for target in targets:
+            self.processor.reset_all_prompts(state)
+            self.processor.set_text_prompt(target["prompt"], state)
+            left, top, right, bottom = target["box"]
+            box = [(left + right) / (2 * image.width), (top + bottom) / (2 * image.height),
+                   (right - left) / image.width, (bottom - top) / image.height]
+            result = self.processor.add_geometric_prompt(box, True, state)
+            masks, scores = result.get("masks"), result.get("scores")
+            if masks is not None and scores is not None:
+                result = mask_candidates(masks.detach().cpu().numpy(), scores.detach().cpu().numpy(), image.width, image.height, threshold)
+                candidates.extend({**candidate, "source_index": target["source_index"]} for candidate in result["candidates"])
+        return {"candidates": candidates, "width": image.width, "height": image.height}
+
+
+def validate_targets(targets, width, height):
+    if not isinstance(targets, list) or not 1 <= len(targets) <= 1000:
+        raise ValueError("每张图片需要 1 到 1000 个有效检测框")
+    for target in targets:
+        box = target.get("box") if isinstance(target, dict) else None
+        if (not isinstance(box, list) or len(box) != 4 or any(type(value) not in (int, float) or not math.isfinite(value) for value in box)
+                or not 0 <= box[0] < box[2] <= width or not 0 <= box[1] < box[3] <= height
+                or not isinstance(target.get("prompt"), str) or not 1 <= len(target["prompt"].strip()) <= 160
+                or type(target.get("source_index")) is not int or target["source_index"] < 0):
+            raise ValueError("检测框、原图坐标或对象描述无效")
+
 
 def mask_candidates(masks, scores, width, height, threshold):
     import numpy as np
@@ -92,6 +127,17 @@ class OnnxRuntime:
     def predict(self, image_path, prompt, threshold):
         masks, scores, width, height = self.model.predict(image_path, prompt, threshold)
         return mask_candidates(masks, scores, width, height, threshold)
+
+    def predict_boxes(self, image_path, targets, threshold):
+        encoded = self.model.encode_image(image_path)
+        _, width, height = encoded
+        validate_targets(targets, width, height)
+        candidates = []
+        for target in targets:
+            masks, scores, _, _ = self.model.predict(image_path, target["prompt"], threshold, box=target["box"], encoded=encoded)
+            result = mask_candidates(masks, scores, width, height, threshold)
+            candidates.extend({**candidate, "source_index": target["source_index"]} for candidate in result["candidates"])
+        return {"candidates": candidates, "width": width, "height": height}
 
 
 def main():
@@ -145,16 +191,18 @@ def main():
                 return self.respond(404, {"detail": "not found"})
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                if not 0 < length <= 32768:
+                if not 0 < length <= 1048576:
                     return self.respond(413, {"detail": "request too large"})
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
                 image_path, prompt = payload.get("image_path"), payload.get("prompt")
                 threshold = payload.get("threshold", 0.35)
-                if not isinstance(image_path, str) or not isinstance(prompt, str) or not prompt.strip():
+                targets = payload.get("targets")
+                if not isinstance(image_path, str) or targets is None and (not isinstance(prompt, str) or not prompt.strip()):
                     return self.respond(422, {"detail": "image path and prompt are required"})
                 if not isinstance(threshold, (int, float)) or not 0.05 <= threshold <= 0.95:
                     return self.respond(422, {"detail": "threshold must be between 0.05 and 0.95"})
-                self.respond(200, runtime.predict(image_path, prompt.strip(), float(threshold)))
+                self.respond(200, runtime.predict_boxes(image_path, targets, float(threshold)) if targets is not None
+                             else runtime.predict(image_path, prompt.strip(), float(threshold)))
             except (OSError, ValueError, TypeError) as error:
                 self.respond(422, {"detail": str(error)[:300]})
             except Exception:
