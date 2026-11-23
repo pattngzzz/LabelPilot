@@ -141,9 +141,7 @@ def validate_augmented_sample(source, augmented, contents, settings, provenance)
     return len(shapes)
 
 
-def augmented_variants(path, document, source_id, source_sha256, settings):
-    preset = PRESETS[settings["preset"]]
-    angles = rotation_angles(source_id, source_sha256, settings) if preset.get("rotation") else None
+def augmentation_image(path):
     with Image.open(path) as source:
         if source.mode in ("RGBA", "LA") or "transparency" in source.info:
             rgba = source.convert("RGBA")
@@ -151,6 +149,13 @@ def augmented_variants(path, document, source_id, source_sha256, settings):
             original.paste(rgba, mask=rgba.getchannel("A"))
         else:
             original = source.convert("RGB")
+    return original
+
+
+def augmented_variants(path, document, source_id, source_sha256, settings):
+    preset = PRESETS[settings["preset"]]
+    angles = rotation_angles(source_id, source_sha256, settings) if preset.get("rotation") else None
+    original = path if isinstance(path, Image.Image) else augmentation_image(path)
     for index in range(1, settings["copies"] + 1):
         seed_material = f"labelpilot-augmentation-v1:{settings['seed']}:{source_id}:{source_sha256}:{settings['preset']}:{index}"
         generator = random.Random(int.from_bytes(hashlib.sha256(seed_material.encode()).digest(), "big"))

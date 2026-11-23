@@ -3,10 +3,12 @@ import re
 import shutil
 import sqlite3
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 
 from .exporting import DatasetFolder, validated_export_plan, write_members
+from .export_acceleration import AugmentationCache, ExportAcceleration, export_workers
 from .model_files import directory
 from .store import Problem, Store, now
 
@@ -66,6 +68,10 @@ class ExportJobs:
     def start(self, project_id, options):
         self.store.project(project_id)
         destination = directory(options.get("destination"))
+        workers = export_workers(options.get("workers", 0))
+        reuse_cache = options.get("reuse_cache", True)
+        if type(reuse_cache) is not bool:
+            raise Problem("增强缓存开关必须为布尔值", 422)
         with self.lock:
             if self.closed:
                 raise Problem("服务正在关闭，请稍后重试", 503)
@@ -74,7 +80,9 @@ class ExportJobs:
             job_id = uuid.uuid4().hex
             record = {"id": job_id, "project": project_id, "status": "preparing",
                       "destination": str(destination), "completed": 0, "total": 0, "percent": 0,
-                      "current_image": "", "created_at": now(), "updated_at": now()}
+                      "current_image": "", "created_at": now(), "updated_at": now(), "workers": workers,
+                      "cache_enabled": reuse_cache, "cache_hits": 0, "cache_misses": 0, "cache_errors": 0,
+                      "elapsed_seconds": 0, "images_per_second": 0, "remaining_seconds": None}
             self.records[job_id] = record
             while len(self.records) > 50:
                 del self.records[next(iter(self.records))]
@@ -95,14 +103,21 @@ class ExportJobs:
     def run(self, job_id, project_id, options, destination):
         temporary = None
         snapshot = None
+        cache = None
+        started = time.monotonic()
+        writing_started = None
 
         def checkpoint():
             if self.stop.is_set():
                 raise ExportCancelled()
 
         def progress(completed, total, image):
+            elapsed = max(0.001, time.monotonic() - writing_started)
+            speed = completed / elapsed
             self.update(job_id, completed=completed, total=total, percent=min(99, int(completed * 100 / total)),
-                        current_image=image)
+                        current_image=image, elapsed_seconds=round(time.monotonic() - started, 1),
+                        images_per_second=round(speed, 2), remaining_seconds=round((total - completed) / speed),
+                        **(cache.stats() if cache else {}))
 
         try:
             checkpoint()
@@ -119,7 +134,12 @@ class ExportJobs:
             self.update(job_id, status="writing", total=len(plan.rows) + plan.augmented_images)
             dataset = DatasetFolder(staging)
             temporary = staging
-            manifest = write_members(snapshot, plan, dataset, fingerprints, checkpoint=checkpoint, progress=progress, verify=True)
+            if options.get("reuse_cache", True) and plan.augmentation:
+                cache = AugmentationCache(self.store.data / "export_cache")
+            writing_started = time.monotonic()
+            with ExportAcceleration(export_workers(options.get("workers", 0)), cache, checkpoint) as acceleration:
+                manifest = write_members(snapshot, plan, dataset, fingerprints, checkpoint=checkpoint,
+                                         progress=progress, verify=True, acceleration=acceleration)
             checkpoint()
             self.update(job_id, status="finalizing")
             if output.exists():
@@ -129,8 +149,9 @@ class ExportJobs:
             result = {"directory": str(output), "images": len(manifest["items"]),
                       "original_images": len(plan.rows), "augmented_images": plan.augmented_images,
                       "split_counts": manifest["split_counts"], "source_split_counts": plan.split_counts,
-                      "integrity_check": manifest.get("integrity_check")}
-            self.update(job_id, status="completed", percent=100, result=result, current_image="")
+                       "integrity_check": manifest.get("integrity_check"), "acceleration": manifest.get("acceleration")}
+            self.update(job_id, status="completed", percent=100, result=result, current_image="", remaining_seconds=0,
+                        elapsed_seconds=round(time.monotonic() - started, 1), **(cache.stats() if cache else {}))
         except Exception as exc:
             cleanup_error = None
             if temporary is not None and temporary.exists():

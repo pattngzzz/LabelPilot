@@ -232,6 +232,246 @@ def test_folder_export_existing_staging_is_not_deleted(reviewed_store, monkeypat
         jobs.shutdown()
 
 
+@pytest.mark.parametrize("format_name", ["yolo", "labelme", "coco"])
+def test_accelerated_export_is_byte_identical_and_reuses_verified_cache(reviewed_store, monkeypatch, format_name):
+    import labelpilot.exporting as exporting
+
+    options = {"destination": str(reviewed_store.home), "format": format_name,
+               "split": {"train": 50, "val": 25, "test": 25},
+               "augmentation": {"preset": "all", "copies": 3, "seed": 43}}
+    jobs = ExportJobs(reviewed_store)
+
+    def export(**extra):
+        record = finish_folder_export(jobs, jobs.start("test", {**options, **extra}))
+        assert record["status"] == "completed", record
+        root = Path(record["result"]["directory"])
+        contents = {path.relative_to(root).as_posix(): path.read_bytes() for path in root.rglob("*")
+                    if path.is_file() and path.name != "export_manifest.json"}
+        assert record["result"]["integrity_check"]["passed"]
+        assert record["images_per_second"] > 0 and record["remaining_seconds"] == 0
+        return contents, record
+
+    try:
+        serial, _ = export(workers=1, reuse_cache=False)
+        parallel, _ = export(workers=4, reuse_cache=False)
+        cold, cold_record = export(workers=4)
+        assert cold_record["cache_hits"] == 0 and cold_record["cache_misses"] == 30
+        assert serial == parallel == cold
+        monkeypatch.setattr(exporting, "augmented_variants", lambda *args: pytest.fail("Warm cache must not regenerate"))
+        warm, warm_record = export(workers=2)
+        assert serial == warm and warm_record["cache_hits"] == 30 and warm_record["cache_errors"] == 0
+        assert warm_record["result"]["acceleration"]["cache_hits"] == 30
+    finally:
+        jobs.shutdown()
+
+
+def test_accelerated_export_decodes_each_training_source_once(reviewed_store, monkeypatch):
+    import labelpilot.exporting as exporting
+
+    decoded = []
+    original = exporting.augmentation_image
+    monkeypatch.setattr(exporting, "augmentation_image", lambda path: (decoded.append(1), original(path))[1])
+    jobs = ExportJobs(reviewed_store)
+    try:
+        options = {"destination": str(reviewed_store.home), "workers": 4, "reuse_cache": False,
+                   "split": {"train": 100, "val": 0, "test": 0}, "augmentation": {"preset": "all", "copies": 3}}
+        result = finish_folder_export(jobs, jobs.start("test", options))
+        assert result["status"] == "completed", result
+        assert len(decoded) == 4 and result["result"]["augmented_images"] == 60
+    finally:
+        jobs.shutdown()
+
+
+@pytest.mark.parametrize("corruption", ["bytes", "shift", "label", "missing"])
+def test_accelerated_export_rebuilds_corrupt_cache_without_losing_boxes(reviewed_store, monkeypatch, corruption):
+    import labelpilot.exporting as exporting
+
+    jobs = ExportJobs(reviewed_store)
+    options = {"destination": str(reviewed_store.home), "workers": 4,
+               "split": {"train": 100, "val": 0, "test": 0}, "augmentation": {"preset": "all"}}
+    try:
+        cold = finish_folder_export(jobs, jobs.start("test", options))
+        assert cold["status"] == "completed", cold
+        damaged = None
+        for path in (reviewed_store.data / "export_cache").glob("*.cache"):
+            with zipfile.ZipFile(path) as archive:
+                metadata = json.loads(archive.read("manifest.json"))
+                if not metadata["variants"][0][1]["shapes"]:
+                    continue
+                contents = {name: archive.read(name) for name in archive.namelist()}
+            damaged = path
+            if corruption == "bytes":
+                contents["0.jpg"] = b"corrupt jpeg"
+            elif corruption == "shift":
+                metadata["variants"][0][1]["shapes"][0]["points"][0][0] += 1
+            elif corruption == "label":
+                metadata["variants"][0][1]["shapes"][0]["label"] = "wrong_label"
+            else:
+                metadata["variants"].pop()
+            contents["manifest.json"] = json.dumps(metadata).encode()
+            with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
+                for name, data in contents.items():
+                    archive.writestr(name, data)
+            break
+        assert damaged is not None
+        warm = finish_folder_export(jobs, jobs.start("test", options))
+        assert warm["status"] == "completed", warm
+        assert warm["cache_errors"] > 0 and warm["cache_misses"] == 5 and warm["cache_hits"] == 15
+        for record in (cold, warm):
+            assert record["result"]["integrity_check"]["annotations_checked"] == 12
+        baseline = Path(cold["result"]["directory"])
+        rebuilt = Path(warm["result"]["directory"])
+        assert {path.relative_to(baseline): path.read_bytes() for path in baseline.rglob("*")
+                if path.is_file() and path.name != "export_manifest.json"} == {
+                    path.relative_to(rebuilt): path.read_bytes() for path in rebuilt.rglob("*")
+                    if path.is_file() and path.name != "export_manifest.json"}
+    finally:
+        jobs.shutdown()
+
+
+@pytest.mark.parametrize("change", ["seed", "copies", "label", "points", "sha", "algorithm", "engine", "project"])
+def test_export_cache_key_invalidates_changed_inputs(change):
+    from labelpilot.export_acceleration import cache_key
+
+    document = {"shapes": [{"label": "object", "points": [[1, 2], [10, 20]]}]}
+    settings = {"seed": 42, "copies": 1, "algorithm_version": 1, "engine": "Pillow test"}
+    original = cache_key("test", "item", "original", document, settings)
+    project, sha = "test", "original"
+    if change in ("seed", "copies", "algorithm", "engine"):
+        key = "algorithm_version" if change == "algorithm" else change
+        settings[key] = "new engine" if change == "engine" else settings[key] + 1
+    elif change == "label":
+        document["shapes"][0]["label"] = "another"
+    elif change == "points":
+        document["shapes"][0]["points"][0][0] += 1
+    elif change == "sha":
+        sha = "changed image"
+    else:
+        project = "different"
+    assert cache_key(project, "item", sha, document, settings) != original
+
+
+def test_accelerated_export_handles_unavailable_cache(reviewed_store):
+    (reviewed_store.data / "export_cache").write_text("not a directory")
+    jobs = ExportJobs(reviewed_store)
+    try:
+        result = finish_folder_export(jobs, jobs.start("test", {"destination": str(reviewed_store.home),
+                                    "split": {"train": 100, "val": 0, "test": 0},
+                                    "augmentation": {"preset": "all"}}))
+        assert result["status"] == "completed" and result["cache_errors"] > 0
+        assert result["cache_hits"] == 0 and result["cache_misses"] == 20
+    finally:
+        jobs.shutdown()
+
+
+@pytest.mark.parametrize("change", ["seed", "annotation", "source_image"])
+def test_accelerated_export_does_not_reuse_stale_cache(reviewed_store, change):
+    jobs = ExportJobs(reviewed_store)
+    options = {"destination": str(reviewed_store.home), "workers": 2,
+               "split": {"train": 100, "val": 0, "test": 0}, "augmentation": {"preset": "all"}}
+    try:
+        cold = finish_folder_export(jobs, jobs.start("test", options))
+        assert cold["status"] == "completed", cold
+        if change == "seed":
+            options["augmentation"]["seed"] = 43
+        elif change == "annotation":
+            data = payload(reviewed_store, "human", "reviewed")
+            data["document"]["shapes"][0]["points"][0][0] += 1
+            reviewed_store.save("test", data["item"]["id"], data)
+        else:
+            source = Path(reviewed_store.project("test").item(item(reviewed_store, "human")["id"])["path"])
+            Image.new("RGB", (240, 120), "red").save(source)
+        changed = finish_folder_export(jobs, jobs.start("test", options))
+        assert Path(cold["result"]["directory"]).is_dir()
+        if change == "source_image":
+            assert changed["status"] == "failed" and "原图" in changed["error"]
+            assert not list(reviewed_store.home.glob(".test_yolo_*.part"))
+        else:
+            assert changed["status"] == "completed", changed
+            assert changed["cache_hits"] == (15 if change == "annotation" else 0)
+            assert changed["cache_misses"] == (5 if change == "annotation" else 20)
+    finally:
+        jobs.shutdown()
+
+
+@pytest.mark.parametrize("extra", [{"workers": True}, {"workers": 3}, {"workers": -1},
+                                  {"workers": 32}, {"workers": "4"}, {"reuse_cache": "true"}])
+def test_accelerated_export_rejects_invalid_settings_before_start(reviewed_store, extra):
+    jobs = ExportJobs(reviewed_store)
+    with pytest.raises(Problem):
+        jobs.start("test", {"destination": str(reviewed_store.home), **extra})
+    assert jobs.records == {} and not (reviewed_store.data / "export_cache").exists()
+
+
+def test_export_acceleration_is_ordered_and_bounds_inflight_images():
+    from labelpilot.export_acceleration import ExportAcceleration
+
+    produced, consumed, threads = [], [], set()
+
+    def values():
+        for index in range(9):
+            produced.append(index)
+            assert len(produced) - len(consumed) <= 2
+            yield index
+
+    def process(value):
+        threads.add(threading.get_ident())
+        time.sleep(0.01 if value % 2 else 0.02)
+        return value
+
+    with ExportAcceleration(2) as acceleration:
+        for result in acceleration.map(process, values()):
+            consumed.append(result)
+    assert consumed == list(range(9))
+    assert len(threads) == 2
+
+
+def test_accelerated_export_cancellation_waits_for_workers_and_preserves_cache(reviewed_store, monkeypatch):
+    import labelpilot.exporting as exporting
+
+    started, release = threading.Event(), threading.Event()
+    original = exporting.augmentation_image
+
+    def decode(path):
+        started.set()
+        assert release.wait(5)
+        return original(path)
+
+    monkeypatch.setattr(exporting, "augmentation_image", decode)
+    jobs = ExportJobs(reviewed_store)
+    options = {"destination": str(reviewed_store.home), "workers": 2,
+               "split": {"train": 100, "val": 0, "test": 0}, "augmentation": {"preset": "all"}}
+    try:
+        record = jobs.start("test", options)
+        assert started.wait(5)
+        jobs.stop.set()
+        release.set()
+        result = finish_folder_export(jobs, record)
+        assert result["status"] == "cancelled", result
+        assert not list(reviewed_store.home.glob(".test_yolo_*.part"))
+        assert not list(reviewed_store.home.glob("test_yolo_*"))
+        assert not list((reviewed_store.data / "export_cache").glob("*.tmp"))
+    finally:
+        release.set()
+        jobs.shutdown()
+
+
+def test_export_cache_capacity_evicts_old_entries_and_keeps_recent(tmp_path):
+    from labelpilot.export_acceleration import AugmentationCache
+
+    cache = AugmentationCache(tmp_path / "cache")
+    variants = [({}, 1, b"image" * 100, {"shapes": []}, {}, 0)]
+    cache.save("a" * 64, variants)
+    size = (cache.root / ("a" * 64 + ".cache")).stat().st_size
+    cache.max_bytes = size * 2
+    cache.save("b" * 64, variants)
+    assert cache.load("a" * 64) is not None
+    cache.save("c" * 64, variants)
+    assert cache.load("b" * 64) is None
+    assert cache.load("a" * 64) is not None and cache.load("c" * 64) is not None
+    assert sum(path.stat().st_size for path in cache.root.glob("*.cache")) <= cache.max_bytes
+
+
 def test_folder_export_api_selection_security_and_labels_only(reviewed_store, monkeypatch):
     app = create_app(reviewed_store.home)
     calls = []

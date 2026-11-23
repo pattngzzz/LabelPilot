@@ -1866,6 +1866,13 @@ function renderExportJob(job) {
   } else {
     progress.value = job.percent;
     detail.textContent = `${job.percent}% · ${job.completed} / ${job.total} 张（含增强副本）${job.current_image ? ` · ${job.current_image}` : ""}`;
+    if (job.images_per_second > 0) {
+      detail.textContent += ` · ${job.images_per_second.toFixed(1)} 张/秒`;
+      if (job.remaining_seconds > 0) detail.textContent += ` · 预计剩余 ${Math.ceil(job.remaining_seconds / 60)} 分钟`;
+    }
+    if (job.workers) detail.textContent += ` · ${job.workers} 路并行`;
+    if (job.cache_hits) detail.textContent += ` · 已复用 ${job.cache_hits} 张增强缓存`;
+    if (job.cache_errors) detail.textContent += " · 部分缓存不可用，已重新生成并校验";
     status.textContent = job.status === "finalizing" ? "正在写入类别表和清单、完成校验…" : "正在写入图片和标注并校验完整性…";
   }
   if (job.status === "completed") {
@@ -1873,7 +1880,10 @@ function renderExportJob(job) {
     const summary = counts ? `训练 ${counts.train} 张 / 验证 ${counts.val} 张 / 测试 ${counts.test} 张。` : "未划分数据集。";
     status.textContent = `已导出 ${result.images} 张。${summary}原图 ${result.original_images} 张，训练增强 ${result.augmented_images} 张。` +
       (result.integrity_check?.passed ? "标注完整性校验通过。" : "");
-    detail.textContent = `100% · 保存位置：${result.directory}`;
+    detail.textContent = `100% · 保存位置：${result.directory}` +
+      (job.elapsed_seconds ? ` · 用时 ${job.elapsed_seconds} 秒` : "") +
+      (job.cache_hits ? ` · 复用增强 ${job.cache_hits} 张` : "") +
+      (job.cache_errors ? " · 缓存异常部分已重新生成并校验" : "");
   } else if (["failed", "cancelled"].includes(job.status)) {
     status.dataset.error = "true";
     status.textContent = job.error;
@@ -1919,7 +1929,8 @@ async function exportDataset() {
   status.dataset.error = "false";
   status.textContent = "正在启动后台导出任务…";
   try {
-    const job = await api(plan.url, "POST", {...plan.options, destination, preview_token:plan.data.preview_token});
+    const job = await api(plan.url, "POST", {...plan.options, destination, preview_token:plan.data.preview_token,
+      workers:Number(element("exportWorkers").value), reuse_cache:element("exportReuseCache").checked});
     await monitorExport(job, plan.url);
   } catch (error) {
     status.dataset.error = "true";

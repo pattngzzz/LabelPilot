@@ -14,7 +14,8 @@ from typing import Optional
 
 from PIL import Image
 
-from .augmentation import augmented_variants, plan_augmentation, validate_augmented_sample
+from .augmentation import augmentation_image, augmented_variants, plan_augmentation, validate_augmented_sample
+from .export_acceleration import cache_key
 from .cleaning import clean_selection
 from .store import Problem, Project, digest, now, read_annotation_snapshot, source_group
 from .tasks import EXPORT_FORMATS, HAND_COUNT, HAND_KEYPOINTS, HAND_SKELETON, model_labels, polygon_area, semantic_mask
@@ -354,6 +355,7 @@ class DatasetFolder:
         self.root = root
         self.members = []
         self.member_names = set()
+        self.directories = {root}
         root.mkdir(parents=True)
 
     def open(self, name, mode):
@@ -361,7 +363,9 @@ class DatasetFolder:
         if member.is_absolute() or ".." in member.parts or "\\" in name or name in self.member_names:
             raise Problem("导出文件路径无效或重复，已中止导出", 422)
         path = self.root / name
-        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.parent not in self.directories:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.directories.add(path.parent)
         self.members.append(name)
         self.member_names.add(name)
         return path.open(mode + "b")
@@ -512,7 +516,84 @@ def verify_export_annotation(archive, format_name, project, document, image_name
                 reject("COCO 关键点或可见性不一致")
 
 
-def write_members(store, plan, archive, fingerprints, *, checkpoint=None, progress=None, verify=False):
+def checked_variants(document, source_id, source_sha256, settings, variants, checkpoint=None):
+    produced = 0
+    for index, contents, augmented, provenance in variants:
+        if checkpoint:
+            checkpoint()
+        if (index != produced + 1 or index > settings["copies"] or provenance.get("variant") != index
+                or provenance.get("source_id") != source_id or provenance.get("source_sha256") != source_sha256):
+            raise Problem("增强副本编号或来源不一致，已中止导出", 422)
+        produced += 1
+        shape_count = validate_augmented_sample(document, augmented, contents, settings, provenance)
+        yield settings, index, contents, augmented, provenance, shape_count
+    if produced != settings["copies"]:
+        raise Problem("增强副本数量缺失，已中止导出", 422)
+
+
+def prepare_export_rows(store, plan, fingerprints, checkpoint, acceleration):
+    def inputs():
+        for row in plan.rows:
+            if checkpoint:
+                checkpoint()
+            current = store.detail(plan.project.id, row["id"])
+            if current["version"] != row.get("version", 0) or current["status"] != row["status"]:
+                raise Problem("导出期间标注发生变化，请重试", 409)
+            if row["id"] in fingerprints and current["source_fingerprint"] != fingerprints[row["id"]]:
+                raise Problem("导出期间原标注发生变化，请重试", 409)
+            if plan.cleaning is not None and current["image_sha256"] != row["image_sha256"]:
+                raise Problem("图像在清洗后发生变化，请重新预检", 409)
+            document = copy.deepcopy(current["document"])
+            validate_export_document(store, plan.project, document, current["width"], current["height"], current["status"])
+            yield row, current, output_document(plan, document)
+
+    check = acceleration.checkpoint if acceleration else checkpoint
+
+    def prepare(sample):
+        row, current, document = sample
+        if check:
+            check()
+        source_contents = None
+        if plan.include_images and (plan.augmentation or acceleration):
+            source_contents = Path(plan.project.item(row["id"])["path"]).read_bytes()
+            if hashlib.sha256(source_contents).hexdigest() != current["image_sha256"]:
+                raise Problem("复制图片时原图发生变化，请重新准备数据", 409)
+        variants = []
+        if plan.augmentation and plan.assignments[row["id"]] == "train":
+            augmentation = plan.augmentation
+            settings_list = [{**augmentation, "preset": preset} for preset in augmentation["presets"]]
+            cache = acceleration.cache if acceleration else None
+            key = cache_key(plan.project.id, row["id"], current["image_sha256"], document, augmentation) if cache else None
+            cached = cache.load(key) if cache else None
+            if cached is not None:
+                try:
+                    if len(cached) != augmentation["variants_per_image"]:
+                        raise Problem("缓存副本数量不匹配", 422)
+                    for offset, settings in enumerate(settings_list):
+                        start = offset * settings["copies"]
+                        variants.extend(checked_variants(document, row["id"], current["image_sha256"], settings,
+                                                         cached[start:start + settings["copies"]], check))
+                except (Problem, ValueError, KeyError, TypeError, IndexError, AttributeError, OverflowError):
+                    if check:
+                        check()
+                    cache.discard(key)
+                    variants = []
+                else:
+                    cache.record(True, len(variants))
+                    return row, current, document, source_contents, variants
+            with augmentation_image(io.BytesIO(source_contents)) as original:
+                for settings in settings_list:
+                    generated = augmented_variants(original, document, row["id"], current["image_sha256"], settings)
+                    variants.extend(checked_variants(document, row["id"], current["image_sha256"], settings, generated, check))
+            if cache:
+                cache.record(False, len(variants))
+                cache.save(key, variants)
+        return row, current, document, source_contents, variants
+
+    return acceleration.map(prepare, inputs()) if acceleration else map(prepare, inputs())
+
+
+def write_members(store, plan, archive, fingerprints, *, checkpoint=None, progress=None, verify=False, acceleration=None):
     project, format_name, rows = output_project(plan), plan.format_name, plan.rows
     split_config = plan.split_config
     split_counts = copy.deepcopy(plan.split_counts)
@@ -542,20 +623,10 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None, progre
     verify_annotations = verify or augmentation or project.task_type != "detect"
     if plan.cleaning is not None:
         manifest["cleaning"] = plan.cleaning
-    for row in rows:
+    for row, current, document, source_contents, variants in prepare_export_rows(store, plan, fingerprints, checkpoint, acceleration):
         if checkpoint:
             checkpoint()
         item_id = row["id"]
-        current = store.detail(project_id, item_id)
-        if current["version"] != row.get("version", 0) or current["status"] != row["status"]:
-            raise Problem("导出期间标注发生变化，请重试", 409)
-        if item_id in fingerprints and current["source_fingerprint"] != fingerprints[item_id]:
-            raise Problem("导出期间原标注发生变化，请重试", 409)
-        if plan.cleaning is not None and current["image_sha256"] != row["image_sha256"]:
-            raise Problem("图像在清洗后发生变化，请重新预检", 409)
-        document = copy.deepcopy(current["document"])
-        validate_export_document(store, plan.project, document, current["width"], current["height"], current["status"])
-        document = output_document(plan, document)
         item = project.item(row["id"])
         safe_photo_id = re.sub(r"[^\w.-]", "_", row["photo_id"])
         filename = f"{safe_photo_id}_{row['id'][:8]}{Path(item['path']).suffix.lower()}"
@@ -569,8 +640,7 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None, progre
         if group is not None:
             manifest["items"][-1]["split_group"] = group
         if plan.include_images:
-            if augmentation:
-                source_contents = Path(item["path"]).read_bytes()
+            if source_contents is not None:
                 archive.writestr(image_name, source_contents)
             elif verify or plan.cleaning is not None:
                 write_verified_image(archive, item["path"], image_name, current["image_sha256"])
@@ -590,41 +660,29 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None, progre
             manifest["items"][-1]["annotation_count"] = len(source_document["shapes"])
         if progress:
             progress(len(manifest["items"]), len(rows) + augmented_images, row["photo_id"])
-        if augmentation and subset == "train":
-            for preset in augmentation["presets"]:
-                settings = {**augmentation, "preset": preset}
-                produced = 0
-                for index, contents, augmented, provenance in augmented_variants(
-                        io.BytesIO(source_contents), copy.deepcopy(source_document), row["id"], current["image_sha256"], settings):
-                    if checkpoint:
-                        checkpoint()
-                    if (index != produced + 1 or index > settings["copies"] or provenance.get("variant") != index
-                            or provenance.get("source_id") != row["id"] or provenance.get("source_sha256") != current["image_sha256"]):
-                        raise Problem("增强副本编号或来源不一致，已中止导出", 422)
-                    produced += 1
-                    shape_count = validate_augmented_sample(source_document, augmented, contents, settings, provenance)
-                    variant_id = f"{row['id']}__aug_{preset}_{index}"
-                    variant_name = f"images/train/{Path(filename).stem}__aug_{preset}_{index}.jpg"
-                    archive.writestr(variant_name, contents)
-                    if hashlib.sha256(archive.read(variant_name)).hexdigest() != augmented["labelpilot"]["image_sha256"]:
-                        raise Problem("增强图片回读指纹不匹配，已中止导出", 422)
-                    manifest["items"].append({"photo_id": row["photo_id"], "id": variant_id, "status": "augmented",
-                                              "revision": 0, "sha256": augmented["labelpilot"]["image_sha256"],
-                                              "source_group": item["source_group"], "image": variant_name,
-                                              "split": "train", "source_id": row["id"],
-                                              "source_revision": current["version"], "human_reviewed": False,
-                                              "annotation_count": shape_count,
-                                              "augmentation": provenance})
-                    expected_document = copy.deepcopy(augmented)
-                    annotation_offset = len(coco_documents["train"]["annotations"])
-                    write_annotation(archive, format_name, project, augmented, variant_name, "train", split_config,
-                                     coco_documents, len(manifest["items"]))
-                    verify_export_annotation(archive, format_name, project, expected_document, variant_name, "train",
-                                             split_config, coco_documents, len(manifest["items"]), annotation_offset)
-                    if progress:
-                        progress(len(manifest["items"]), len(rows) + augmented_images, variant_id)
-                if produced != settings["copies"]:
-                    raise Problem("增强副本数量缺失，已中止导出", 422)
+        for settings, index, contents, augmented, provenance, shape_count in variants:
+            if checkpoint:
+                checkpoint()
+            preset = settings["preset"]
+            variant_id = f"{row['id']}__aug_{preset}_{index}"
+            variant_name = f"images/train/{Path(filename).stem}__aug_{preset}_{index}.jpg"
+            archive.writestr(variant_name, contents)
+            if hashlib.sha256(archive.read(variant_name)).hexdigest() != augmented["labelpilot"]["image_sha256"]:
+                raise Problem("增强图片回读指纹不匹配，已中止导出", 422)
+            manifest["items"].append({"photo_id": row["photo_id"], "id": variant_id, "status": "augmented",
+                                      "revision": 0, "sha256": augmented["labelpilot"]["image_sha256"],
+                                      "source_group": item["source_group"], "image": variant_name,
+                                      "split": "train", "source_id": row["id"],
+                                      "source_revision": current["version"], "human_reviewed": False,
+                                      "annotation_count": shape_count, "augmentation": provenance})
+            expected_document = copy.deepcopy(augmented)
+            annotation_offset = len(coco_documents["train"]["annotations"])
+            write_annotation(archive, format_name, project, augmented, variant_name, "train", split_config,
+                             coco_documents, len(manifest["items"]))
+            verify_export_annotation(archive, format_name, project, expected_document, variant_name, "train",
+                                     split_config, coco_documents, len(manifest["items"]), annotation_offset)
+            if progress:
+                progress(len(manifest["items"]), len(rows) + augmented_images, variant_id)
     names = model_labels(project.task_type, project.names)
     archive.writestr("classes.txt", "\n".join(names) + "\n")
     if format_name in ("yolo", "mask"):
@@ -654,5 +712,8 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None, progre
                                        "checks": ["image_sha256", "decoded_augmented_dimensions", "object_count",
                                                   "class_and_attributes", "exact_transformed_points", "serialized_annotation_readback",
                                                   "unique_archive_paths"]}
+    if acceleration:
+        manifest["acceleration"] = {"workers": acceleration.workers, "cache_enabled": acceleration.cache is not None,
+                                    **(acceleration.cache.stats() if acceleration.cache else {})}
     archive.writestr("export_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
     return manifest
