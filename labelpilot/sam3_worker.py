@@ -58,31 +58,62 @@ class Sam3Runtime:
         scores = scores.detach().cpu().reshape(-1).tolist()
         if len(masks) != len(scores):
             raise RuntimeError("SAM3 返回的掩膜数量与分数不一致")
-        candidates = []
-        order = np.argsort(np.asarray(scores))[::-1]
-        for index in order[:40]:
-            score = float(scores[index])
-            if not math.isfinite(score) or score < threshold:
-                continue
-            mask = np.squeeze(masks[index])
-            if tuple(mask.shape) != (image.height, image.width):
-                raise RuntimeError("SAM3 掩膜尺寸与原图不一致，已拒绝应用以避免坐标偏移")
-            points = mask_polygon(mask > 0)
-            if points:
-                candidates.append({"score": score, "points": points})
-        return {"candidates": candidates, "width": image.width, "height": image.height}
+        return mask_candidates(masks, scores, image.width, image.height, threshold)
+
+
+def mask_candidates(masks, scores, width, height, threshold):
+    import numpy as np
+
+    scores = np.asarray(scores).reshape(-1)
+    if len(masks) != len(scores):
+        raise RuntimeError("SAM3 返回的掩膜数量与分数不一致")
+    candidates = []
+    for index in np.argsort(scores)[::-1][:40]:
+        score = float(scores[index])
+        if not math.isfinite(score) or score < threshold:
+            continue
+        mask = np.asarray(masks[index])
+        if mask.ndim == 3 and mask.shape[0] == 1:
+            mask = mask[0]
+        if tuple(mask.shape) != (height, width):
+            raise RuntimeError("SAM3 掩膜尺寸与原图不一致，已拒绝应用以避免坐标偏移")
+        points = mask_polygon(mask > 0)
+        if points:
+            candidates.append({"score": score, "points": points})
+    return {"candidates": candidates, "width": width, "height": height}
+
+
+class OnnxRuntime:
+    def __init__(self, directory, device):
+        from labelpilot.sam3_onnx import Sam3OnnxRuntime
+
+        self.model = Sam3OnnxRuntime(directory, device)
+
+    def predict(self, image_path, prompt, threshold):
+        masks, scores, width, height = self.model.predict(image_path, prompt, threshold)
+        return mask_candidates(masks, scores, width, height, threshold)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--port", required=True, type=int)
+    parser.add_argument("--port", type=int)
+    parser.add_argument("--backend", choices=("pytorch", "onnx"), default="pytorch")
+    parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
+    if args.check:
+        from labelpilot.sam3_onnx import validate_bundle
+
+        validate_bundle(args.checkpoint)
+        print("SAM3 ONNX 文件完整性检查通过")
+        return
+    if args.port is None:
+        parser.error("--port is required for inference")
     token = os.environ.get("LABELPILOT_SAM3_TOKEN", "")
     device = os.environ.get("LABELPILOT_SAM3_DEVICE", "cuda")
     if not token:
         raise SystemExit("Missing local service token")
-    runtime = Sam3Runtime(args.checkpoint, device)
+    runtime = (OnnxRuntime if args.backend == "onnx" else Sam3Runtime)(args.checkpoint, device)
 
     class Handler(BaseHTTPRequestHandler):
         def respond(self, status, value):
@@ -101,7 +132,7 @@ def main():
                 return self.respond(403, {"detail": "forbidden"})
             if self.path != "/health":
                 return self.respond(404, {"detail": "not found"})
-            self.respond(200, {"ready": True, "device": device})
+            self.respond(200, {"ready": True, "device": device, "backend": args.backend})
 
         def do_POST(self):
             if not self.authorized():

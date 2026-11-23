@@ -29,15 +29,22 @@ class Sam3Assistant:
     def _paths(self, value):
         python, checkpoint = value.get("python_executable", ""), value.get("checkpoint_path", "")
         device = value.get("device", "cuda")
-        if not isinstance(python, str) or not isinstance(checkpoint, str) or device not in ("cuda", "cpu"):
+        backend = value.get("backend", "pytorch")
+        if not isinstance(python, str) or not isinstance(checkpoint, str) or device not in ("cuda", "cpu") or backend not in ("pytorch", "onnx"):
             raise Problem("SAM3 Python、权重路径或设备设置无效", 422)
+        if not python.strip() or not checkpoint.strip():
+            raise Problem("请先选择有效的 SAM3 Python 环境和本地权重文件", 422)
         try:
             python, checkpoint = Path(python).expanduser().resolve(strict=True), Path(checkpoint).expanduser().resolve(strict=True)
         except (OSError, RuntimeError, ValueError):
             raise Problem("请先选择有效的 SAM3 Python 环境和本地权重文件", 422)
         if not python.is_file() or python.name.lower() not in ("python.exe", "python"):
             raise Problem("所选 SAM3 Python 必须是独立环境中的 python.exe", 422)
-        if not checkpoint.is_file() or checkpoint.suffix.lower() not in (".pt", ".pth"):
+        if backend == "onnx":
+            if not checkpoint.is_dir() or any(not (checkpoint / name).is_file() for name in
+                                              ("sam3_image_encoder.onnx", "sam3_language_encoder.onnx", "sam3_decoder.onnx", "tokenizer.json")):
+                raise Problem("请选择包含三个 SAM3 ONNX 模型与 tokenizer.json 的文件夹", 422)
+        elif not checkpoint.is_file() or checkpoint.suffix.lower() not in (".pt", ".pth"):
             raise Problem("请选择本地 SAM3 .pt 或 .pth 权重文件", 422)
         return str(python), str(checkpoint), device
 
@@ -47,17 +54,38 @@ class Sam3Assistant:
             if self.process is not None:
                 raise Problem("请先释放 SAM3 显存，再修改配置", 409)
             python, checkpoint, device = self._paths(payload)
+            backend = payload.get("backend", "pytorch")
+            if backend == "onnx":
+                self._validate_onnx(python, checkpoint)
             self.config_path.parent.mkdir(parents=True, exist_ok=True)
-            atomic_json(self.config_path, {"python_executable": python, "checkpoint_path": checkpoint, "device": device})
+            atomic_json(self.config_path, {"python_executable": python, "checkpoint_path": checkpoint, "device": device,
+                                           "backend": backend})
             return self.status()
 
-    def _installed(self, python):
+    def _validate_onnx(self, python, checkpoint):
+        environment = os.environ.copy()
+        environment["PYTHONNOUSERSITE"] = "1"
+        try:
+            result = subprocess.run([python, "-X", "utf8", "-m", "labelpilot.sam3_worker", "--check",
+                                     "--backend", "onnx", "--checkpoint", checkpoint],
+                                    cwd=Path(__file__).parent.parent, capture_output=True, timeout=45,
+                                    encoding="utf-8", errors="replace", env=environment,
+                                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        except (OSError, subprocess.SubprocessError):
+            raise Problem("SAM3 ONNX 完整性检查失败，请检查独立环境", 503)
+        if result.returncode:
+            detail = result.stderr.strip().splitlines()
+            raise Problem("SAM3 ONNX 校验失败：" + (detail[-1][-400:] if detail else "请检查文件与依赖"), 422)
+
+    def _installed(self, python, backend="pytorch"):
         if not python or not Path(python).is_file():
             return False
         try:
             environment = os.environ.copy()
             environment["PYTHONNOUSERSITE"] = "1"
-            result = subprocess.run([python, "-c", "import importlib.util,sys; sys.exit(not importlib.util.find_spec('sam3'))"],
+            modules = ("onnxruntime", "onnx", "tokenizers", "cv2", "numpy", "PIL") if backend == "onnx" else ("sam3",)
+            code = f"import importlib.util,sys; sys.exit(not all(importlib.util.find_spec(name) for name in {modules!r}))"
+            result = subprocess.run([python, "-c", code],
                                     capture_output=True, timeout=15,
                                     env=environment,
                                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
@@ -86,26 +114,28 @@ class Sam3Assistant:
         with self.lock:
             self._reap_worker()
             config = self.config()
+            backend = config.get("backend", "pytorch")
             python, checkpoint = config.get("python_executable", ""), config.get("checkpoint_path", "")
             python_exists = isinstance(python, str) and Path(python).is_file()
-            checkpoint_exists = isinstance(checkpoint, str) and Path(checkpoint).is_file()
-            installed = self._installed(python) if python_exists else False
+            checkpoint_exists = bool(isinstance(checkpoint, str) and checkpoint and
+                                     (Path(checkpoint).is_dir() if backend == "onnx" else Path(checkpoint).is_file()))
+            installed = self._installed(python, backend) if python_exists else False
             health = self._health() if self.process is not None else None
             configured = bool(python_exists and checkpoint_exists)
             if not python_exists:
                 message = "选择 SAM3 独立 Python 环境和本地权重文件后即可使用。"
             elif not installed:
-                message = "所选 Python 环境未安装 SAM3；请按 README 安装隔离环境。"
+                message = "所选 Python 环境未安装 SAM3 所需依赖；请按 README 安装隔离环境。"
             elif not checkpoint_exists:
                 message = "已连接隔离 SAM3 环境；请选择本机获授权的 checkpoint。"
             elif health and health.get("ready"):
-                message = "SAM3 已加载；正在独占 GPU，YOLO 推理和训练暂不可用。"
+                message = "SAM3 已加载；正在独占模型运行环境，YOLO 推理和训练暂不可用。"
             elif self.process is not None:
                 message = "SAM3 正在加载；首次启动可能需要几分钟。"
             else:
                 message = "SAM3 已配置，尚未加载模型。"
             return {"configured": configured, "installed": installed, "running": self.process is not None,
-                    "ready": bool(health and health.get("ready")), "device": config.get("device", "cuda"),
+                    "ready": bool(health and health.get("ready")), "device": config.get("device", "cuda"), "backend": backend,
                     "python_executable": python if isinstance(python, str) else "",
                     "checkpoint_path": checkpoint if isinstance(checkpoint, str) else "",
                     "message": message}
@@ -120,7 +150,8 @@ class Sam3Assistant:
         if self.process is not None and (self._health() or {}).get("ready"):
             return
         python, checkpoint, device = self._paths(self.config())
-        if not self._installed(python):
+        backend = self.config().get("backend", "pytorch")
+        if not self._installed(python, backend):
             raise Problem("SAM3 尚未安装在所选 Python 环境；请按 README 安装隔离环境", 503)
         self.jobs.reserve_model_slot()
         self.slot_reserved = True
@@ -128,15 +159,15 @@ class Sam3Assistant:
             self.inference.release_cached_model()
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
             self.port, self.token = self._reserve_port(), secrets.token_urlsafe(32)
-            worker = Path(__file__).with_name("sam3_worker.py")
             environment = os.environ.copy()
             environment["LABELPILOT_SAM3_TOKEN"] = self.token
             environment["LABELPILOT_SAM3_DEVICE"] = device
             environment["PYTHONNOUSERSITE"] = "1"
             with self.log_path.open("ab") as log:
                 self.process = subprocess.Popen(
-                    [python, str(worker), "--checkpoint", checkpoint, "--port", str(self.port)],
-                    cwd=worker.parent.parent, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                    [python, "-X", "utf8", "-m", "labelpilot.sam3_worker", "--backend", backend,
+                     "--checkpoint", checkpoint, "--port", str(self.port)],
+                    cwd=Path(__file__).parent.parent, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                     env=environment, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
             deadline = time.monotonic() + 900
             while time.monotonic() < deadline:

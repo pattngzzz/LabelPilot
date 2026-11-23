@@ -3,6 +3,9 @@
 const sam3Ui = (() => {
   let resultItemId = null;
   let resultLabel = "";
+  let resultPrompt = "";
+  let resultBackend = "";
+  let generating = false;
   let config = null;
 
   function fillLabels() {
@@ -19,6 +22,7 @@ const sam3Ui = (() => {
     element("sam3PythonPath").value = config.python_executable || "";
     element("sam3CheckpointPath").value = config.checkpoint_path || "";
     element("sam3Device").value = config.device || "cuda";
+    element("sam3Backend").value = config.backend || "pytorch";
     element("sam3Status").textContent = config.message;
     element("sam3Release").disabled = !config.running;
     element("sam3Generate").disabled = !state.current || !config.configured || !config.installed;
@@ -36,7 +40,15 @@ const sam3Ui = (() => {
 
   async function browse(mode, field) {
     const selected = await api("/api/sam3/select", "POST", {mode, path:element(field).value});
-    if (!selected.cancelled) element(field).value = selected.path;
+    if (!selected.cancelled) {
+      element(field).value = selected.path;
+      configDirty();
+    }
+  }
+
+  function configDirty() {
+    element("sam3Generate").disabled = true;
+    element("sam3Status").textContent = "配置尚未保存，请先保存配置再生成候选。";
   }
 
   async function saveConfig() {
@@ -45,8 +57,9 @@ const sam3Ui = (() => {
     if (!python || !checkpoint) throw new Error("请先选择 SAM3 独立 Python 环境和本地权重文件");
     config = await api("/api/sam3/config", "POST", {
       python_executable:python, checkpoint_path:checkpoint, device:element("sam3Device").value,
+      backend:element("sam3Backend").value,
     });
-    element("sam3Status").textContent = config.message;
+    await refresh();
     return config;
   }
 
@@ -94,13 +107,16 @@ const sam3Ui = (() => {
   }
 
   async function generate() {
-    if (!state.current || state.busy || !state.project || state.project.task_type !== "segment") return;
+    if (generating || !state.current || state.busy || !state.project || state.project.task_type !== "segment") return;
     const label = element("sam3Label").value;
     const prompt = element("sam3Prompt").value.trim();
     if (!label || !prompt) throw new Error("请选择项目标签并输入对象描述");
     const itemId = state.current.item.id;
     resultItemId = itemId;
     resultLabel = label;
+    resultPrompt = prompt;
+    resultBackend = config?.backend || "pytorch";
+    generating = true;
     state.sam3Candidates = [];
     state.sam3PreviewIndex = -1;
     renderCandidates();
@@ -122,6 +138,7 @@ const sam3Ui = (() => {
       renderCandidates();
       draw();
     } finally {
+      generating = false;
       element("sam3Generate").disabled = false;
       await refresh().catch(() => {});
     }
@@ -167,7 +184,7 @@ const sam3Ui = (() => {
   function recordApplication(count) {
     const metadata = state.current.document.labelpilot || {};
     const history = Array.isArray(metadata.sam3_suggestions) ? [...metadata.sam3_suggestions] : [];
-    history.push({prompt:element("sam3Prompt").value.trim(), label:resultLabel, applied_count:count,
+    history.push({prompt:resultPrompt, backend:resultBackend, label:resultLabel, applied_count:count,
       applied_at:new Date().toISOString()});
     state.current.document.labelpilot = {...metadata, sam3_suggestions:history.slice(-50)};
   }
@@ -184,13 +201,18 @@ const sam3Ui = (() => {
 
   element("sam3Button").addEventListener("click", () => open().catch(error => toast(error.message, true)));
   element("sam3BrowsePython").addEventListener("click", () => browse("sam3_python", "sam3PythonPath").catch(error => toast(error.message, true)));
-  element("sam3BrowseCheckpoint").addEventListener("click", () => browse("sam3_checkpoint", "sam3CheckpointPath").catch(error => toast(error.message, true)));
+  element("sam3BrowseCheckpoint").addEventListener("click", () => browse(element("sam3Backend").value === "onnx" ? "sam3_onnx" : "sam3_checkpoint", "sam3CheckpointPath").catch(error => toast(error.message, true)));
   element("sam3SaveConfig").addEventListener("click", () => saveConfig().catch(error => toast(error.message, true)));
   element("sam3Generate").addEventListener("click", () => generate().catch(error => {
     element("sam3Status").textContent = error.message;
     toast(error.message, true);
   }));
   element("sam3Release").addEventListener("click", () => release().catch(error => toast(error.message, true)));
+  element("sam3Backend").addEventListener("change", () => {
+    element("sam3CheckpointPath").value = "";
+    configDirty();
+  });
+  element("sam3Device").addEventListener("change", configDirty);
   element("sam3Prompt").addEventListener("input", event => { event.target.dataset.edited = "true"; });
   element("sam3Label").addEventListener("change", event => {
     if (!element("sam3Prompt").dataset.edited) element("sam3Prompt").value = event.target.value;

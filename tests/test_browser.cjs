@@ -1145,17 +1145,30 @@ print('Rotation ZIP: all angles, dimensions, exact normalized boxes and train-on
     await check('element("sam3Generate").disabled && element("sam3Label").value==="part"',
       "SAM3 stays idle without local weights and preserves the project label name");
     await evaluate('element("sam3Dialog").close()');
-    await evaluate(`window.sam3BaseApi=api;window.sam3Calls=[];api=async(path,method,body)=>{
-      if(path==="/api/sam3")return{configured:true,installed:true,running:false,ready:false,device:"cuda",message:"SAM3 test ready"};
+    await evaluate(`window.sam3BaseApi=api;window.sam3Calls=[];window.sam3Saved={configured:false,installed:true,running:false,ready:false,device:"cuda",backend:"pytorch",python_executable:"C:/isolated/python.exe",message:"SAM3 test ready"};api=async(path,method,body)=>{
+      if(path==="/api/sam3")return sam3Saved;
+      if(path==="/api/sam3/select"){sam3Calls.push(body);return{cancelled:false,path:"C:/local/sam3-onnx"};}
+      if(path==="/api/sam3/config"){sam3Calls.push(body);sam3Saved={...sam3Saved,...body,configured:true};return sam3Saved;}
       if(path.endsWith("/sam3")){sam3Calls.push(body);return{label:body.label,candidates:[{score:.91,points:[[150,140],[200,140],[200,190],[150,190]]}]};}
       return sam3BaseApi(path,method,body);
     };`);
     await click("#sam3Button");
-    await waitFor('element("sam3Dialog").open && !element("sam3Generate").disabled');
+    await waitFor('element("sam3Dialog").open && element("sam3PythonPath").value.includes("isolated")');
+    await evaluate('element("sam3Backend").value="onnx";element("sam3Backend").dispatchEvent(new Event("change",{bubbles:true}))');
+    await check('element("sam3Generate").disabled && !element("sam3CheckpointPath").value',
+      "Switching SAM3 formats clears stale weights and blocks inference until saved");
+    await click("#sam3BrowseCheckpoint");
+    await waitFor('element("sam3CheckpointPath").value==="C:/local/sam3-onnx"');
+    await check('sam3Calls.some(call=>call.mode==="sam3_onnx")', "ONNX selection requests a native model folder picker");
+    await click("#sam3SaveConfig");
+    await waitFor('!element("sam3Generate").disabled');
+    await check('sam3Saved.backend==="onnx" && sam3Saved.checkpoint_path==="C:/local/sam3-onnx"',
+      "SAM3 configuration persists the ONNX backend and selected local folder");
     await click("#sam3Generate");
     await waitFor('state.sam3Candidates.length===1 && !element("sam3Generate").disabled');
+    await evaluate('element("sam3Prompt").value="changed after prediction"');
     await click(".sam3-candidate .button.primary");
-    await check('state.current.document.shapes.length===1 && state.current.document.shapes[0].label==="part" && state.current.document.labelpilot.sam3_suggestions[0].applied_count===1',
+    await check('state.current.document.shapes.length===1 && state.current.document.shapes[0].label==="part" && state.current.document.labelpilot.sam3_suggestions[0].applied_count===1 && state.current.document.labelpilot.sam3_suggestions[0].prompt==="part" && state.current.document.labelpilot.sam3_suggestions[0].backend==="onnx"',
       "Applying a SAM3 proposal adds a polygon and records its prompt provenance");
     await evaluate('element("sam3Dialog").close()');
     await click('[data-tool="polygon"]');

@@ -31,7 +31,7 @@ def initial_directory(value):
 
 
 def select_images(mode, path=None):
-    if mode not in ("file", "folder", "export_folder", "sam3_python", "sam3_checkpoint"):
+    if mode not in ("file", "folder", "export_folder", "sam3_python", "sam3_checkpoint", "sam3_onnx"):
         raise Problem("请选择图片文件或文件夹", 422)
     initial = initial_directory(path)
     if not PICKER_LOCK.acquire(blocking=False):
@@ -69,6 +69,10 @@ def select_images(mode, path=None):
             if not valid:
                 raise Problem("请选择独立环境中的 python.exe 或 SAM3 .pt / .pth 权重文件", 422)
             return {"cancelled": False, "path": str(file)}
+        if mode == "sam3_onnx":
+            if len(selected) != 1:
+                raise Problem("请只选择一个 SAM3 ONNX 文件夹", 422)
+            return {"cancelled": False, "path": str(directory(selected[0]))}
         if mode in ("folder", "export_folder"):
             if len(selected) != 1:
                 raise Problem("请只选择一个图片文件夹", 422)
@@ -106,8 +110,9 @@ def show_dialog(mode, path):
     root.update()
     try:
         options = {"parent": root, "initialdir": path}
-        if mode in ("folder", "export_folder"):
-            title = "LabelPilot · 选择数据集导出文件夹" if mode == "export_folder" else "LabelPilot · 选择待标注图片文件夹"
+        if mode in ("folder", "export_folder", "sam3_onnx"):
+            title = ("LabelPilot · 选择 SAM3 ONNX 模型文件夹" if mode == "sam3_onnx" else
+                     "LabelPilot · 选择数据集导出文件夹" if mode == "export_folder" else "LabelPilot · 选择待标注图片文件夹")
             selected = filedialog.askdirectory(title=title, mustexist=True, **options)
             return [selected] if selected else []
         if mode in ("sam3_python", "sam3_checkpoint"):

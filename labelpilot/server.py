@@ -145,7 +145,7 @@ def create_app(home=None):
     @app.post("/api/sam3/select")
     def select_sam3_file(payload: dict):
         mode = payload.get("mode")
-        if mode not in ("sam3_python", "sam3_checkpoint"):
+        if mode not in ("sam3_python", "sam3_checkpoint", "sam3_onnx"):
             raise Problem("请选择 SAM3 Python 环境或权重文件", 422)
         return native_picker.select_images(mode, payload.get("path"))
 
@@ -264,7 +264,12 @@ def create_app(home=None):
         image_path = Path(item["path"]).resolve(strict=True)
         if not image_path.is_relative_to(project.root):
             raise Problem("图片路径不在项目目录中", 403)
+        width, height, image_digest = store.image_info(project, item, verify_image=True)
         result = sam3.predict(image_path, payload)
+        if (result.get("width"), result.get("height")) != (width, height):
+            raise Problem("SAM3 返回尺寸与原图不一致，已拒绝候选以避免坐标偏移", 422)
+        if store.image_info(project, item)[2] != image_digest:
+            raise Problem("SAM3 推理期间原图发生改变，已拒绝候选", 409)
         result["label"] = label
         return result
 

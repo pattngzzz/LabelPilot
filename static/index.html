@@ -565,9 +565,10 @@
     <form method="dialog" class="dialog-heading"><div><div class="eyebrow">LOCAL AI ASSIST</div><h2 id="sam3Title">SAM3 分割辅助</h2></div><button class="icon-button" aria-label="关闭 SAM3 设置">×</button></form>
     <div class="dialog-body">
       <p class="muted">用对象描述生成当前图片的实例轮廓候选。候选只会预览，不会自动写入、审核或覆盖已有标注。</p>
+      <label>模型格式<select id="sam3Backend"><option value="pytorch">PyTorch（.pt / .pth）</option><option value="onnx">ONNX（X-AnyLabeling 模型文件夹）</option></select></label>
       <div class="sam3-config-grid">
         <label>SAM3 Python 环境<div class="sam3-path-row"><input id="sam3PythonPath" readonly placeholder="选择隔离安装的 python.exe"><button class="button" id="sam3BrowsePython" type="button">选择</button></div></label>
-        <label>SAM3 本地权重<div class="sam3-path-row"><input id="sam3CheckpointPath" readonly placeholder="选择已获授权下载的 .pt 权重"><button class="button" id="sam3BrowseCheckpoint" type="button">选择</button></div></label>
+        <label>SAM3 本地权重<div class="sam3-path-row"><input id="sam3CheckpointPath" readonly placeholder="选择权重文件或 ONNX 模型文件夹"><button class="button" id="sam3BrowseCheckpoint" type="button">选择</button></div></label>
       </div>
       <div class="form-row"><label>推理设备<select id="sam3Device"><option value="cuda" selected>CUDA 显卡</option><option value="cpu">CPU（较慢）</option></select></label><label>最低置信度 <output id="sam3ThresholdValue">0.35</output><input id="sam3Threshold" type="range" min="0.05" max="0.9" step="0.05" value="0.35"></label></div>
       <div class="sam3-prompt-row"><label>对象描述<input id="sam3Prompt" maxlength="160" placeholder="例如：laboratory balance"></label><label>应用为标签<select id="sam3Label"></select></label></div>

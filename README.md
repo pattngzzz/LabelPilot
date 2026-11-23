@@ -79,7 +79,12 @@
 
 实例分割项目可在画布工具栏打开“SAM3 辅助”。选择隔离环境中的 Python、SAM3 本地 checkpoint、项目标签和对象描述后，工具会为当前图片生成轮廓候选。逐个或批量采用只会把候选追加到当前未保存草稿，不会覆盖旧标注或自动审核；SAM3 候选只保留外轮廓，带内部孔洞的对象须人工修正。关闭面板不会自动释放 GPU，完成 SAM3 标注后请点“释放 SAM3 显存”；SAM3 占用期间 YOLO 推理和训练会被互斥保护。
 
-SAM3 使用独立 Python 3.12 环境，不更改 LabelPilot / YOLO 环境；本地运行配置保存在被忽略的 `data/sam3/config.json`。请按 Meta 官方 SAM3 仓库的 Windows / Python / CUDA 安装说明安装源码和依赖，并在该环境额外安装 `opencv-python`（掩膜轮廓转换需要），再在面板中选择该环境的 `python.exe`。模型 checkpoint 由 Meta/Hugging Face 管控，使用前须自行申请并接受对应模型许可；获授权的权重下载到本机后，再用系统文件选择器选择。不要把权重、访问令牌或本机路径提交到 Git；`sam3-config.example.json` 是不含机器路径的模板。当前电脑的 RTX 4060 Laptop 约 8 GiB 显存，需逐图验证实际占用和速度；尚未获得权重前，端到端 GPU 分割效果为 `NOT_PROVEN`。
+SAM3 使用独立 Python 3.12 环境，不更改 LabelPilot / YOLO 环境；本地运行配置保存在被忽略的 `data/sam3/config.json`。支持以下两种格式，切换格式后须重新选择权重并保存配置：
+
+- **ONNX**：复用 X-AnyLabeling 项目发布的 SAM3 图像编码器、语言编码器、解码器。选择包含 `sam3_image_encoder.onnx`、`sam3_language_encoder.onnx`、`sam3_decoder.onnx`、模型引用的所有 `.onnx.data` 及 OpenAI CLIP `tokenizer.json` 的文件夹；不要只选一个 ONNX 文件。保存配置和启动模型时会检查外部张量引用的文件及字节范围，缺失或截断则拒绝加载。独立环境安装 `onnxruntime-gpu==1.25.1`、`onnx==1.21.0`、`tokenizers==0.23.1`、`opencv-python-headless>=4.10,<5`，CUDA 使用兼容的 PyTorch CUDA DLL；缺少 CUDA provider 会报错，不会静默把整套模型改为 CPU 推理。CLIP 描述最长 32 个词元（包含起止符），过长会提示缩短而不是悄悄截断。
+- **PyTorch**：按 Meta 官方 SAM3 安装说明安装源码、依赖及 `opencv-python`，选择该环境的 `python.exe` 和 `.pt` / `.pth` checkpoint。Meta/Hugging Face checkpoint 需自行申请访问并接受对应模型许可。
+
+ONNX 预处理遵循项目导出的 RGB 图像输入及原图尺寸解码约定，不通过缩放已生成轮廓来弥补尺寸错误。SAM3 推理会校验原图 SHA-256、EXIF 方向、返回尺寸以及推理期间图片是否发生变化，候选仍需人工审核。模型、分词器、下载缓存和机器配置放在被忽略的 `data/sam3`，不要把模型权重、访问令牌或个人路径提交到 Git；`sam3-config.example.json` 是无机器路径的模板。实际速度、显存和效果需要在目标环境用真实图片验证，代码测试不能证明实际分割质量。
 
 ## 批量预标注
 
