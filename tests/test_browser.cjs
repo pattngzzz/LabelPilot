@@ -1139,19 +1139,38 @@ print('Rotation ZIP: all angles, dimensions, exact normalized boxes and train-on
     await createTask("segment", "part");
     await check(`element("projectTask").textContent==="实例分割" && document.querySelector('[data-tool="rectangle"]').hidden`,
       "Instance projects show contour tools and a task-specific header");
+    await check('!element("sam3Button").hidden', "Instance projects expose the local SAM3 assistant");
+    await click("#sam3Button");
+    await waitFor('element("sam3Dialog").open && element("sam3Status").textContent.includes("选择 SAM3")');
+    await check('element("sam3Generate").disabled && element("sam3Label").value==="part"',
+      "SAM3 stays idle without local weights and preserves the project label name");
+    await evaluate('element("sam3Dialog").close()');
+    await evaluate(`window.sam3BaseApi=api;window.sam3Calls=[];api=async(path,method,body)=>{
+      if(path==="/api/sam3")return{configured:true,installed:true,running:false,ready:false,device:"cuda",message:"SAM3 test ready"};
+      if(path.endsWith("/sam3")){sam3Calls.push(body);return{label:body.label,candidates:[{score:.91,points:[[150,140],[200,140],[200,190],[150,190]]}]};}
+      return sam3BaseApi(path,method,body);
+    };`);
+    await click("#sam3Button");
+    await waitFor('element("sam3Dialog").open && !element("sam3Generate").disabled');
+    await click("#sam3Generate");
+    await waitFor('state.sam3Candidates.length===1 && !element("sam3Generate").disabled');
+    await click(".sam3-candidate .button.primary");
+    await check('state.current.document.shapes.length===1 && state.current.document.shapes[0].label==="part" && state.current.document.labelpilot.sam3_suggestions[0].applied_count===1',
+      "Applying a SAM3 proposal adds a polygon and records its prompt provenance");
+    await evaluate('element("sam3Dialog").close()');
     await click('[data-tool="polygon"]');
     for (const coords of [[35,50],[114,50],[114,116],[35,116]]) await mouseClick(await point(coords));
     await press("q","KeyQ");
     await waitFor('element("labelPicker").open');
     await press("q","KeyQ");
-    await waitFor('state.current.document.shapes[0]?.shape_type==="polygon"');
+    await waitFor('state.current.document.shapes.length===2');
     await changeMode("prompt");
     await mouseClick(await point([60,73]));
     await waitFor('!element("acceptPrompt").disabled');
     await click("#acceptPrompt");
     await waitFor('element("labelPicker").open');
     await press("q","KeyQ");
-    await waitFor('state.current.document.shapes.length===2');
+    await waitFor('state.current.document.shapes.length===3');
     await check('state.current.document.shapes.every(shape=>shape.shape_type==="polygon")',
       "Manual contours and point-assisted proposals both create independent instance polygons");
     await click("#saveButton");

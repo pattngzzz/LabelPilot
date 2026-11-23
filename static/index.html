@@ -13,6 +13,7 @@
   <script src="/static/automation.js?v=__ASSET_VERSION__" defer></script>
   <script src="/static/task-tools.js?v=__ASSET_VERSION__" defer></script>
   <script src="/static/app.js?v=__ASSET_VERSION__" defer></script>
+  <script src="/static/sam3.js?v=__ASSET_VERSION__" defer></script>
 </head>
 <body>
   <aside class="rail">
@@ -82,6 +83,7 @@
           <button class="tool task-tool" data-tool="erase" data-tasks="semantic" title="橡皮 (X)" hidden>橡皮</button>
           <button class="tool task-tool" data-tool="hand" data-tasks="hand_pose" title="添加手部关键点 (K)" hidden>＋ 手部</button>
           <button class="tool" data-tool="pan" title="平移 (H / 按住空格)">✥</button></div><span class="divider"></span><button class="tool" id="undoButton" title="撤销 (Ctrl+Z)">↶</button><button class="tool" id="redoButton" title="重做 (Ctrl+Shift+Z)">↷</button><div class="toolbar-space"></div><button class="tool" id="zoomOut" title="缩小">−</button><button class="zoom-label" id="fitButton" title="适应画布 (F)">100%</button><button class="tool" id="zoomIn" title="放大">＋</button><button class="button focus-toggle" id="focusButton" title="放大 / 恢复画布工作区 (Tab)" aria-pressed="false">⛶ 大画布</button><button class="button magic" id="predictButton">✦ 模型预标注</button>
+          <button class="button sam3-button" id="sam3Button" data-tasks="segment" type="button">✦ SAM3 辅助</button>
           <select id="efficiencyMode" aria-label="标注模式"><option value="">常规标注</option><option value="fast">逐对象快审</option><option value="sequence" data-tasks="detect">连续帧</option><option value="fourpoint" data-tasks="detect">四点画框</option><option value="prompt" data-tasks="detect segment semantic">点选辅助</option></select>
         </div>
         <div id="efficiencyBar" class="efficiency-bar" hidden>
@@ -558,6 +560,22 @@
       <div id="imageBrowserList" class="model-browser-list" aria-label="文件夹与图片文件"></div>
     </div>
     <div class="dialog-actions"><button type="button" class="button" id="cancelImageBrowser">取消</button><button type="button" class="button primary" id="confirmImageSelection" disabled>使用所选图片</button></div>
+  </dialog>
+  <dialog id="sam3Dialog" class="sam3-dialog" aria-labelledby="sam3Title">
+    <form method="dialog" class="dialog-heading"><div><div class="eyebrow">LOCAL AI ASSIST</div><h2 id="sam3Title">SAM3 分割辅助</h2></div><button class="icon-button" aria-label="关闭 SAM3 设置">×</button></form>
+    <div class="dialog-body">
+      <p class="muted">用对象描述生成当前图片的实例轮廓候选。候选只会预览，不会自动写入、审核或覆盖已有标注。</p>
+      <div class="sam3-config-grid">
+        <label>SAM3 Python 环境<div class="sam3-path-row"><input id="sam3PythonPath" readonly placeholder="选择隔离安装的 python.exe"><button class="button" id="sam3BrowsePython" type="button">选择</button></div></label>
+        <label>SAM3 本地权重<div class="sam3-path-row"><input id="sam3CheckpointPath" readonly placeholder="选择已获授权下载的 .pt 权重"><button class="button" id="sam3BrowseCheckpoint" type="button">选择</button></div></label>
+      </div>
+      <div class="form-row"><label>推理设备<select id="sam3Device"><option value="cuda" selected>CUDA 显卡</option><option value="cpu">CPU（较慢）</option></select></label><label>最低置信度 <output id="sam3ThresholdValue">0.35</output><input id="sam3Threshold" type="range" min="0.05" max="0.9" step="0.05" value="0.35"></label></div>
+      <div class="sam3-prompt-row"><label>对象描述<input id="sam3Prompt" maxlength="160" placeholder="例如：laboratory balance"></label><label>应用为标签<select id="sam3Label"></select></label></div>
+      <p class="muted sam3-note">标签名称保持原样；英文描述通常更适合开放词汇提示。单轮返回最多 40 个候选，洞状目标的内部孔洞需人工检查。</p>
+      <p id="sam3Status" class="sam3-status" role="status">正在检查 SAM3 配置…</p>
+      <div id="sam3CandidateList" class="sam3-candidates" aria-live="polite"></div>
+    </div>
+    <div class="dialog-actions"><button class="button" id="sam3Release" type="button">释放 SAM3 显存</button><button class="button" id="sam3SaveConfig" type="button">保存配置</button><span class="toolbar-space"></span><button class="button primary" id="sam3Generate" type="button">生成当前图候选</button></div>
   </dialog>
   <dialog id="helpDialog"><form method="dialog" class="dialog-heading"><h2>你的本地标注工作流</h2><button class="icon-button" aria-label="关闭">×</button></form><div class="dialog-body"><div class="help-flow"><b>01 选择图片</b><span>导入现有标注，或让本地模型生成建议。</span><b>02 精修对象</b><span>按 R，点击起点后松开，再点击终点；在框旁窗口按 Q / Enter 使用当前标签，也可点击已有标签或输入新标签，名称原样保留。</span><b>03 人工确认</b><span>A / D 仅翻页，修改自动存草稿；按 E 保存并审核当前图片，然后下一张。</span><b>04 导出复用</b><span>YOLO / Labelme / COCO，原始数据始终保留。</span></div><div class="shortcut-grid"><span>选择 / 两次点击画框 / 多边形</span><kbd>V / R / P</kbd><span>大画布 / 恢复工作区</span><kbd>Tab</kbd><span>平移 / 适应画布</span><kbd>Space / F</kbd><span>保存 / 撤销 / 重做</span><kbd>Ctrl+S / Z / Shift+Z</kbd><span>上一张 / 下一张（不自动审核）</span><kbd>A / D</kbd><span>保存、审核并下一张</span><kbd>E</kbd><span>确认标签（非输入时） / 完成多边形</span><kbd>Q / Enter</kbd><span>删除 / 取消绘制</span><kbd>Del / Esc</kbd><span>切换前九个标签 / 显示文字</span><kbd>1–9 / L</kbd></div><p class="muted">所有图片、标签及推理都留在本机；默认仅监听 127.0.0.1。自定义新标签不会让旧模型自动学会该类别，仍需人工标注或重新训练。</p></div></dialog>
   <div class="toast-stack" id="toasts" aria-live="polite"></div>

@@ -65,6 +65,9 @@ const taskUi = (() => {
   function itemChanged() {
     stroke = newHand = placing = null;
     joint = 0;
+    state.sam3Candidates = [];
+    state.sam3PreviewIndex = -1;
+    document.dispatchEvent(new Event("labelpilot-item-changed"));
     decodedMasks.clear();
     render();
   }

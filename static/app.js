@@ -7,7 +7,8 @@ const statusNames = {unstarted:"未开始",imported:"人工标注 · 待审核",
 const reviewModes = new Set(["review", "review_empty", "review_difficult", "review_low"]);
 const state = {projects:[],project:null,items:[],filtered:0,offset:0,pageSize:60,current:null,image:null,selected:-1,
   activeClass:0,tool:"select",dirty:false,busy:false,undo:[],redo:[],scale:1,panX:0,panY:0,drag:null,
-  polygon:[],rectangle:null,pendingShape:null,labelPickerSaving:false,canvasPointer:null,space:false,showLabels:true,prediction:null,loadSequence:0,listSequence:0};
+  polygon:[],rectangle:null,pendingShape:null,labelPickerSaving:false,canvasPointer:null,space:false,showLabels:true,prediction:null,
+  sam3Candidates:[],sam3PreviewIndex:-1,loadSequence:0,listSequence:0};
 const canvas = element("canvas");
 const context = canvas.getContext("2d");
 const sessionToken = document.querySelector('meta[name="labelpilot-token"]').content;
@@ -1273,6 +1274,13 @@ async function openExportDialog(clean=false) {
   if (exportPreview.running) {
     if (!element("exportDialog").open) element("exportDialog").showModal();
     return;
+  }
+  if (state.sam3PreviewIndex >= 0 && state.sam3Candidates[state.sam3PreviewIndex]) {
+    const candidate=state.sam3Candidates[state.sam3PreviewIndex];
+    const color=state.project.classes[state.activeClass].color;
+    pathPoints(candidate.points);
+    context.save(); context.globalAlpha=.2; context.fillStyle=color; context.fill(); context.globalAlpha=1;
+    context.strokeStyle=color; context.lineWidth=2; context.setLineDash([6,4]); context.stroke(); context.setLineDash([]); context.restore();
   }
   element("exportResult").textContent = "";
   element("exportProgress").hidden = true;

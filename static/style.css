@@ -38,6 +38,17 @@
 .label-composer input { padding: 7px 8px; font-size: 11px; }
 .label-composer .button { padding: 5px 9px; font-size: 17px; }
 .label-composer small { display: block; margin-top: 6px; color: var(--muted); font-size: 9px; }
+.sam3-button { border-color: var(--accent-border); color: var(--accent-text); white-space: nowrap; }
+.sam3-dialog { width: min(780px, calc(100vw - 32px)); }
+.sam3-config-grid, .sam3-prompt-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 12px 0; }
+.sam3-config-grid label, .sam3-prompt-row label { min-width: 0; }
+.sam3-path-row { display: flex; gap: 6px; margin-top: 6px; }
+.sam3-path-row input { min-width: 0; flex: 1; font-size: 10px; }
+.sam3-note { font-size: 10px; line-height: 1.7; }
+.sam3-status { margin: 12px 0; padding: 10px; border: 1px solid var(--accent-border); border-radius: 6px; color: var(--accent-text); }
+.sam3-candidates { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; max-height: 180px; overflow: auto; }
+.sam3-candidate { display: flex; gap: 6px; padding: 6px; border: 1px solid var(--border); border-radius: 6px; }
+@media(max-width:650px){.sam3-config-grid,.sam3-prompt-row{grid-template-columns:1fr}.sam3-dialog .dialog-actions{flex-wrap:wrap}}
 .label-export { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 8px 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
 .label-export .button { padding: 6px 9px; font-size: 11px; }
 .label-export small { color: var(--muted); font-size: 10px; }

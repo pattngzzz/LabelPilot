@@ -24,6 +24,7 @@ from .exporting import export_project, preview_export
 from .export_jobs import ExportJobs
 from .inference import Inference, Jobs
 from . import model_files, native_picker
+from .sam3 import Sam3Assistant
 from .store import IMAGE_SUFFIXES, Problem, Store
 from .tracking import track_frames
 from .training import TrainingJobs, has_training_dependencies
@@ -42,6 +43,7 @@ def create_app(home=None):
     comparisons = ComparisonJobs(store, jobs)
     automation = Automation(store, jobs, training, comparisons)
     exports = ExportJobs(store)
+    sam3 = Sam3Assistant(store, inference, jobs)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -49,6 +51,7 @@ def create_app(home=None):
         try:
             yield
         finally:
+            sam3.shutdown()
             exports.shutdown()
             automation.shutdown()
             comparisons.shutdown()
@@ -62,6 +65,7 @@ def create_app(home=None):
     app.state.comparisons = comparisons
     app.state.automation = automation
     app.state.exports = exports
+    app.state.sam3 = sam3
     app.state.token = secrets.token_urlsafe(32)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"])
 
@@ -91,7 +95,7 @@ def create_app(home=None):
     def index():
         version = hashlib.sha256(b"".join((ASSETS / name).read_bytes() for name in
                                          ("index.html", "efficiency.js", "resume.js", "automation.js", "task-tools.js",
-                                          "app.js", "style.css", "realityloop.png"))).hexdigest()[:16]
+                                          "app.js", "sam3.js", "style.css", "realityloop.png"))).hexdigest()[:16]
         return (ASSETS / "index.html").read_text(encoding="utf-8").replace(
             "__SESSION_TOKEN__", app.state.token).replace("__ASSET_VERSION__", version)
 
@@ -129,6 +133,25 @@ def create_app(home=None):
     @app.post("/api/images/select")
     def select_images(payload: dict):
         return native_picker.select_images(payload.get("mode"), payload.get("path"))
+
+    @app.get("/api/sam3")
+    def sam3_status():
+        return sam3.status()
+
+    @app.post("/api/sam3/config")
+    def configure_sam3(payload: dict):
+        return sam3.configure(payload)
+
+    @app.post("/api/sam3/select")
+    def select_sam3_file(payload: dict):
+        mode = payload.get("mode")
+        if mode not in ("sam3_python", "sam3_checkpoint"):
+            raise Problem("请选择 SAM3 Python 环境或权重文件", 422)
+        return native_picker.select_images(mode, payload.get("path"))
+
+    @app.post("/api/sam3/release")
+    def release_sam3():
+        return sam3.release()
 
     @app.post("/api/projects/{project_id}/model")
     def model(project_id: str, payload: dict):
@@ -228,6 +251,22 @@ def create_app(home=None):
     @app.post("/api/projects/{project_id}/items/{item_id}/predict")
     def predict(project_id: str, item_id: str, payload: dict):
         return inference.predict(project_id, item_id, payload)
+
+    @app.post("/api/projects/{project_id}/items/{item_id}/sam3")
+    def sam3_predict(project_id: str, item_id: str, payload: dict):
+        project = store.project(project_id)
+        if project.task_type != "segment":
+            raise Problem("SAM3 辅助只用于实例分割项目", 422)
+        label = payload.get("label")
+        if not isinstance(label, str) or label not in project.names:
+            raise Problem("请选择当前项目已有标签", 422)
+        item = project.item(item_id)
+        image_path = Path(item["path"]).resolve(strict=True)
+        if not image_path.is_relative_to(project.root):
+            raise Problem("图片路径不在项目目录中", 403)
+        result = sam3.predict(image_path, payload)
+        result["label"] = label
+        return result
 
     @app.post("/api/projects/{project_id}/items/{item_id}/prompt-box")
     def propose_box(project_id: str, item_id: str, payload: dict):
