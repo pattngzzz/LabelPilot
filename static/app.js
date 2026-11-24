@@ -1223,6 +1223,13 @@ function renderExportPreview(data, options) {
   const configuredSplits = Object.keys(exportSplitLabels);
   const activeSplits = configuredSplits.filter(name => counts?.[name] > 0);
   const notes = [];
+  if (data.incremental) {
+    const change = data.incremental;
+    notes.push('增量：新增 ' + change.added + ' 张 / 修改 ' + change.updated + ' 张 / 跳过 ' + change.skipped + ' 张');
+    notes.push(change.split_policy);
+    if (change.new_classes?.length) notes.push('类别表将追加：' + change.new_classes.join('、'));
+    if (change.augmentation_changed) notes.push('增强配置与旧数据集不同：已有训练图将按新配置重建，并移除失效增强副本');
+  } else if (options.incremental) notes.push('所选位置没有已有数据集，将建立首次完整导出');
   if (data.excluded) notes.push(`${data.excluded} 张未纳入`);
   if (data.unreviewed) notes.push(`${data.unreviewed} 张待审核`);
   if (data.group_count) notes.push(`${data.group_count} 个分组`);
@@ -1236,7 +1243,7 @@ function renderExportPreview(data, options) {
   element("exportSplitDistribution").hidden = !counts;
   if (counts) {
     element("exportSplitBar").innerHTML = configuredSplits.map(name =>
-      `<span data-subset="${name}" style="width:${100 * counts[name] / data.images}%"></span>`).join("");
+      `<span data-subset="${name}" style="width:${100 * counts[name] / Math.max(1, data.images)}%"></span>`).join("");
     element("exportSplitCounts").innerHTML = configuredSplits.map(name =>
       `<div><dt>${exportSplitLabels[name]}</dt><dd>${counts[name].toLocaleString()} 张</dd></div>`).join("");
   }
@@ -1314,6 +1321,7 @@ function updateExportPreview() {
   catch (error) { setExportPreviewStatus(error.message, true); return; }
 
   const options = {format:element("exportFormat").value, batch:element("exportBatch").value,
+    ...(element("exportIncremental").checked ? {incremental:true, destination:element("exportDestination").value} : {}),
     ...(["detect","segment"].includes(taskUi.type()) ? {output_task:element("exportOutputTask").value} : {}),
     reviewed_only:element("reviewedOnly").checked, include_images:element("includeImages").checked, clean, split, augmentation};
   const url = projectUrl("/export");
@@ -1870,12 +1878,15 @@ async function selectExportFolder() {
       element("exportProgressDetail").hidden = true;
       try { localStorage.setItem("labelpilot-export-directory", result.directory); } catch {}
     }
-    hint.textContent = "将在所选位置新建独立数据集目录，不覆盖已有文件，不生成 ZIP。";
+    hint.textContent = element("exportIncremental").checked
+      ? "将合并到所选数据集；未变数据跳过，修改项安全更新，新类别追加且保持旧编号。"
+      : "将在所选位置新建独立数据集目录，不覆盖已有文件，不生成 ZIP。";
   } catch (error) { hint.textContent = error.message; }
   finally {
     exportPreview.selecting = false;
     element("chooseExportFolder").disabled = false;
-    updateExportButton();
+    if (element("exportIncremental").checked) updateExportPreview();
+    else updateExportButton();
   }
 }
 
@@ -1914,6 +1925,11 @@ function renderExportJob(job) {
     const summary = counts ? `训练 ${counts.train} 张 / 验证 ${counts.val} 张 / 测试 ${counts.test} 张。` : "未划分数据集。";
     status.textContent = `已导出 ${result.images} 张。${summary}原图 ${result.original_images} 张，训练增强 ${result.augmented_images} 张。` +
       (result.integrity_check?.passed ? "标注完整性校验通过。" : "");
+    if (result.incremental) {
+      const change = result.incremental;
+      status.textContent = '增量完成：新增 ' + change.added + ' 张，更新 ' + change.updated + ' 张，跳过 ' + change.skipped + ' 张原图。' + status.textContent;
+    }
+    if (result.cleanup_warning) status.textContent += result.cleanup_warning;
     detail.textContent = `100% · 保存位置：${result.directory}` +
       (job.elapsed_seconds ? ` · 用时 ${job.elapsed_seconds} 秒` : "") +
       (job.cache_hits ? ` · 复用增强 ${job.cache_hits} 张` : "") +
@@ -1957,6 +1973,7 @@ async function exportDataset() {
   if (!element("exportDialog").open || !plan || plan.data.blocking_issue || exportPreview.running || exportPreview.selecting) return;
   const destination = element("exportDestination").value;
   if (!destination) return toast("请先选择导出文件夹");
+  if (plan.data.incremental?.augmentation_changed && !window.confirm("增强配置与已有数据集不同，将重建已有训练数据的增强副本，并移除不再需要的旧副本。确定按当前增强配置更新？")) return;
   if (plan.data.unreviewed && !window.confirm(`这次导出包含 ${plan.data.unreviewed} 张待审核图片。确定导出？`)) return;
   setExportBusy(true);
   const status = element("exportResult");
@@ -2104,7 +2121,7 @@ listen("jobsList","click",async event=>{const button=event.target.closest("[data
 for (const id of ["railExport", "exportButton"]) listen(id, "click", () => openExportDialog());
 listen("cleanButton", "click", () => openExportDialog(true));
 listen("cleanupDuplicates", "click", cleanupDuplicates);
-for (const id of ["exportFormat", "exportOutputTask", "exportBatch", "reviewedOnly", "includeImages", "cleanDataset", "splitDataset",
+for (const id of ["exportIncremental", "exportFormat", "exportOutputTask", "exportBatch", "reviewedOnly", "includeImages", "cleanDataset", "splitDataset",
   "exportSplitUnit", "splitTrain", "splitVal", "splitTest", "splitSeed", "augmentationPreset", "augmentationCopies", "augmentationSeed"]) listen(id, "input", () => {
   element("exportResult").textContent = "";
   element("exportProgress").hidden = true;

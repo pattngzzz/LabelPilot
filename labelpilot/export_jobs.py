@@ -9,6 +9,7 @@ from contextlib import contextmanager
 
 from .exporting import DatasetFolder, validated_export_plan, write_members
 from .export_acceleration import AugmentationCache, ExportAcceleration, export_workers
+from .incremental_export import record_metadata, safe_path
 from .model_files import directory
 from .store import Problem, Store, now
 
@@ -104,6 +105,9 @@ class ExportJobs:
         temporary = None
         snapshot = None
         cache = None
+        target_lock = None
+        incremental = None
+        cleanup_warning = None
         started = time.monotonic()
         writing_started = None
 
@@ -121,17 +125,28 @@ class ExportJobs:
 
         try:
             checkpoint()
+            if options.get("incremental") and (destination / "export_manifest.json").exists():
+                target_lock = safe_path(destination, ".labelpilot-export.lock")
+                try:
+                    with target_lock.open("x", encoding="utf-8") as lock_file:
+                        lock_file.write(job_id)
+                except FileExistsError:
+                    target_lock = None
+                    raise Problem("该数据集已有增量导出锁；请等待其他任务完成。若上次异常退出，请先检查恢复目录再移除锁", 409)
             snapshot = ExportSnapshot(self.store, project_id)
             plan, fingerprints = validated_export_plan(snapshot, project_id, options, checkpoint=checkpoint)
+            incremental = plan.incremental
             checkpoint()
             destination = directory(str(destination))
             safe_project = re.sub(r"[^\w-]", "_", project_id)
             filename = f"{safe_project}_{plan.format_name}_{job_id}"
-            output = destination / filename
-            staging = destination / f".{filename}.part"
-            if output.exists() or staging.exists():
+            output = incremental.root if incremental else destination / filename
+            staging_parent = destination.parent if incremental else destination
+            staging = staging_parent / (f".lp-{job_id}.part" if incremental else f".{filename}.part")
+            if (not incremental and output.exists()) or staging.exists():
                 raise Problem("导出目录已存在，请重新导出，已有文件不会被覆盖", 409)
-            self.update(job_id, status="writing", total=len(plan.rows) + plan.augmented_images)
+            self.update(job_id, status="writing", total=len(plan.rows) + plan.augmented_images,
+                        incremental=incremental.summary() if incremental else None)
             dataset = DatasetFolder(staging)
             temporary = staging
             if options.get("reuse_cache", True) and plan.augmentation:
@@ -142,21 +157,41 @@ class ExportJobs:
                                          progress=progress, verify=True, acceleration=acceleration)
             checkpoint()
             self.update(job_id, status="finalizing")
-            if output.exists():
-                raise Problem("目标目录已存在，已有文件不会被覆盖", 409)
-            temporary.rename(output)
-            temporary = None
+            if incremental:
+                manifest = incremental.merge(plan, dataset, manifest)
+                record_metadata(dataset, manifest)
+                incremental.publish(dataset, checkpoint)
+                try:
+                    if temporary.is_symlink() or temporary.resolve().parent != incremental.root.parent:
+                        raise OSError("临时目录路径已改变，未自动清理")
+                    shutil.rmtree(temporary)
+                except OSError:
+                    cleanup_warning = f"数据已完成合并，但临时备份未能清理，请检查后移除：{temporary}"
+                temporary = None
+            else:
+                record_metadata(dataset, manifest)
+                if output.exists():
+                    raise Problem("目标目录已存在，已有文件不会被覆盖", 409)
+                temporary.rename(output)
+                temporary = None
             result = {"directory": str(output), "images": len(manifest["items"]),
-                      "original_images": len(plan.rows), "augmented_images": plan.augmented_images,
-                      "split_counts": manifest["split_counts"], "source_split_counts": plan.split_counts,
+                      "original_images": manifest["original_images"], "augmented_images": manifest["augmented_images"],
+                      "split_counts": manifest["split_counts"], "source_split_counts": manifest["source_split_counts"],
+                      "incremental": incremental.summary() if incremental else None,
+                      "cleanup_warning": cleanup_warning,
                        "integrity_check": manifest.get("integrity_check"), "acceleration": manifest.get("acceleration")}
             self.update(job_id, status="completed", percent=100, result=result, current_image="", remaining_seconds=0,
                         elapsed_seconds=round(time.monotonic() - started, 1), **(cache.stats() if cache else {}))
         except Exception as exc:
             cleanup_error = None
+            if incremental and getattr(incremental, "recovery_required", False):
+                cleanup_error = f"请保留恢复目录：{temporary} 和目标锁文件，不要删除。"
+                temporary = None
+                target_lock = None
             if temporary is not None and temporary.exists():
                 try:
-                    if temporary.is_symlink() or temporary.resolve().parent != destination:
+                    expected_parent = incremental.root.parent if incremental else destination
+                    if temporary.is_symlink() or temporary.resolve().parent != expected_parent:
                         raise OSError("临时目录路径已改变，未自动清理")
                     shutil.rmtree(temporary)
                 except OSError:
@@ -166,5 +201,7 @@ class ExportJobs:
             self.update(job_id, status="cancelled" if isinstance(exc, ExportCancelled) else "failed",
                         error=message + (f" {cleanup_error}" if cleanup_error else ""))
         finally:
+            if target_lock is not None:
+                target_lock.unlink(missing_ok=True)
             if snapshot is not None:
                 snapshot.connection.close()

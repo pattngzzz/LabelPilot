@@ -17,6 +17,7 @@ from PIL import Image
 from .augmentation import augmentation_image, augmented_variants, plan_augmentation, validate_augmented_sample
 from .ocr import detection_entries, finish_ocr_export, verify_ocr_annotation, write_ocr_annotation
 from .export_acceleration import cache_key
+from .incremental_export import file_stamp, load_incremental, record_entry
 from .cleaning import clean_selection
 from .store import Problem, Project, digest, now, read_annotation_snapshot, source_group
 from .tasks import EXPORT_FORMATS, HAND_COUNT, HAND_KEYPOINTS, HAND_SKELETON, model_labels, polygon_area, semantic_mask
@@ -65,9 +66,11 @@ def assign_groups(rows, unit, active, targets, rng):
     return assignments, counts
 
 
-def plan_splits(rows, options):
+def plan_splits(rows, options, incremental=None):
     settings = options.get("split")
     if settings is None:
+        if incremental:
+            return incremental.assignments(rows, None, None, None, None)
         return {row["id"]: "unassigned" for row in rows}, None, None
     if not isinstance(settings, dict) or set(settings) - {*SPLIT_NAMES, "seed", "unit"}:
         raise Problem("划分设置必须包含 train、val、test 百分比，可指定随机种子和划分方式", 422)
@@ -84,6 +87,8 @@ def plan_splits(rows, options):
     if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= 4294967295:
         raise Problem("随机种子必须为 0 到 4294967295 的整数", 422)
     active = [name for name in SPLIT_NAMES if ratios[name] > 0]
+    if incremental:
+        return incremental.assignments(rows, settings, ratios, seed, unit)
     targets = {name: len(rows) * ratios[name] / 100 for name in SPLIT_NAMES}
     rng = random.Random(seed)
     if unit != "image":
@@ -128,6 +133,7 @@ class ExportPlan:
     cleaning: Optional[list]
     augmentation: Optional[dict] = None
     output_task: Optional[str] = None
+    incremental: Optional[object] = None
 
     @property
     def augmented_images(self):
@@ -175,18 +181,19 @@ def prepare_export(store, project_id, options, *, include_documents=False, check
         raise Problem("当前导出增强仅适用于目标检测和实例分割", 422)
     if clean and not reviewed_only:
         raise Problem("清洗版数据集仅纳入已人工确认的图片", 422)
+    incremental = load_incremental(project, format_name, options)
     batch = options.get("batch")
     if batch is None:
         batch = ""
     if not isinstance(batch, str):
         raise Problem("批次必须为文本", 422)
     listing = store.listing(project_id, batch=batch, limit=1000000,
-                            include_documents=include_documents and not clean)
+                            include_documents=(include_documents or bool(incremental)) and not clean)
     rows = [item for item in listing["items"] if item["status"] == "reviewed" or
             (not reviewed_only and item["status"] in ("imported", "predicted", "draft"))]
     if not rows:
         raise Problem("所选范围没有符合条件的标注。默认仅导出已人工确认的图片", 422)
-    if len(rows) > 10000:
+    if len(rows) > 10000 and not incremental:
         raise Problem("请按批次导出，每次不超过 10000 张", 422)
     cleaning = None
     if clean:
@@ -194,10 +201,14 @@ def prepare_export(store, project_id, options, *, include_documents=False, check
         if not rows and not allow_empty_cleaning:
             counts = cleaning_summary(cleaning)["counts"]
             raise Problem(f"清洗后没有可用图片。图片不可用 {counts['unreadable']} 张，标注异常 {counts['annotation']} 张，冲突副本 {counts['conflict']} 张", 422)
-    assignments, split_config, split_counts = plan_splits(rows, options) if rows else ({}, None, None)
+    assignments, split_config, split_counts = plan_splits(rows, options, incremental) if rows else ({}, None, None)
     plan = ExportPlan(project, format_name, batch, reviewed_only, include_images, rows,
                       listing["filtered"] - len(rows), assignments, split_config, split_counts, cleaning, augmentation, output_task)
-    if len(rows) + plan.augmented_images > 20000:
+    if incremental:
+        plan = incremental.select(store, plan, checkpoint)
+    if len(plan.rows) > 10000:
+        raise Problem("本次新增或修改超过 10000 张，请按批次增量导出", 422)
+    if len(plan.rows) + plan.augmented_images > 20000:
         raise Problem("增强后每次导出最多 20000 张，请减少副本数量或按批次导出", 422)
     return plan
 
@@ -219,7 +230,8 @@ def export_fingerprint(plan, sources):
          row["image_sha256"], plan.assignments[row["id"]], sources.get(row["id"])) for row in plan.rows
     ]
     snapshot = (plan.project.id, plan.project.names, plan.format_name, plan.batch, plan.reviewed_only,
-                plan.include_images, plan.excluded, plan.split_config, plan.cleaning, plan.augmentation, plan.output_task, item_versions)
+                plan.include_images, plan.excluded, plan.split_config, plan.cleaning, plan.augmentation, plan.output_task,
+                plan.incremental.baseline_hash if plan.incremental else None, item_versions)
     return hashlib.sha256(json.dumps(snapshot, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
@@ -294,7 +306,7 @@ def describe_export(store, plan):
     blocking_issue = None
     if projection_issue:
         blocking_issue = projection_issue
-    elif not plan.rows:
+    elif not plan.rows and not plan.incremental:
         blocking_issue = "清洗后没有可用图片。请检查排除示例或扩大批次范围"
     elif plan.format_name == "yolo" and (plan.output_task or plan.project.task_type) == "detect" and polygons:
         blocking_issue = f"{polygons} 张图片包含多边形。{YOLO_POLYGON_ERROR}"
@@ -309,12 +321,15 @@ def describe_export(store, plan):
         if plan.split_config and plan.split_config["unit"] != "image" else None,
         "blocking_issue": blocking_issue,
         "augmented_images": plan.augmented_images,
+        "incremental": plan.incremental.summary() if plan.incremental else None,
         "cleaning": cleaning_summary(plan.cleaning) if plan.cleaning is not None else None,
         "preview_token": export_fingerprint(plan, fingerprints),
     }
 
 
 def export_project(store, project_id, options):
+    if options.get("incremental"):
+        raise Problem("增量导出需要选择本机文件夹，不支持 ZIP 接口", 422)
     with store.lock:
         plan, fingerprints = validated_export_plan(store, project_id, options)
         return write_archive(store, plan, fingerprints)
@@ -390,6 +405,12 @@ class DatasetFolder:
 
     def read(self, name):
         return (self.root / name).read_bytes()
+
+    def rewrite(self, name, content):
+        if name not in self.member_names:
+            self.writestr(name, content)
+        else:
+            (self.root / name).write_bytes(content if isinstance(content, bytes) else content.encode("utf-8"))
 
 
 def write_verified_image(archive, source, name, expected_digest):
@@ -553,7 +574,12 @@ def prepare_export_rows(store, plan, fingerprints, checkpoint, acceleration):
         for row in plan.rows:
             if checkpoint:
                 checkpoint()
+            source = Path(plan.project.item(row["id"])["path"])
+            source_state = file_stamp(source)
             current = store.detail(plan.project.id, row["id"])
+            if file_stamp(source) != source_state:
+                raise Problem("读取期间原图发生变化，请重新准备数据", 409)
+            current["export_source_stat"] = source_state
             if current["version"] != row.get("version", 0) or current["status"] != row["status"]:
                 raise Problem("导出期间标注发生变化，请重试", 409)
             if row["id"] in fingerprints and current["source_fingerprint"] != fingerprints[row["id"]]:
@@ -644,6 +670,7 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None, progre
         if checkpoint:
             checkpoint()
         item_id = row["id"]
+        member_offset = len(archive.members) if hasattr(archive, "members") else 0
         item = project.item(row["id"])
         safe_photo_id = re.sub(r"[^\w.-]", "_", row["photo_id"])
         filename = f"{safe_photo_id}_{row['id'][:8]}{Path(item['path']).suffix.lower()}"
@@ -675,12 +702,15 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None, progre
                 raise Problem("原图副本指纹与已保存标注不一致，已中止导出", 409)
         if verify or augmentation:
             manifest["items"][-1]["annotation_count"] = len(source_document["shapes"])
+        record_entry(archive, manifest["items"][-1], member_offset, item["path"], source_document or document,
+                     current["export_source_stat"])
         if progress:
             progress(len(manifest["items"]), len(rows) + augmented_images, row["photo_id"])
         for settings, index, contents, augmented, provenance, shape_count in variants:
             if checkpoint:
                 checkpoint()
             preset = settings["preset"]
+            member_offset = len(archive.members) if hasattr(archive, "members") else 0
             variant_id = f"{row['id']}__aug_{preset}_{index}"
             variant_name = f"images/train/{Path(filename).stem}__aug_{preset}_{index}.jpg"
             archive.writestr(variant_name, contents)
@@ -698,20 +728,10 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None, progre
                              coco_documents, len(manifest["items"]))
             verify_export_annotation(archive, format_name, project, expected_document, variant_name, "train",
                                      split_config, coco_documents, len(manifest["items"]), annotation_offset)
+            record_entry(archive, manifest["items"][-1], member_offset)
             if progress:
                 progress(len(manifest["items"]), len(rows) + augmented_images, variant_id)
-    names = model_labels(project.task_type, project.names)
-    archive.writestr("classes.txt", "\n".join(names) + "\n")
-    if format_name in ("yolo", "mask"):
-        paths = "" if not split_config else "".join(
-            f"{name}: " + (f"images/{name}" if split_counts[name] else "null") + "\n" for name in SPLIT_NAMES)
-        if format_name == "mask":
-            paths += "masks_dir: masks\n"
-            manifest["mask_classes"] = names
-        elif project.task_type == "hand_pose":
-            paths += f"kpt_shape: [{HAND_COUNT}, 3]\nflip_idx: {list(range(HAND_COUNT))}\n"
-        archive.writestr("dataset.yaml", paths + "names:\n" + "\n".join(
-            f"  {index}: {json.dumps(name, ensure_ascii=False)}" for index, name in enumerate(names)) + "\n")
+    write_configuration(archive, plan, manifest)
     if format_name == "paddleocr":
         try:
             finish_ocr_export(archive, coco_documents, manifest)
@@ -739,3 +759,20 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None, progre
                                     **(acceleration.cache.stats() if acceleration.cache else {})}
     archive.writestr("export_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
     return manifest
+
+
+def write_configuration(archive, plan, manifest, *, rewrite=False):
+    project = output_project(plan)
+    names = model_labels(project.task_type, project.names)
+    write = archive.rewrite if rewrite else archive.writestr
+    write("classes.txt", "\n".join(names) + "\n")
+    if plan.format_name in ("yolo", "mask"):
+        paths = "" if not plan.split_config else "".join(
+            f"{name}: " + (f"images/{name}" if manifest["split_counts"][name] else "null") + "\n" for name in SPLIT_NAMES)
+        if plan.format_name == "mask":
+            paths += "masks_dir: masks\n"
+            manifest["mask_classes"] = names
+        elif project.task_type == "hand_pose":
+            paths += f"kpt_shape: [{HAND_COUNT}, 3]\nflip_idx: {list(range(HAND_COUNT))}\n"
+        write("dataset.yaml", paths + "names:\n" + "\n".join(
+            f"  {index}: {json.dumps(name, ensure_ascii=False)}" for index, name in enumerate(names)) + "\n")

@@ -587,6 +587,22 @@ with contextlib.nullcontext(archive) as archive:
     assert 'val: images/val' in archive.read('dataset.yaml').decode()
 `, splitExport], {windowsHide:true, encoding:"utf8"});
     assert.equal(exportCheck.status, 0, exportCheck.stderr || exportCheck.error?.message);
+    await check('!element("exportIncremental").checked', "Incremental merge is opt-in and preserves the default independent export");
+    await click("#exportIncremental");
+    await evaluate('window.incrementalPickerApi=api;api=async(route,method,body)=>route==="/api/exports/select" ? {cancelled:false,directory:'+JSON.stringify(splitExport)+'} : incrementalPickerApi(route,method,body);');
+    await click("#chooseExportFolder");
+    await waitFor('exportPreview.plan?.data.incremental?.skipped===4 && !element("createExport").disabled');
+    await check('element("exportImageCount").textContent==="0" && element("exportPreviewStatus").textContent.includes("跳过 4 张") && element("exportDestinationHint").textContent.includes("保持旧编号")', "A native-picker selection previews only newly added or changed files in the existing dataset");
+    await click("#createExport");
+    await waitFor('!exportPreview.running && lastExportResult.incremental?.skipped===4 && element("exportResult").textContent.includes("增量完成")');
+    assert.equal(await evaluate('lastExportResult.directory'), splitExport, "Incremental export updates the selected root without nesting another dataset");
+    assert.equal(fs.readdirSync(downloads).filter(name => fs.statSync(path.join(downloads,name)).isDirectory() && !name.startsWith(".")).length, 1);
+    await evaluate('api=incrementalPickerApi;');
+    await click("#exportIncremental");
+    await evaluate('window.restorePickerApi=api;api=async(route,method,body)=>route==="/api/exports/select" ? {cancelled:false,directory:'+JSON.stringify(downloads)+'} : restorePickerApi(route,method,body);');
+    await click("#chooseExportFolder");
+    await evaluate('api=restorePickerApi;');
+    await waitFor('!element("createExport").disabled && !exportPreview.plan.options.incremental');
     for (const [width, height] of [[1600,1000], [760,800], [480,740], [360,640]]) {
       await cdp("Emulation.setDeviceMetricsOverride", {width, height, deviceScaleFactor:1, mobile:false});
       await sleep(100);

@@ -130,6 +130,279 @@ def test_folder_export_verified_split_augmentation_and_preservation(reviewed_sto
         jobs.shutdown()
 
 
+def incremental_run(store, jobs, options):
+    preview = preview_export(store, "test", options)
+    record = finish_folder_export(jobs, jobs.start("test", {**options, "preview_token": preview["preview_token"]}))
+    assert record["status"] == "completed", record.get("error", record)
+    return record, preview
+
+
+@pytest.mark.parametrize("format_name", ["yolo", "labelme", "coco"])
+def test_incremental_export_append_update_classes_config_and_idempotence(reviewed_store, monkeypatch, format_name):
+    from labelpilot import export_jobs
+
+    store = reviewed_store
+    jobs = ExportJobs(store)
+    options = {"format": format_name, "destination": str(store.home),
+               "split": {"train": 50, "val": 25, "test": 25, "unit": "image", "seed": 42},
+               "augmentation": {"preset": "all", "copies": 1, "seed": 42}}
+    try:
+        initial, _ = incremental_run(store, jobs, options)
+        root = Path(initial["result"]["directory"])
+        initial_manifest = json.loads((root / "export_manifest.json").read_text(encoding="utf-8"))
+        originals = {entry["id"]: entry for entry in initial_manifest["items"] if "source_id" not in entry}
+        before = {name: ((root / name).stat().st_mtime_ns, digest(root / name))
+                  for entry in initial_manifest["items"] for name in entry["files"]}
+        incremental = {**options, "destination": str(root), "incremental": True}
+        no_change, preview = incremental_run(store, jobs, incremental)
+        assert preview["images"] == 0 and preview["blocking_issue"] is None
+        assert no_change["total"] == 0 and no_change["result"]["incremental"] == preview["incremental"]
+        assert preview["incremental"]["skipped"] == 4
+        assert all(((root / name).stat().st_mtime_ns, digest(root / name)) == state for name, state in before.items())
+
+        store.import_labels("test", "classes.txt", "new_label\n")
+        fresh = Path(store.project("test").root) / "new.jpg"
+        Image.new("RGB", (240, 120), "#abcdef").save(fresh)
+        store.rescan("test")
+        new_row = item(store, "new")
+        data = payload(store, "new", "reviewed")
+        data["document"]["shapes"] = [{"label": "new_label", "shape_type": "rectangle", "points": [[20, 20], [60, 70]]}]
+        store.save("test", new_row["id"], data)
+        changed = payload(store, "human", "reviewed")
+        changed["document"]["shapes"][0]["points"] = [[15, 12], [90, 65]]
+        store.save("test", changed["item"]["id"], changed)
+        seen = []
+        writer = export_jobs.write_members
+
+        def track(snapshot, plan, *args, **kwargs):
+            seen.extend(row["id"] for row in plan.rows)
+            return writer(snapshot, plan, *args, **kwargs)
+
+        monkeypatch.setattr(export_jobs, "write_members", track)
+        incremental["split"] = {"train": 60, "val": 20, "test": 20, "seed": 17, "unit": "image"}
+        result, preview = incremental_run(store, jobs, incremental)
+        assert set(seen) == {new_row["id"], changed["item"]["id"]}
+        assert result["result"]["directory"] == str(root)
+        assert preview["incremental"]["added"] == preview["incremental"]["updated"] == 1
+        assert preview["incremental"]["skipped"] == 3
+        manifest = json.loads((root / "export_manifest.json").read_text(encoding="utf-8"))
+        assert manifest["original_images"] == 5 and manifest["classes"] == ["object", "new_label"]
+        assert manifest["split_config"]["train"] == 60 and manifest["split_config"]["seed"] == 17
+        assert (root / "classes.txt").read_text() == "object\nnew_label\n"
+        for entry in manifest["items"]:
+            if entry["id"] in originals:
+                assert entry["split"] == originals[entry["id"]]["split"]
+            if entry.get("source_id", entry["id"]) != changed["item"]["id"]:
+                for name in entry["files"]:
+                    if name in before:
+                        assert ((root / name).stat().st_mtime_ns, digest(root / name)) == before[name]
+            for name, expected in entry["files"].items():
+                assert digest(root / name) == expected["sha256"]
+        if format_name == "yolo":
+            assert '1: "new_label"' in (root / "dataset.yaml").read_text()
+            entry = next(entry for entry in manifest["items"] if entry["id"] == new_row["id"])
+            name = next(name for name in entry["files"] if name.startswith("labels/"))
+            assert (root / name).read_text().startswith("1 ")
+        if format_name == "coco":
+            for subset, count in manifest["split_counts"].items():
+                if count:
+                    document = json.loads((root / "annotations" / f"{subset}.json").read_bytes())
+                    assert len(document["images"]) == count
+                    assert len({image["id"] for image in document["images"]}) == count
+                    assert [category["name"] for category in document["categories"]] == manifest["classes"]
+                    assert all(annotation["image_id"] in {image["id"] for image in document["images"]}
+                               for annotation in document["annotations"])
+        seen.clear()
+        repeated, _ = incremental_run(store, jobs, incremental)
+        assert repeated["total"] == 0 and seen == []
+    finally:
+        jobs.shutdown()
+
+
+@pytest.mark.parametrize("legacy_corruption", [False, True])
+def test_incremental_legacy_manifest_adoption_and_corruption_repair(reviewed_store, legacy_corruption):
+    store = reviewed_store
+    jobs = ExportJobs(store)
+    options = {"destination": str(store.home), "split": {"train": 100, "val": 0, "test": 0},
+               "augmentation": {"preset": "all", "copies": 1, "seed": 42}}
+    try:
+        initial, _ = incremental_run(store, jobs, options)
+        root = Path(initial["result"]["directory"])
+        path = root / "export_manifest.json"
+        manifest = json.loads(path.read_bytes())
+        manifest.pop("metadata_files")
+        for entry in manifest["items"]:
+            for key in ("files", "source_stat", "annotation_sha256"):
+                entry.pop(key, None)
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        images = {entry["image"]: (root / entry["image"]).stat().st_mtime_ns for entry in manifest["items"]}
+        if legacy_corruption:
+            variant = next(entry for entry in manifest["items"] if "source_id" in entry)
+            legacy_label = root / Path(variant["image"].replace("images/", "labels/", 1)).with_suffix(".txt")
+            legacy_label.write_text("shifted or missing boxes\n")
+        incremental = {**options, "destination": str(root), "incremental": True}
+        adopted, _ = incremental_run(store, jobs, incremental)
+        assert adopted["total"] == (6 if legacy_corruption else 0)
+        assert adopted["result"]["incremental"]["skipped"] == (3 if legacy_corruption else 4)
+        assert all((root / name).stat().st_mtime_ns == stamp for name, stamp in images.items())
+        manifest = json.loads(path.read_bytes())
+        variant = next(entry for entry in manifest["items"] if "source_id" in entry)
+        label = next(name for name in variant["files"] if name.startswith("labels/"))
+        (root / label).write_text("corrupted\n")
+        repaired, _ = incremental_run(store, jobs, incremental)
+        assert repaired["result"]["incremental"]["updated"] == 1
+        assert (root / label).read_text() != "corrupted\n"
+    finally:
+        jobs.shutdown()
+
+
+@pytest.mark.parametrize("failure", ["write", "commit", "cancel"])
+def test_incremental_failure_rolls_back_existing_dataset(reviewed_store, monkeypatch, failure):
+    from labelpilot import export_jobs
+    from labelpilot.incremental_export import IncrementalExport
+
+    store, jobs = reviewed_store, ExportJobs(reviewed_store)
+    try:
+        initial, _ = incremental_run(store, jobs, {"destination": str(store.home)})
+        root = Path(initial["result"]["directory"])
+        before = {path.relative_to(root).as_posix(): digest(path) for path in root.rglob("*") if path.is_file()}
+        data = payload(store, "human", "reviewed")
+        data["document"]["shapes"][0]["points"] = [[20, 10], [100, 80]]
+        store.save("test", data["item"]["id"], data)
+        options = {"destination": str(root), "incremental": True}
+        options["preview_token"] = preview_export(store, "test", options)["preview_token"]
+        if failure == "write":
+            monkeypatch.setattr(export_jobs, "write_members", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")))
+        else:
+            publish = IncrementalExport.publish
+
+            def fail_publish(self, dataset, checkpoint):
+                calls = 0
+
+                def fail_checkpoint():
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        raise export_jobs.ExportCancelled() if failure == "cancel" else OSError("commit failed")
+                    checkpoint()
+
+                return publish(self, dataset, fail_checkpoint)
+
+            monkeypatch.setattr(IncrementalExport, "publish", fail_publish)
+        record = finish_folder_export(jobs, jobs.start("test", options))
+        assert record["status"] == ("cancelled" if failure == "cancel" else "failed")
+        after = {path.relative_to(root).as_posix(): digest(path) for path in root.rglob("*") if path.is_file()}
+        assert after == before
+        assert not list(root.glob("*.part"))
+    finally:
+        jobs.shutdown()
+
+
+@pytest.mark.parametrize("mismatch", ["project", "task", "format", "classes", "unit", "missing_manifest", "unsafe_path", "unknown_file", "stale", "lock"])
+def test_incremental_rejects_incompatible_or_changed_targets(reviewed_store, mismatch):
+    store, jobs = reviewed_store, ExportJobs(reviewed_store)
+    try:
+        initial, _ = incremental_run(store, jobs, {"destination": str(store.home), "split": {"train": 100, "val": 0, "test": 0}})
+        root = Path(initial["result"]["directory"])
+        options = {"destination": str(root), "incremental": True, "split": {"train": 100, "val": 0, "test": 0}}
+        manifest_path = root / "export_manifest.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        if mismatch == "project":
+            manifest["project"] = "different"
+        elif mismatch == "task":
+            options["output_task"] = "segment"
+        elif mismatch == "format":
+            options["format"] = "labelme"
+        elif mismatch == "classes":
+            (root / "classes.txt").write_text("wrong\n")
+        elif mismatch == "unit":
+            options["split"]["unit"] = "directory"
+        elif mismatch == "unsafe_path":
+            manifest["items"][0]["files"] = {"../outside.txt": {}}
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        if mismatch == "missing_manifest":
+            manifest_path.unlink()
+        if mismatch not in ("unknown_file", "stale", "lock"):
+            with pytest.raises(Problem):
+                preview_export(store, "test", options)
+            return
+        if mismatch == "unknown_file":
+            Image.new("RGB", (240, 120)).save(store.project("test").root / "new.jpg")
+            store.rescan("test")
+            data = payload(store, "new", "reviewed")
+            data["confirmed_empty"] = True
+            store.save("test", data["item"]["id"], data)
+            name = f"images/train/new_{data['item']['id'][:8]}.jpg"
+            (root / name).write_text("user-owned")
+        options["preview_token"] = preview_export(store, "test", options)["preview_token"]
+        if mismatch == "stale":
+            manifest["updated_at"] = "changed-after-preview"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        elif mismatch == "lock":
+            (root / ".labelpilot-export.lock").write_text("another task")
+        before = {path.relative_to(root).as_posix(): digest(path) for path in root.rglob("*") if path.is_file()}
+        result = finish_folder_export(jobs, jobs.start("test", options))
+        assert result["status"] == "failed", result
+        assert {path.relative_to(root).as_posix(): digest(path) for path in root.rglob("*") if path.is_file()} == before
+    finally:
+        jobs.shutdown()
+
+
+def test_incremental_preserves_class_ids_and_removes_outdated_augmentation(reviewed_store):
+    store, jobs = reviewed_store, ExportJobs(reviewed_store)
+    try:
+        options = {"destination": str(store.home), "incremental": True,
+                   "split": {"train": 100, "val": 0, "test": 0},
+                   "augmentation": {"preset": "rotation", "copies": 3, "seed": 42}}
+        first, _ = incremental_run(store, jobs, options)
+        root = Path(first["result"]["directory"])
+        manifest = json.loads((root / "export_manifest.json").read_bytes())
+        old_augmented = [name for entry in manifest["items"] if "source_id" in entry for name in entry["files"]]
+        store.add_label("test", "new_label")
+        store.project("test").names.reverse()
+        options.update(destination=str(root), augmentation=None)
+        result, _ = incremental_run(store, jobs, options)
+        assert result["result"]["augmented_images"] == 0 and result["result"]["original_images"] == 4
+        assert all(not (root / name).exists() for name in old_augmented)
+        assert (root / "classes.txt").read_text() == "object\nnew_label\n"
+        entry = next(entry for entry in json.loads((root / "export_manifest.json").read_bytes())["items"]
+                     if entry["photo_id"] == "human")
+        assert (root / next(name for name in entry["files"] if name.startswith("labels/"))).read_text().startswith("0 ")
+        store.add_label("test", "metadata_only")
+        result, preview = incremental_run(store, jobs, options)
+        assert preview["images"] == result["total"] == 0
+        assert (root / "classes.txt").read_text().splitlines() == ["object", "new_label", "metadata_only"]
+        assert '2: "metadata_only"' in (root / "dataset.yaml").read_text()
+    finally:
+        jobs.shutdown()
+
+
+def test_incremental_new_source_members_follow_existing_group(reviewed_store):
+    store, jobs = reviewed_store, ExportJobs(reviewed_store)
+    try:
+        for index, row in enumerate(store.project("test").items):
+            row["source_group"] = f"capture-{index}"
+        options = {"destination": str(store.home), "split": {"train": 50, "val": 25, "test": 25, "unit": "source_group"}}
+        first, _ = incremental_run(store, jobs, options)
+        root = Path(first["result"]["directory"])
+        old_items = json.loads((root / "export_manifest.json").read_bytes())["items"]
+        previous = old_items[0]
+        Image.new("RGB", (240, 120)).save(store.project("test").root / "new.jpg")
+        store.rescan("test")
+        for row in store.project("test").items:
+            row["source_group"] = (previous["source_group"] if row["photo_id"] == "new" else
+                                   next(entry["source_group"] for entry in old_items if entry["id"] == row["id"]))
+        data = payload(store, "new", "reviewed")
+        data["confirmed_empty"] = True
+        store.save("test", data["item"]["id"], data)
+        result, _ = incremental_run(store, jobs, {**options, "destination": str(root), "incremental": True})
+        manifest = json.loads((root / "export_manifest.json").read_bytes())
+        assert next(entry["split"] for entry in manifest["items"] if entry["photo_id"] == "new") == previous["split"]
+        assert result["result"]["incremental"]["added"] == 1
+    finally:
+        jobs.shutdown()
+
+
 def test_folder_export_snapshot_progress_and_concurrent_saving(reviewed_store, monkeypatch):
     from labelpilot import export_jobs
 

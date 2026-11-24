@@ -203,6 +203,65 @@ def test_ocr_folder_export_inherits_original_split_for_all_crops(tmp_path):
     jobs.shutdown()
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("task,format_name", [("ocr", "paddleocr"), ("ocr", "labelme"), ("semantic", "mask"),
+                                             ("segment", "yolo"), ("hand_pose", "yolo"), ("hand_pose", "coco")])
+def test_incremental_export_task_types_and_ocr_crop_cleanup(tmp_path, task, format_name, legacy):
+    store, project, item_id = project_with_image(tmp_path, task, ["text"] if task == "ocr" else ["object"])
+    if task == "ocr":
+        shapes = [ocr_shape(), ocr_shape("ABC", value_decimal=None)]
+    elif task == "hand_pose":
+        shapes = [{"label": "object", "shape_type": "hand", "points": [[5, 5], [70, 50]],
+                   "keypoints": [[10, 10, 2] for _ in range(HAND_COUNT)]}]
+    else:
+        shapes = [polygon("object", 5, 5, 50, 30)]
+    reviewed(store, project, item_id, shapes)
+    jobs = ExportJobs(store)
+
+    def run(options):
+        preview = preview_export(store, project.id, options)
+        record = jobs.start(project.id, {**options, "preview_token": preview["preview_token"]})
+        jobs.worker.join(timeout=20)
+        record = jobs.get(project.id, record["id"])
+        assert record["status"] == "completed", record.get("error", record)
+        return record["result"]
+
+    try:
+        options = {"format": format_name, "destination": str(tmp_path)}
+        result = run(options)
+        root = Path(result["directory"])
+        if legacy:
+            manifest = json.loads((root / "export_manifest.json").read_bytes())
+            manifest.pop("metadata_files")
+            for entry in manifest["items"]:
+                for key in ("files", "source_stat", "annotation_sha256"):
+                    entry.pop(key, None)
+            atomic_json(root / "export_manifest.json", manifest)
+        options.update(destination=str(root), incremental=True)
+        first = run(options)
+        assert first["incremental"]["skipped"] == (0 if legacy and format_name in ("coco", "paddleocr") else 1)
+        Image.new("RGB", (80, 60), "#123456").save(project.root / "new.png")
+        store.rescan(project.id)
+        project = store.project(project.id)
+        new_id = next(row["id"] for row in project.items if row["photo_id"] == "new")
+        reviewed(store, project, new_id, shapes)
+        result = run(options)
+        assert result["images"] == 2 and result["incremental"]["added"] == 1 and result["incremental"]["skipped"] == 1
+        if task == "ocr":
+            reviewed(store, project, item_id, [ocr_shape("UPDATED", value_decimal=None)])
+            assert run(options)["incremental"]["updated"] == 1
+            if format_name == "paddleocr":
+                assert len((root / "det" / "all.txt").read_text(encoding="utf-8").splitlines()) == 2
+                lines = (root / "rec" / "all.txt").read_text(encoding="utf-8").splitlines()
+                assert len(lines) == 3 and sum(line.endswith("\tUPDATED") for line in lines) == 1
+                assert len(list((root / "recognition").glob("*.png"))) == 3
+                manifest = json.loads((root / "export_manifest.json").read_bytes())
+                assert manifest["ocr"]["splits"]["all"] == {"images": 2, "recognition_crops": 3}
+        assert run(options)["incremental"]["skipped"] == 2
+    finally:
+        jobs.shutdown()
+
+
 def test_ocr_rejects_yolo_formats_missing_images_augmentation_and_training(tmp_path):
     from labelpilot.inference import Inference, Jobs
     from labelpilot.training import TrainingJobs, training_selection
