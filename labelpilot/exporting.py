@@ -15,6 +15,7 @@ from typing import Optional
 from PIL import Image
 
 from .augmentation import augmentation_image, augmented_variants, plan_augmentation, validate_augmented_sample
+from .ocr import detection_entries, finish_ocr_export, verify_ocr_annotation, write_ocr_annotation
 from .export_acceleration import cache_key
 from .cleaning import clean_selection
 from .store import Problem, Project, digest, now, read_annotation_snapshot, source_group
@@ -167,8 +168,10 @@ def prepare_export(store, project_id, options, *, include_documents=False, check
     clean = options.get("clean", False)
     if any(type(value) is not bool for value in (reviewed_only, include_images, clean)):
         raise Problem("导出开关必须为布尔值", 422)
+    if format_name == "paddleocr" and not include_images:
+        raise Problem("PaddleOCR 导出需要包含原图，用于配对检测标签并生成识别裁剪", 422)
     augmentation = plan_augmentation(options)
-    if augmentation and project.task_type in ("semantic", "hand_pose"):
+    if augmentation and project.task_type not in ("detect", "segment"):
         raise Problem("当前导出增强仅适用于目标检测和实例分割", 422)
     if clean and not reviewed_only:
         raise Problem("清洗版数据集仅纳入已人工确认的图片", 422)
@@ -258,6 +261,10 @@ def describe_export(store, plan):
             raise Problem(f"{row['photo_id']} 的标注缺少有效的原图尺寸", 422)
         try:
             validate_export_document(store, plan.project, document, width, height, row["status"])
+            if plan.format_name == "paddleocr":
+                detection_entries(document)
+        except ValueError as exc:
+            raise Problem(f"{row['photo_id']}：{exc}", 422) from exc
         except Problem as exc:
             raise Problem(f"{row['photo_id']}：{exc.message}", exc.status) from exc
         shapes = document["shapes"]
@@ -339,7 +346,7 @@ def write_archive(store, plan, fingerprints):
     temporary = path.with_suffix(".zip.part")
     try:
         with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=2) as archive:
-            manifest = write_members(store, plan, archive, fingerprints)
+            manifest = write_members(store, plan, archive, fingerprints, verify=plan.project.task_type == "ocr")
         temporary.replace(path)
         return {"id": path.stem, "filename": path.name, "images": len(manifest["items"]), "split_counts": manifest["split_counts"],
                 "original_images": len(plan.rows), "augmented_images": plan.augmented_images,
@@ -421,7 +428,12 @@ def write_annotation(archive, format_name, project, document, image_name, subset
     suffix = f"/{subset}" if split_config else ""
     base_name = Path(image_name).stem
     width, height = document["imageWidth"], document["imageHeight"]
-    if format_name == "labelme":
+    if format_name == "paddleocr":
+        try:
+            write_ocr_annotation(archive, document, image_name, subset, split_config, coco_documents[subset])
+        except ValueError as exc:
+            raise Problem(f"OCR 导出失败：{exc}", 422) from exc
+    elif format_name == "labelme":
         document["imagePath"] = ("../../" if split_config else "../") + image_name
         document["imageData"] = None
         document["shapes"] = labelme_shapes(document["shapes"])
@@ -468,7 +480,12 @@ def verify_export_annotation(archive, format_name, project, document, image_name
     base_name = Path(image_name).stem
     shapes = document["shapes"]
     width, height = document["imageWidth"], document["imageHeight"]
-    if format_name == "labelme":
+    if format_name == "paddleocr":
+        try:
+            verify_ocr_annotation(archive, document, image_name, subset, split_config, coco_documents[subset])
+        except ValueError as exc:
+            reject(str(exc))
+    elif format_name == "labelme":
         decoded = json.loads(archive.read(f"annotations{suffix}/{base_name}.json"))
         if (decoded.get("shapes") != labelme_shapes(shapes) or decoded.get("imageWidth") != document["imageWidth"]
                 or decoded.get("imageHeight") != document["imageHeight"]
@@ -642,7 +659,7 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None, progre
         if plan.include_images:
             if source_contents is not None:
                 archive.writestr(image_name, source_contents)
-            elif verify or plan.cleaning is not None:
+            elif verify or plan.cleaning is not None or project.task_type == "ocr":
                 write_verified_image(archive, item["path"], image_name, current["image_sha256"])
             else:
                 archive.write(item["path"], image_name)
@@ -695,6 +712,11 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None, progre
             paths += f"kpt_shape: [{HAND_COUNT}, 3]\nflip_idx: {list(range(HAND_COUNT))}\n"
         archive.writestr("dataset.yaml", paths + "names:\n" + "\n".join(
             f"  {index}: {json.dumps(name, ensure_ascii=False)}" for index, name in enumerate(names)) + "\n")
+    if format_name == "paddleocr":
+        try:
+            finish_ocr_export(archive, coco_documents, manifest)
+        except ValueError as exc:
+            raise Problem(f"OCR 导出校验失败：{exc}", 422) from exc
     if format_name == "coco":
         for name, document in coco_documents.items():
             filename = f"annotations/{name}.json" if split_config else "annotations.json"

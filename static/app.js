@@ -257,7 +257,9 @@ async function saveCurrent(status="draft") {
   await workspaceResume.wait();
   if (!state.current || state.busy) return false;
   let confirmedEmpty = false;
-  const confirmEmpty = () => window.confirm("此图没有前景标注。确认确实不存在项目目标后，将作为已确认的负样本。");
+  const confirmEmpty = () => window.confirm(taskUi.type() === "ocr"
+    ? "确认本图没有需要转写的文字（如黑屏 / 空白显示）？将保存为无文字样本，不代表读数为 0。有文字但看不清时，请框出该区域并标为不可读。"
+    : "此图没有前景标注。确认确实不存在项目目标后，将作为已确认的负样本。");
   if (status === "reviewed" && state.current.document.shapes.length === 0) {
     confirmedEmpty = confirmEmpty();
     if (!confirmedEmpty) return false;
@@ -471,7 +473,7 @@ function renderObjects() {
   element("annotationSummary").textContent = shapes.length ? `${shapes.length} ${unit}` : "暂无标注";
   element("objectList").innerHTML = shapes.map((shape,index) => {
     const info = classInfo(shape.label);
-    const label = shape.erase ? "擦除区域" : info.name;
+    const label = shape.erase ? "擦除区域" : taskUi.type() === "ocr" ? shape.text_raw || "（未转写 / 不可读）" : info.name;
     const detail = shape.shape_type === "hand" ? `${shape.keypoints.filter(point => point[2]).length} / 21`
       : shape.score == null ? "人工" : `${Math.round(shape.score*100)}%`;
     return `<button class="object-row ${state.selected === index ? "selected" : ""}" data-shape="${index}" title="${escapeHtml(label)}"><span class="object-index">${index + 1}</span><i class="class-swatch" style="background:${info.color}"></i><span class="object-name">${escapeHtml(label)}</span><small>${detail}</small></button>`;
@@ -519,18 +521,20 @@ function renderLabelOptions() {
   element("pickerLabelOptions").innerHTML = labels.map(item => `<button type="button" class="picker-label-option ${item.id === state.activeClass ? "selected" : ""}" data-label="${escapeHtml(item.name)}"><i class="class-swatch" style="background:${item.color}"></i><span>${escapeHtml(item.name)}</span><small>${classCode(item)}</small></button>`).join("") || '<p class="picker-empty">没有匹配的已有标签，可直接创建新标签。</p>';
   const existing = state.project.classes.some(item => item.name === query);
   element("confirmPickedLabel").textContent = !query ? "使用当前标签" : existing ? "使用此标签" : "创建并使用";
+  if (ocrUi.active()) element("confirmPickedLabel").textContent = "保存文字标注";
   element("pickerCurrentLabel").textContent = `当前标签：${state.project.classes[state.activeClass].name}`;
   positionLabelPicker();
 }
 
 function openLabelPicker(points, anchor, kind="rectangle", details={}) {
   state.pendingShape = {points, anchor, kind, details};
+  ocrUi.beginPicker();
   element("pickerLabelInput").value = "";
   element("pickerLabelError").textContent = "";
   renderLabelOptions();
   element("labelPicker").showModal();
   positionLabelPicker();
-  element("confirmPickedLabel").focus({preventScroll:true});
+  element(ocrUi.active() ? "pickerOcrText" : "confirmPickedLabel").focus({preventScroll:true});
   draw();
 }
 
@@ -543,12 +547,21 @@ function cancelLabelPicker() {
 
 async function applyPickedLabel(name) {
   if (!state.pendingShape || state.labelPickerSaving || state.busy) return;
+  if (ocrUi.active() && name !== undefined) {
+    element("pickerLabelInput").value = name;
+    renderLabelOptions();
+    element("pickerOcrText").focus({preventScroll:true});
+    return;
+  }
+  let ocrDetails;
+  try { ocrDetails = ocrUi.pickedValues(); }
+  catch (error) { element("pickerLabelError").textContent = error.message; positionLabelPicker(); return; }
   const label = (name ?? element("pickerLabelInput").value).trim() || state.project.classes[state.activeClass].name;
   const pending = state.pendingShape;
   state.labelPickerSaving = true;
   updateLabelDeleteButtons();
   element("pickerLabelError").textContent = "";
-  element("labelPicker").querySelectorAll("button,input").forEach(node => {node.disabled = true;});
+  element("labelPicker").querySelectorAll("button,input,select").forEach(node => {node.disabled = true;});
   try {
     if (!state.project.classes.some(item => item.name === label)) {
       const project = await api(projectUrl("/labels"), "POST", {name:label});
@@ -558,7 +571,7 @@ async function applyPickedLabel(name) {
     state.activeClass = state.project.classes.findIndex(item => item.name === label);
     if (state.activeClass < 0) throw new Error("标签未创建成功，请重新选择");
     state.pendingShape = null;
-    addShape(pending.points, pending.kind, pending.details);
+    addShape(pending.points, pending.kind, {...pending.details, ...ocrDetails});
     renderClasses();
     setTool(state.tool === "polygon" ? "polygon" : efficiency.boxTool());
     element("labelPicker").close();
@@ -569,7 +582,7 @@ async function applyPickedLabel(name) {
   } finally {
     state.labelPickerSaving = false;
     updateLabelDeleteButtons();
-    element("labelPicker").querySelectorAll("button,input").forEach(node => {node.disabled = false;});
+    element("labelPicker").querySelectorAll("button,input,select").forEach(node => {node.disabled = false;});
     if (element("labelPicker").open) element("pickerLabelInput").focus({preventScroll:true});
   }
 }
@@ -699,7 +712,7 @@ function draw() {
     const [left,top] = bounds(shape);
     if (state.showLabels || selected) {
       const position=screenPoint([left,top]);
-      const label=shape.erase ? "擦除区域" : info.name+(shape.score == null?"":` ${Math.round(shape.score*100)}%`);
+      const label=shape.erase ? "擦除区域" : (task === "ocr" ? (shape.text_raw || "不可读 / 未转写").slice(0, 64) : info.name)+(shape.score == null?"":` ${Math.round(shape.score*100)}%`);
       context.font="10px 'Segoe UI','Microsoft YaHei',sans-serif";
       const textWidth=context.measureText(label).width+9;
       const textY=Math.max(0,position[1]-17);
@@ -767,6 +780,7 @@ function addShape(points,kind,details={}) {
 }
 function finishPolygon() {
   if (state.pendingShape) return;
+  if (taskUi.type() === "ocr" && state.polygon.length !== 4) return toast("OCR 请沿文字边缘依次点击四个角，再按 Q / Enter 完成", true);
   if(state.polygon.length<3)return toast("多边形至少需要三个顶点");
   const points=copy(state.polygon);
   if(points.length>3 && Math.hypot(points.at(-1)[0]-points.at(-2)[0],points.at(-1)[1]-points.at(-2)[1])*state.scale<3)points.pop();

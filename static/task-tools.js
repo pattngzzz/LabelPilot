@@ -1,8 +1,9 @@
 "use strict";
 
 const taskUi = (() => {
-  const names = {detect:"目标检测", segment:"实例分割", semantic:"语义分割", hand_pose:"手部姿态"};
+  const names = {detect:"目标检测", segment:"实例分割", semantic:"语义分割", hand_pose:"手部姿态", ocr:"OCR 文字与读数"};
   const instructions = {
+    ocr:"R 框文字 · P 顺序标四角、Q 完成 · 填写原文与可读性 · E 审核下一张",
     detect:"R 两次点击画框 · Esc 取消 · A / D 翻页",
     segment:"R 画定位框 · SAM3 按框生成轮廓 · P 描轮廓 · Q 完成",
     semantic:"P 圈区域 · B 画笔 · X 橡皮 · 按类别生成像素掩膜",
@@ -55,7 +56,8 @@ const taskUi = (() => {
     if (!formats.selectedOptions.length || formats.selectedOptions[0].disabled) {
       formats.value = Array.from(formats.options).find(option => !option.disabled).value;
     }
-    element("augmentationSettings").hidden = task === "semantic" || task === "hand_pose";
+    if (task === "ocr") formats.value = "paddleocr";
+    element("augmentationSettings").hidden = !["detect", "segment"].includes(task);
     if (element("augmentationSettings").hidden) element("augmentationPreset").value = "none";
     element("acceptPrompt").textContent = isMaskTask() ? "采用分割建议" : "采用候选框";
     element("jointSelect").replaceChildren(...(state.project.keypoints || []).map((point, index) =>
@@ -89,6 +91,7 @@ const taskUi = (() => {
   }
 
   function render() {
+    ocrUi.render();
     const hand = selectedHand();
     const handTool = type() === "hand_pose" && state.tool === "hand";
     const next = newHand?.points.length || 0;
@@ -368,8 +371,10 @@ const taskUi = (() => {
   }
 
   function install() {
+    ocrUi.install();
     document.querySelectorAll('[name="projectTask"]').forEach(node => node.addEventListener("change", () => {
-      element("newClasses").placeholder = projectTask() === "hand_pose" ? "hand（留空也会使用此类别）" : "class_a\nclass_b";
+      element("newClasses").placeholder = projectTask() === "hand_pose" ? "hand（留空也会使用此类别）"
+        : projectTask() === "ocr" ? "text（留空也会使用此类别）" : "class_a\nclass_b";
     }));
     listen("maskOpacity", "input", draw);
     listen("brushRadius", "input", () => { element("brushRadiusValue").textContent = element("brushRadius").value + " px"; });

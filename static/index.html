@@ -12,6 +12,7 @@
   <script src="/static/resume.js?v=__ASSET_VERSION__" defer></script>
   <script src="/static/automation.js?v=__ASSET_VERSION__" defer></script>
   <script src="/static/task-tools.js?v=__ASSET_VERSION__" defer></script>
+  <script src="/static/ocr.js?v=__ASSET_VERSION__" defer></script>
   <script src="/static/app.js?v=__ASSET_VERSION__" defer></script>
   <script src="/static/sam3.js?v=__ASSET_VERSION__" defer></script>
 </head>
@@ -19,7 +20,7 @@
   <aside class="rail">
     <div class="logo" title="现实回环"><img src="/static/realityloop.png?v=__ASSET_VERSION__" alt="现实回环"></div>
     <button class="rail-button active" id="workspaceButton" title="标注工作台"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></button>
-    <button class="rail-button" id="modelSettings" title="基线模型与批量预标注"><svg viewBox="0 0 24 24"><path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5Z"/></svg></button>
+    <button class="rail-button" id="modelSettings" data-tasks="detect segment semantic hand_pose" title="基线模型与批量预标注"><svg viewBox="0 0 24 24"><path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5Z"/></svg></button>
     <button class="rail-button" id="railExport" title="导出数据集"><svg viewBox="0 0 24 24"><path d="M12 3v12m-4-4 4 4 4-4M4 15v6h16v-6"/></svg></button>
     <div class="rail-spacer"></div>
     <span class="local-dot" title="仅本机运行"></span>
@@ -36,9 +37,9 @@
         <span class="privacy"><i></i> 本地工作区</span>
         <button class="button" id="cleanButton">一键清洗</button>
         <button class="button" id="exportButton">导出数据集</button>
-        <button class="button primary" id="trainingButton">一键训练</button>
+        <button class="button primary" id="trainingButton" data-tasks="detect segment semantic hand_pose">一键训练</button>
         <button class="button" id="comparisonButton" data-tasks="detect">模型对比</button>
-        <button class="button" id="automationButton">自动流程</button>
+        <button class="button" id="automationButton" data-tasks="detect segment semantic hand_pose">自动流程</button>
       </div>
     </header>
     <section class="overview">
@@ -78,11 +79,11 @@
       </aside>
       <section class="editor panel">
         <div class="editor-heading"><div><strong id="imageTitle">选择图片开始标注</strong><span id="imageMeta"></span></div><div class="editor-status"><span id="dirtyBadge" class="dirty" hidden>未保存</span><span id="statusBadge" class="pill">未开始</span><button class="icon-button" id="historyButton" title="保存历史与恢复">↶</button></div></div>
-        <div class="editor-toolbar"><div class="tool-group"><button class="tool active" data-tool="select" title="选择 / 移动 (V)">↖</button><button class="tool" data-tool="rectangle" data-tasks="detect segment" title="矩形框 (R)" aria-label="矩形框">▢</button><button class="tool" data-tool="polygon" data-tasks="detect segment semantic" title="多边形 (P)" aria-label="多边形">⬡</button>
+        <div class="editor-toolbar"><div class="tool-group"><button class="tool active" data-tool="select" title="选择 / 移动 (V)">↖</button><button class="tool" data-tool="rectangle" data-tasks="detect segment ocr" title="矩形框 (R)" aria-label="矩形框">▢</button><button class="tool" data-tool="polygon" data-tasks="detect segment semantic ocr" title="多边形 (P)" aria-label="多边形">⬡</button>
           <button class="tool task-tool" data-tool="brush" data-tasks="semantic" title="画笔 (B)" hidden>画笔</button>
           <button class="tool task-tool" data-tool="erase" data-tasks="semantic" title="橡皮 (X)" hidden>橡皮</button>
           <button class="tool task-tool" data-tool="hand" data-tasks="hand_pose" title="添加手部关键点 (K)" hidden>＋ 手部</button>
-          <button class="tool" data-tool="pan" title="平移 (H / 按住空格)">✥</button></div><span class="divider"></span><button class="tool" id="undoButton" title="撤销 (Ctrl+Z)">↶</button><button class="tool" id="redoButton" title="重做 (Ctrl+Shift+Z)">↷</button><div class="toolbar-space"></div><button class="tool" id="zoomOut" title="缩小">−</button><button class="zoom-label" id="fitButton" title="适应画布 (F)">100%</button><button class="tool" id="zoomIn" title="放大">＋</button><button class="button focus-toggle" id="focusButton" title="放大 / 恢复画布工作区 (Tab)" aria-pressed="false">⛶ 大画布</button><button class="button magic" id="predictButton">✦ 模型预标注</button>
+          <button class="tool" data-tool="pan" title="平移 (H / 按住空格)">✥</button></div><span class="divider"></span><button class="tool" id="undoButton" title="撤销 (Ctrl+Z)">↶</button><button class="tool" id="redoButton" title="重做 (Ctrl+Shift+Z)">↷</button><div class="toolbar-space"></div><button class="tool" id="zoomOut" title="缩小">−</button><button class="zoom-label" id="fitButton" title="适应画布 (F)">100%</button><button class="tool" id="zoomIn" title="放大">＋</button><button class="button focus-toggle" id="focusButton" title="放大 / 恢复画布工作区 (Tab)" aria-pressed="false">⛶ 大画布</button><button class="button magic" id="predictButton" data-tasks="detect segment semantic hand_pose">✦ 模型预标注</button>
           <button class="button sam3-button" id="sam3Button" data-tasks="detect segment" type="button">✦ SAM3 辅助</button>
           <select id="efficiencyMode" aria-label="标注模式"><option value="">常规标注</option><option value="fast">逐对象快审</option><option value="sequence" data-tasks="detect">连续帧</option><option value="fourpoint" data-tasks="detect">四点画框</option><option value="prompt" data-tasks="detect segment semantic">点选辅助</option></select>
         </div>
@@ -128,9 +129,9 @@
           <label>关键点<select id="jointSelect"></select></label>
           <label>可见性<select id="jointVisibility"><option value="2">可见</option><option value="1">遮挡</option><option value="0">未标注</option></select></label>
           <button class="button" type="button" id="placeJoint">在画布定位</button>
-        </div><label>描述 / 原有属性备注<textarea id="shapeDescription" rows="3" placeholder="如 readability=unreadable"></textarea></label><label class="check"><input type="checkbox" id="shapeDifficult">难例 / 遮挡</label><button class="button danger" id="deleteShape">删除选中对象 <kbd>Del</kbd></button></div></div>
+        </div><div id="ocrShapeFields" hidden></div><label>描述 / 原有属性备注<textarea id="shapeDescription" rows="3" placeholder="如 readability=unreadable"></textarea></label><label class="check"><input type="checkbox" id="shapeDifficult">难例 / 遮挡</label><button class="button danger" id="deleteShape">删除选中对象 <kbd>Del</kbd></button></div></div>
         <div class="inspector-content" id="classesContent" hidden><p class="muted class-note" id="classesHint">选择标签后开始标注；右侧 × 删除未使用标签。</p><div id="classList"></div></div>
-        <div class="inspector-bottom"><div class="model-chip"><span class="model-symbol">✦</span><div><strong>基线模型辅助</strong><span id="modelCaption">本地模型 · 按需加载</span></div><button class="icon-button" id="modelSettingsSmall" title="设置模型">⚙</button></div><p>预标注仅是建议，确认前不作为已审核真值。</p><div id="jobStatus" hidden></div></div>
+        <div class="inspector-bottom" data-tasks="detect segment semantic hand_pose"><div class="model-chip"><span class="model-symbol">✦</span><div><strong>基线模型辅助</strong><span id="modelCaption">本地模型 · 按需加载</span></div><button class="icon-button" id="modelSettingsSmall" title="设置模型">⚙</button></div><p>预标注仅是建议，确认前不作为已审核真值。</p><div id="jobStatus" hidden></div></div>
       </aside>
     </main>
     <footer class="statusbar"><span><i class="dot green"></i><span id="connectionStatus">本地工作区</span></span><span id="activeClassText">绘制类别：—</span><button id="keyboardHelp">快捷键 <kbd>?</kbd></button></footer>
@@ -160,7 +161,7 @@
           <button class="button" type="button" id="chooseExportFolder">选择导出文件夹…</button>
           <p id="exportDestinationHint" class="muted">弹出系统文件夹选择窗口。将在所选位置新建独立数据集目录，不覆盖已有文件，不生成 ZIP。</p>
         </div>
-        <label>导出格式<select id="exportFormat"><option value="yolo" data-tasks="detect segment hand_pose">YOLO</option><option value="labelme" data-tasks="detect segment">Labelme / X-AnyLabeling</option><option value="coco" data-tasks="detect segment hand_pose">COCO</option><option value="mask" data-tasks="semantic" hidden>PNG 类别掩膜</option></select></label>
+        <label>导出格式<select id="exportFormat"><option value="yolo" data-tasks="detect segment hand_pose">YOLO</option><option value="labelme" data-tasks="detect segment ocr">Labelme / X-AnyLabeling</option><option value="coco" data-tasks="detect segment hand_pose">COCO</option><option value="mask" data-tasks="semantic" hidden>PNG 类别掩膜</option><option value="paddleocr" data-tasks="ocr" hidden>PaddleOCR · 检测＋识别裁剪</option></select></label>
         <label data-tasks="detect segment">标注用途<select id="exportOutputTask"><option value="detect">目标检测（轮廓转外接框）</option><option value="segment">实例分割（保留对象轮廓）</option></select></label><label>批次<select id="exportBatch"><option value="">全部批次</option></select></label>
         <label class="check"><input type="checkbox" id="reviewedOnly" checked>仅纳入已人工确认的标注</label>
         <label class="check"><input type="checkbox" id="includeImages" checked>包含原图副本</label>
@@ -532,12 +533,14 @@
         <label class="task-option"><input type="radio" name="projectTask" value="segment"><span><strong>实例分割</strong><small>为每个对象描出轮廓</small></span></label>
         <label class="task-option"><input type="radio" name="projectTask" value="semantic"><span><strong>语义分割</strong><small>把像素划分为类别区域</small></span></label>
         <label class="task-option"><input type="radio" name="projectTask" value="hand_pose"><span><strong>手部姿态</strong><small>逐手标注 21 个关键点</small></span></label>
+        <label class="task-option"><input type="radio" name="projectTask" value="ocr"><span><strong>OCR 文字与读数</strong><small>文字位置、原文及可读性</small></span></label>
       </fieldset>
       <label for="newImageRoot">图片目录</label>
       <div class="model-path-row"><input id="newImageRoot" placeholder="点击右侧按钮选择，路径会自动填入"><button type="button" class="button" id="chooseImageFiles" title="打开 Windows 文件选择窗口，可多选图片">选择图片文件</button><button type="button" class="button" id="chooseImageFolder" title="打开 Windows 文件夹选择窗口">选择文件夹</button></div>
       <p id="newImageSelection" class="model-selection-status" role="status">文件夹模式：读取目录及子目录内的图片；文件模式：仅导入明确选中的图片。</p>
       <button type="button" class="button" id="useEntireImageFolder" hidden>改为整个文件夹（含子目录）</button>
       <div class="form-row"><label>原生 Labelme 标注目录（选填）<input id="newAnnotationRoot"></label><label>模型预标注目录（选填）<input id="newPreannotationRoot"></label></div>
+      <p class="muted" id="newOcrHint" hidden>OCR：每行文字或每个数值单元单独标注。类别留空默认 text；原文在框选后填写，不要把每个读数建为新类别。无需配置 YOLO 模型。</p>
       <label>有序类别（每行一个，顺序即 ID）<textarea id="newClasses" rows="4" placeholder="class_a&#10;class_b"></textarea></label>
       <label>或类别映射文件（优先）<input id="newClassMap" placeholder="class_map.json 的 names 字典，或 classes.txt"></label>
       <label>本地模型（选填）<input id="newModelPath" placeholder="D:\models\best.pt"></label><label>华聚式 task_manifest.json（选填）<input id="newManifest"></label>
@@ -548,6 +551,7 @@
     <div class="dialog-heading"><h2 id="labelPickerTitle">选择标签</h2><button type="button" class="icon-button" id="closeLabelPicker" aria-label="取消本次框选">×</button></div>
     <form id="pickerLabelForm" class="picker-body">
       <p id="labelPickerHelp">Q / Enter 确认当前标签；也可点击已有标签，或点击输入框输入新名称后按 Enter 确认。输入时 q 仍是标签文字。</p>
+      <div id="ocrPickerFields" hidden></div>
       <input id="pickerLabelInput" maxlength="160" placeholder="搜索或输入自定义标签" aria-label="搜索或自定义标签" autocomplete="off">
       <div id="pickerLabelOptions" class="picker-label-options" role="group" aria-label="已有标签"></div>
       <small id="pickerCurrentLabel"></small>

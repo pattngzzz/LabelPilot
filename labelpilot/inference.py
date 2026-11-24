@@ -135,6 +135,8 @@ class Inference:
     def predict(self, project_id, item_id, options, *, model_path=None, model_sha256=None):
         project = self.store.project(project_id)
         task = project.task_type
+        if task == "ocr":
+            raise Problem("OCR 当前支持人工标注和导出，尚未接入文字预识别；不能使用 YOLO 代替 OCR", 422)
         path = Path(model_path or project.config.get("model_path", ""))
         if path.suffix.lower() != ".pt" or not path.is_file():
             raise Problem("未配置可信的本地 .pt 模型；不会联网下载权重", 422)
@@ -250,6 +252,8 @@ class Jobs:
 
     def start(self, project_id, options, *, audit=False, routing=False, task_id=None, pinned_model=None):
         project = self.store.project(project_id)
+        if project.task_type == "ocr":
+            raise Problem("OCR 当前支持人工标注和导出，尚未接入批量文字预识别", 422)
         limit = options.get("limit", 100)
         query, batch = options.get("query", ""), options.get("batch", "")
         if type(limit) is not int or not 1 <= limit <= 10000:

@@ -63,6 +63,8 @@ def has_training_dependencies():
 
 def training_selection(store, project_id, options, checkpoint=None):
     task = store.project(project_id).task_type
+    if task == "ocr":
+        raise Problem("请导出 PaddleOCR 数据后单独训练文字模型；OCR 不使用 YOLO 一键训练", 422)
     data_options = {"format": EXPORT_FORMATS[task][0], "batch": options["batch"], "clean": True}
     if task in ("detect", "segment"):
         data_options["output_task"] = task
@@ -119,6 +121,8 @@ class TrainingJobs:
 
     def start(self, project_id, payload, *, task_id=None, starting_weights=None, expected_dataset=None):
         project = self.store.project(project_id)
+        if project.task_type == "ocr":
+            raise Problem("请导出 PaddleOCR 数据后单独训练文字模型；OCR 不使用 YOLO 一键训练", 422)
         options = training_options(project, payload)
         if not has_training_dependencies():
             raise Problem("当前 Python 缺少 PyTorch 或 Ultralytics，请使用安装了 LabelPilot 依赖的环境", 422)

@@ -2051,7 +2051,7 @@ def test_delete_label_removes_only_target_model_aliases(store):
 def test_asset_versions_change_with_frontend_content(dataset, tmp_path, monkeypatch):
     assets = tmp_path / "frontend"
     assets.mkdir()
-    for name in ("index.html", "efficiency.js", "resume.js", "automation.js", "task-tools.js",
+    for name in ("index.html", "efficiency.js", "resume.js", "automation.js", "task-tools.js", "ocr.js",
                  "sam3.js", "app.js", "style.css", "realityloop.png"):
         (assets / name).write_bytes((server.ASSETS / name).read_bytes())
     monkeypatch.setattr(server, "ASSETS", assets)
@@ -2063,7 +2063,7 @@ def test_asset_versions_change_with_frontend_content(dataset, tmp_path, monkeypa
         assert f'/static/style.css?v={version}' in page.text
         assert f'/static/efficiency.js?v={version}' in page.text
         assert version in client.get("/").text
-        for name in ("efficiency.js", "resume.js", "automation.js", "app.js", "style.css"):
+        for name in ("efficiency.js", "resume.js", "automation.js", "ocr.js", "app.js", "style.css"):
             for suffix in ("", f"?v={version}"):
                 response = client.get(f"/static/{name}{suffix}")
                 assert response.status_code == 200

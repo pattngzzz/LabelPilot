@@ -1135,8 +1135,8 @@ print('Rotation ZIP: all angles, dimensions, exact normalized boxes and train-on
     };
     if (await evaluate('element("autoDraft").checked')) await click("#autoDraft");
     await click("#newProjectButton");
-    await check('document.querySelector(".logo img").naturalWidth>0 && document.querySelectorAll(".task-option").length===4',
-      "The RealityLoop logo loads and the project dialog offers four task types");
+    await check('document.querySelector(".logo img").naturalWidth>0 && document.querySelectorAll(".task-option").length===5',
+      "The RealityLoop logo loads and the project dialog offers five task types including OCR");
     const taskNamesFit = `Array.from(document.querySelectorAll(".task-option")).every(tile =>
       tile.querySelector("span").getBoundingClientRect().right <= tile.getBoundingClientRect().right)`;
     await check(taskNamesFit, "Task names and descriptions fit inside the desktop choices");
@@ -1276,6 +1276,57 @@ print('Rotation ZIP: all angles, dimensions, exact normalized boxes and train-on
       "Semantic export is ready with a per-pixel PNG mask");
     await evaluate('element("exportDialog").close()');
 
+    await createTask("ocr", "");
+    await check('state.project.classes[0].name==="text" && element("projectTask").textContent==="OCR 文字与读数" && element("predictButton").hidden && element("trainingButton").hidden',
+      "OCR defaults to the text class and does not expose unsupported YOLO inference or training");
+    await box([35,50], [180,85]);
+    await check('!element("ocrPickerFields").hidden && document.activeElement.id==="pickerOcrText" && element("pickerOcrPreview").width>0',
+      "Drawing a text region opens transcription with a local enlarged preview");
+    await cdp("Emulation.setDeviceMetricsOverride", {width:420,height:850,deviceScaleFactor:1,mobile:false});
+    await sleep(80);
+    await check('(()=>{const rect=element("labelPicker").getBoundingClientRect();return rect.left>=0 && rect.top>=0 && rect.right<=innerWidth && rect.bottom<=innerHeight;})()',
+      "OCR transcription and its preview remain within a narrow viewport");
+    await cdp("Emulation.setDeviceMetricsOverride", {width:1600,height:1000,deviceScaleFactor:1,mobile:false});
+    await click("#confirmPickedLabel");
+    await check('element("labelPicker").open && state.current.document.shapes.length===0 && element("pickerLabelError").textContent.includes("原文")',
+      "A readable OCR region cannot be silently accepted without its transcription");
+    await click("#pickerOcrText");
+    await cdp("Input.insertText", {text:"00.250 g"});
+    await click("#confirmPickedLabel");
+    await waitFor('!element("labelPicker").open && state.current.document.shapes.length===1');
+    await setReviewValue("shapeOcrValue", "00.250");
+    await setReviewValue("shapeOcrUnit", "g");
+    await setReviewValue("shapeOcrRole", "process_value");
+    await check('state.current.document.shapes[0].text_raw==="00.250 g" && state.current.document.shapes[0].value_decimal==="00.250" && element("objectList").textContent.includes("00.250 g")',
+      "Original text and precision-preserving decimal values are separate editable fields");
+    await click('[data-tool="select"]');
+    await press("e", "KeyE");
+    await waitFor('state.items.some(item=>item.status==="reviewed") && !state.busy');
+    await press("a", "KeyA");
+    await waitFor('state.current?.status==="reviewed" && !state.busy');
+    await check('state.current.document.shapes[0].text_raw==="00.250 g" && state.current.document.shapes[0].unit==="g"',
+      "E reviews OCR annotations and reload preserves their text, unit and metadata");
+    await click('[data-shape="0"]');
+    await evaluate('element("toasts").replaceChildren()');
+    fs.writeFileSync(path.join(home,"ocr-workspace.png"), Buffer.from((await cdp("Page.captureScreenshot", {format:"png"})).data,"base64"));
+    await press("p", "KeyP");
+    for (const coordinate of [[190,50],[280,55],[275,90],[190,85]]) await mouseClick(await point(coordinate));
+    await press("q", "KeyQ");
+    await waitFor('element("labelPicker").open');
+    await setReviewValue("pickerOcrReadability", "unreadable");
+    await click("#confirmPickedLabel");
+    await waitFor('state.current.document.shapes.length===2 && !element("labelPicker").open');
+    await check('state.current.document.shapes[1].shape_type==="polygon" && state.current.document.shapes[1].readability==="unreadable" && state.current.document.shapes[1].text_raw===""',
+      "Four-corner OCR regions can record unreadable text without inventing zero");
+    await click("#saveButton");
+    await waitFor('state.current.status==="draft" && !state.dirty && !state.busy');
+    await click("#reviewButton");
+    await waitFor('state.items.some(item=>item.status==="reviewed") && !state.busy');
+    await click("#exportButton");
+    await waitFor('element("exportDialog").open && exportPreview.plan');
+    await check('element("exportFormat").value==="paddleocr" && !exportPreview.plan.data.blocking_issue && element("augmentationSettings").hidden',
+      "OCR export selects PaddleOCR and keeps unsafe detection augmentation disabled");
+    await evaluate('element("exportDialog").close()');
     await createTask("hand_pose", "");
     await click('[data-tool="hand"]');
     await mouseClick(await point([130,147]));

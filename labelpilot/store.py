@@ -12,6 +12,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from .ocr import validate_ocr_shape
 from .tasks import BACKGROUND, HAND_KEYPOINTS, HAND_SKELETON, MAX_MASK_PIXELS, SHAPE_TYPES, polygon_area, read_mask, semantic_mask, validate_hand
 
 
@@ -400,6 +401,8 @@ class Store:
         config["id"] = uuid.uuid4().hex[:12]
         if config.get("task_type") == "hand_pose" and not (config.get("classes") or config.get("class_map_path")):
             config["classes"] = ["hand"]
+        if config.get("task_type") == "ocr" and not (config.get("classes") or config.get("class_map_path")):
+            config["classes"] = ["text"]
         if not isinstance(config.get("name"), str) or not config["name"].strip():
             raise Problem("请填写项目名称")
         root = Path(config.get("image_root", "")).resolve()
@@ -811,6 +814,8 @@ class Store:
                     read_mask(shape)
                 elif kind == "hand":
                     validate_hand(shape, (left, top, right, bottom))
+                if task == "ocr":
+                    validate_ocr_shape(shape, reviewed=status == "reviewed")
             except ValueError as exc:
                 raise Problem(str(exc), 422) from exc
         empty = not shapes

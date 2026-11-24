@@ -7,12 +7,14 @@ from PIL import Image, ImageDraw
 
 
 SHAPE_TYPES = {
+    "ocr": ("rectangle", "polygon"),
     "detect": ("rectangle", "polygon"),
     "segment": ("rectangle", "polygon"),
     "semantic": ("polygon", "brush", "mask"),
     "hand_pose": ("hand",),
 }
 EXPORT_FORMATS = {
+    "ocr": ("paddleocr", "labelme"),
     "detect": ("yolo", "labelme", "coco"),
     "segment": ("yolo", "labelme", "coco"),
     "semantic": ("mask",),

@@ -52,6 +52,181 @@ def archive(store, project, format_name):
     return zipfile.ZipFile(store.home / "exports" / result["filename"])
 
 
+def ocr_shape(text="00.250 g", **attributes):
+    return {"label": "text", "shape_type": "rectangle", "points": [[5, 8], [65, 28]],
+            "text_raw": text, "readability": "readable", "value_role": "process_value",
+            "value_decimal": "00.250", "unit": "g", "parent_id": "panel-001", **attributes}
+
+
+def test_ocr_default_class_and_precise_text_survive_revision_and_reload(tmp_path):
+    store, project, item = project_with_image(tmp_path, "ocr")
+    source = Path(project.item(item)["path"]).read_bytes()
+    shape = ocr_shape("型号 ABC-001  00.250 g", custom_attribute={"keep": True})
+    first = reviewed(store, project, item, [shape])
+    assert project.names == ["text"] and first["document"]["shapes"] == [shape]
+    restored = Store(store.home).detail(project.id, item)
+    assert restored["document"]["shapes"] == [shape]
+    assert restored["version"] == 1 and restored["status"] == "reviewed"
+    assert Path(project.item(item)["path"]).read_bytes() == source
+    with archive(store, project, "labelme") as exported:
+        annotation = next(name for name in exported.namelist() if name.startswith("annotations/"))
+        assert json.loads(exported.read(annotation))["shapes"] == [shape]
+
+
+@pytest.mark.parametrize("attributes", [
+    {"text_raw": ""}, {"text_raw": "  "}, {"text_raw": "###"}, {"text_raw": "123\t456"},
+    {"text_raw": "123\n456"}, {"text_raw": "123\u2028abc"}, {"text_raw": 12}, {"readability": "blank"}, {"value_role": "guess"},
+    {"value_decimal": 0.25}, {"value_decimal": "NaN"}, {"value_decimal": "0x250"},
+    {"value_decimal": "1e3"}, {"readability": "partial"}, {"readability": "unreadable"},
+    {"shape_type": "polygon", "points": [[5, 8], [65, 28], [65, 8], [5, 28]]},
+    {"shape_type": "polygon", "points": [[5, 8], [65, 8], [5, 28]]},
+])
+def test_ocr_invalid_review_is_rejected_without_saving(tmp_path, attributes):
+    store, project, item = project_with_image(tmp_path, "ocr")
+    with pytest.raises(Problem) as error:
+        reviewed(store, project, item, [ocr_shape(**attributes)])
+    assert error.value.status == 422
+    assert store.detail(project.id, item)["version"] == 0
+
+
+def test_ocr_draft_can_wait_for_transcription_but_training_export_cannot(tmp_path):
+    store, project, item = project_with_image(tmp_path, "ocr")
+    current = store.detail(project.id, item)
+    document = {**current["document"], "shapes": [ocr_shape("", value_decimal=None)]}
+    store.save(project.id, item, {**current, "document": document, "status": "draft", "expected_version": 0})
+    assert store.detail(project.id, item)["document"]["shapes"][0]["text_raw"] == ""
+    with pytest.raises(Problem, match="原文"):
+        preview_export(store, project.id, {"format": "paddleocr", "reviewed_only": False})
+
+
+def test_ocr_training_export_preserves_text_and_excludes_unreadable_recognition(tmp_path):
+    store, project, item = project_with_image(tmp_path, "ocr")
+    readable = ocr_shape()
+    partial = ocr_shape("1?3", readability="partial", value_decimal=None)
+    unreadable = ocr_shape(None, readability="unreadable", value_decimal=None)
+    reviewed(store, project, item, [readable, partial, unreadable])
+    original = Path(project.item(item)["path"]).read_bytes()
+    assert preview_export(store, project.id, {"format": "paddleocr"})["annotations"] == 3
+    with archive(store, project, "paddleocr") as exported:
+        image_name, encoded = exported.read("det/all.txt").decode().rstrip("\n").split("\t", 1)
+        entries = json.loads(encoded)
+        assert [entry["transcription"] for entry in entries] == ["00.250 g", "###", "###"]
+        assert entries[0]["points"] == [[5, 8], [65, 8], [65, 28], [5, 28]]
+        crop_name, text = exported.read("rec/all.txt").decode().rstrip("\n").split("\t", 1)
+        assert text == "00.250 g" and exported.read(image_name) == original
+        with Image.open(io.BytesIO(exported.read(crop_name))) as crop:
+            assert crop.size == (60, 20) and crop.mode == "RGB"
+        assert len([name for name in exported.namelist() if name.startswith("recognition/")]) == 1
+        metadata = json.loads(exported.read(next(name for name in exported.namelist() if name.startswith("annotations/"))))
+        assert metadata["shapes"] == [readable, partial, unreadable]
+        manifest = json.loads(exported.read("export_manifest.json"))
+        assert manifest["ocr"]["splits"]["all"] == {"images": 1, "recognition_crops": 1}
+        assert manifest["integrity_check"]["passed"] is True
+    assert Path(project.item(item)["path"]).read_bytes() == original
+
+
+def test_ocr_confirmed_blank_is_not_zero_or_a_recognition_sample(tmp_path):
+    store, project, item = project_with_image(tmp_path, "ocr")
+    with pytest.raises(Problem, match="空标注"):
+        reviewed(store, project, item, [])
+    reviewed(store, project, item, [], confirmed_empty=True)
+    with archive(store, project, "paddleocr") as exported:
+        assert json.loads(exported.read("det/all.txt").decode().strip().split("\t", 1)[1]) == []
+        assert exported.read("rec/all.txt") == b""
+        assert not any(name.startswith("recognition/") for name in exported.namelist())
+
+
+@pytest.mark.parametrize("points", [
+    [[5, 8], [65, 10], [60, 28], [8, 25]],
+    [[8, 25], [60, 28], [65, 10], [5, 8]],
+])
+def test_ocr_slanted_quadrilateral_preserves_points_and_text(tmp_path, points):
+    store, project, item = project_with_image(tmp_path, "ocr")
+    shape = ocr_shape("-01.20 °C", shape_type="polygon", points=points, value_decimal="-01.20", unit="°C")
+    reviewed(store, project, item, [shape])
+    with archive(store, project, "paddleocr") as exported:
+        entries = json.loads(exported.read("det/all.txt").decode().strip().split("\t", 1)[1])
+        assert entries == [{"transcription": "-01.20 °C", "points": points}]
+        assert exported.read("rec/all.txt").decode().endswith("\t-01.20 °C\n")
+
+
+def test_ocr_empty_text_is_not_auto_populated_with_zero(tmp_path):
+    store, project, item = project_with_image(tmp_path, "ocr")
+    reviewed(store, project, item, [ocr_shape(None, readability="unreadable", value_decimal=None)])
+    with archive(store, project, "paddleocr") as exported:
+        assert exported.read("rec/all.txt") == b""
+        entries = json.loads(exported.read("det/all.txt").decode().strip().split("\t", 1)[1])
+        assert entries[0]["transcription"] == "###"
+
+
+def test_ocr_perspective_crop_is_not_mirrored_and_preserves_source_pixels():
+    from PIL import ImageDraw
+    from labelpilot.ocr import recognition_crop
+
+    source = Image.new("RGB", (80, 60), "white")
+    painter = ImageDraw.Draw(source)
+    painter.rectangle((9, 9, 18, 18), fill="red")
+    painter.rectangle((51, 9, 60, 18), fill="blue")
+    before = source.tobytes()
+    crop = recognition_crop(source, [[10, 10], [60, 10], [60, 30], [10, 30]])
+    assert crop.size == (50, 20)
+    assert crop.getpixel((2, 2)) == (255, 0, 0)
+    assert crop.getpixel((47, 2)) == (0, 0, 255)
+    assert source.tobytes() == before
+
+
+def test_ocr_folder_export_inherits_original_split_for_all_crops(tmp_path):
+    store, project, item = project_with_image(tmp_path, "ocr")
+    for index in range(1, 4):
+        Image.new("RGB", (80, 60), (index * 40, 0, 0)).save(project.root / f"frame{index}.png")
+    store.rescan(project.id)
+    project = store.project(project.id)
+    for row in project.items:
+        reviewed(store, project, row["id"], [ocr_shape()])
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    jobs = ExportJobs(store)
+    record = jobs.start(project.id, {"format": "paddleocr", "destination": str(destination),
+                                    "split": {"train": 50, "val": 25, "test": 25, "seed": 42}})
+    jobs.worker.join(timeout=20)
+    result = jobs.get(project.id, record["id"])
+    assert result["status"] == "completed", result
+    output = Path(result["result"]["directory"])
+    manifest = json.loads((output / "export_manifest.json").read_text(encoding="utf-8"))
+    for subset, count in (("train", 2), ("val", 1), ("test", 1)):
+        assert manifest["ocr"]["splits"][subset] == {"images": count, "recognition_crops": count}
+        lines = (output / "rec" / f"{subset}.txt").read_text(encoding="utf-8").splitlines()
+        for line in lines:
+            name, text = line.split("\t", 1)
+            assert name.startswith(f"recognition/{subset}/") and (output / name).is_file()
+            assert text == "00.250 g"
+    jobs.shutdown()
+
+
+def test_ocr_rejects_yolo_formats_missing_images_augmentation_and_training(tmp_path):
+    from labelpilot.inference import Inference, Jobs
+    from labelpilot.training import TrainingJobs, training_selection
+
+    store, project, item = project_with_image(tmp_path, "ocr")
+    reviewed(store, project, item, [ocr_shape()])
+    with pytest.raises(Problem, match="格式"):
+        preview_export(store, project.id, {"format": "yolo"})
+    with pytest.raises(Problem, match="包含原图"):
+        preview_export(store, project.id, {"format": "paddleocr", "include_images": False})
+    with pytest.raises(Problem):
+        preview_export(store, project.id, {"format": "paddleocr", "augmentation": {"preset": "all", "copies": 1}})
+    inference = Inference(store)
+    jobs = Jobs(store, inference)
+    with pytest.raises(Problem, match="OCR"):
+        inference.predict(project.id, item, {})
+    with pytest.raises(Problem, match="OCR"):
+        jobs.start(project.id, {})
+    with pytest.raises(Problem, match="OCR"):
+        training_selection(store, project.id, {})
+    with pytest.raises(Problem, match="OCR"):
+        TrainingJobs(store, inference, jobs).start(project.id, {})
+
+
 def test_instance_polygons_export_as_distinct_same_class_objects(tmp_path):
     store, project, item = project_with_image(tmp_path, "segment", ["part"])
     first, second = polygon("part", 3, 4, 18, 21), polygon("part", 24, 20, 32, 29)
