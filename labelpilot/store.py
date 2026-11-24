@@ -568,13 +568,21 @@ class Store:
     def overlay(self, project_id, include_documents=False, include_review=False):
         overlays = {}
         with self.connect() as connection:
-            rows = connection.execute("SELECT item, version, status, document, updated FROM annotations WHERE project=?", (project_id,))
+            rows = connection.execute("""
+                SELECT item, version, status, updated,
+                       CASE WHEN json_type(document, '$.shapes') = 'array'
+                            THEN json_array_length(document, '$.shapes') END AS object_count,
+                       CASE WHEN ? OR (? AND status IN (?, ?, ?)) THEN document END AS document
+                FROM annotations WHERE project=?
+            """, (include_documents, include_review, *PENDING_REVIEW, project_id))
             for row in rows:
-                document = self.project(project_id).normalize_labels(json.loads(row["document"]))
+                if row["object_count"] is None:
+                    raise Problem("已保存标注的 shapes 不是有效数组，已阻止读取队列", 409)
                 item = {"version": row["version"], "status": row["status"],
-                        "count": len(document["shapes"]), "updated": row["updated"]}
+                        "count": row["object_count"], "updated": row["updated"]}
+                document = json.loads(row["document"]) if row["document"] is not None else None
                 if include_documents:
-                    item["document"] = document
+                    item["document"] = self.project(project_id).normalize_labels(document)
                 if include_review and row["status"] in PENDING_REVIEW:
                     item["review"] = review_info(document)
                 overlays[row["item"]] = item

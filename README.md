@@ -35,6 +35,7 @@ LabelPilot 是一个可复用的本地半自动图像标注工具，支持目标
 | --- | --- |
 | 操作系统 | 启动脚本与系统文件选择流程面向 Windows 本机桌面使用 |
 | Python | 推荐 Python 3.11，为工具建立独立虚拟环境 |
+| SQLite | 使用 Python 自带的 SQLite，需支持 JSON 函数，用于轻量队列统计 |
 | 浏览器 | 支持 Canvas 的现代浏览器，建议使用 Chrome 或 Edge |
 | 文件选择 | Python 环境需提供 Tk / tkinter，服务须运行在可显示窗口的桌面会话中 |
 | GPU | 基础标注不要求 GPU；模型推理和训练的 CPU / CUDA 支持取决于所用模型、PyTorch 与驱动环境 |

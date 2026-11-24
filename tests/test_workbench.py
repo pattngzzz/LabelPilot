@@ -1164,6 +1164,57 @@ def test_import_is_not_independent_acceptance(store):
     assert counts == {"unstarted": 2, "imported": 1, "predicted": 1, "draft": 0, "reviewed": 0, "skipped": 0, "error": 0}
 
 
+@pytest.mark.parametrize("include_review", [False, True])
+def test_lightweight_overlay_matches_documents_without_decoding_reviewed_rows(reviewed_store, monkeypatch, include_review):
+    store = reviewed_store
+    pending = payload(store, "model", "draft")
+    pending["document"]["shapes"][0].update(score=.2, difficult=True)
+    store.save("test", item(store, "model")["id"], pending)
+    expected = store.overlay("test", include_documents=True, include_review=include_review)
+    for row in expected.values():
+        row.pop("document")
+    loads = json.loads
+    decoded = []
+
+    def track_loads(value, *args, **kwargs):
+        decoded.append(value)
+        return loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(json, "loads", track_loads)
+    assert store.overlay("test", include_review=include_review) == expected
+    assert len(decoded) == (1 if include_review else 0)
+
+
+def test_lightweight_listing_reflects_other_store_save_restore_and_rescan(store, dataset):
+    before = store.listing("test")
+    other = Store(store.home)
+    saved = other.save("test", item(other, "human")["id"], payload(other, "human", "reviewed"))
+    after = store.listing("test")
+    assert after["counts"]["reviewed"] == before["counts"]["reviewed"] + 1
+    current = next(row for row in after["items"] if row["photo_id"] == "human")
+    assert current["version"] == saved["version"] and current["count"] == 1
+    other.restore("test", current["id"], 0, saved["version"])
+    restored = next(row for row in store.listing("test")["items"] if row["id"] == current["id"])
+    assert restored["status"] == "draft" and restored["version"] == saved["version"] + 1
+    Image.new("RGB", (240, 120)).save(dataset[1] / "added.jpg")
+    store.rescan("test")
+    assert store.listing("test")["total"] == before["total"] + 1
+    assert next(row for row in store.listing("test")["items"] if row["id"] == current["id"]) == restored
+
+
+@pytest.mark.parametrize("shapes", [None, {}, "invalid"])
+def test_lightweight_overlay_rejects_invalid_shapes_instead_of_counting_empty(reviewed_store, shapes):
+    store = reviewed_store
+    with store.connect() as connection:
+        row = connection.execute("SELECT item, document FROM annotations WHERE project=? LIMIT 1", ("test",)).fetchone()
+        document = json.loads(row["document"])
+        document["shapes"] = shapes
+        connection.execute("UPDATE annotations SET document=? WHERE project=? AND item=?",
+                           (json.dumps(document), "test", row["item"]))
+    with pytest.raises(Problem, match="shapes"):
+        store.listing("test")
+
+
 def test_save_preserves_source_and_attributes(store, dataset):
     source = dataset[2] / "human.json"
     fingerprint = digest(source)

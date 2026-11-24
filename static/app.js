@@ -115,6 +115,7 @@ async function selectProject(projectId) {
   if (state.busy) return;
   if (!await ensureSaved()) { element("projectSelect").value = state.project.id; return; }
   state.project = state.projects.find(project => project.id === projectId);
+  delete element("imageList").dataset.project;
   state.current = null;
   state.image = null;
   state.selected = -1;
@@ -177,19 +178,33 @@ async function refreshList() {
 function renderQueue() {
   const review = reviewModes.has(filters().status);
   element("reviewQueueButton").setAttribute("aria-pressed", String(review));
-  element("imageList").innerHTML = state.items.map(item => {
+  const list = element("imageList");
+  const previous = list.dataset.project === state.project.id
+    ? new Map([...list.querySelectorAll(".image-row")].map(row => [row.dataset.item, row])) : new Map();
+  list.dataset.project = state.project.id;
+  const rows = state.items.map(item => {
     const reasons = [];
     if (item.review?.empty) reasons.push("待确认空图");
     if (item.review?.difficult) reasons.push("难例");
     if (item.review?.low_confidence) reasons.push(`低置信 ${Math.round(item.review.confidence * 100)}%`);
     if (item.audit) reasons.push(efficiency.issueText(item.audit.kinds));
     if (item.route) reasons.push(automationUi.routeText(item.route));
-    return `<button class="image-row ${state.current?.item.id === item.id ? "selected" : ""}" data-item="${item.id}" title="${escapeHtml(item.relative)}">
-      <img loading="lazy" src="${projectUrl(`/items/${item.id}/image?thumbnail=true`)}" alt="">
-      <span class="image-row-info"><strong>${escapeHtml(item.photo_id)}</strong><small>${statusNames[item.status]} · ${item.count} 对象</small>
-      ${reasons.length ? `<small class="review-reasons">${reasons.join(" · ")}</small>` : ""}</span><i class="row-dot ${item.status}"></i>
-    </button>`;
-  }).join("") || `<p class="empty-list">${review ? "当前范围没有待审核图片" : "当前筛选暂无图片"}</p>`;
+    const content = `<strong>${escapeHtml(item.photo_id)}</strong><small>${statusNames[item.status]} · ${item.count} 对象</small>
+      ${reasons.length ? `<small class="review-reasons">${reasons.join(" · ")}</small>` : ""}`;
+    const row = previous.get(item.id) || document.createElement("button");
+    if (!previous.has(item.id)) {
+      row.dataset.item = item.id;
+      row.title = item.relative;
+      row.innerHTML = `<img loading="lazy" src="${projectUrl(`/items/${item.id}/image?thumbnail=true`)}" alt=""><span class="image-row-info"></span><i class="row-dot"></i>`;
+    }
+    row.className = "image-row" + (state.current?.item.id === item.id ? " selected" : "");
+    const info = row.querySelector(".image-row-info");
+    if (info.innerHTML !== content) info.innerHTML = content;
+    row.querySelector(".row-dot").className = "row-dot " + item.status;
+    return row;
+  });
+  if (rows.length) list.replaceChildren(...rows);
+  else list.innerHTML = `<p class="empty-list">${review ? "当前范围没有待审核图片" : "当前筛选暂无图片"}</p>`;
 }
 
 function finishReviewQueue() {
@@ -2007,6 +2022,7 @@ listen("refreshButton","click",async()=>{
   if(state.busy || !await ensureSaved())return;
   const selectedId=state.current?.item.id;
   const summary=await api(projectUrl("/rescan"),"POST",{});
+  delete element("imageList").dataset.project;
   Object.assign(state.project,summary);
   const options='<option value="">全部批次</option>'+summary.batches.map(batch=>`<option value="${escapeHtml(batch)}">${escapeHtml(batch)}</option>`).join("");
   const previousBatch=element("batchSelect").value;

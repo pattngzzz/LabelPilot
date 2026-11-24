@@ -153,6 +153,7 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     socket = new WebSocket(targets.find(target => target.type === "page").webSocketDebuggerUrl);
     await new Promise((resolve, reject) => {socket.onopen=resolve; socket.onerror=reject;});
     let sequence = 0;
+    const thumbnailRequests = [];
     let labelFileChooser = null;
     let acceptLabelDeletion = false;
     let lastLabelDeletionPrompt = "";
@@ -172,6 +173,7 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
         data.error ? request.reject(new Error(JSON.stringify(data.error))) : request.resolve(data.result);
       }
       if (data.method === "Runtime.exceptionThrown") errors.push(data.params);
+      if (data.method === "Network.requestWillBeSent" && data.params.request.url.includes("thumbnail=true")) thumbnailRequests.push(data.params.request.url);
       if (data.method === "Page.fileChooserOpened") labelFileChooser = data.params;
       if (data.method === "Page.javascriptDialogOpening") {
         const deleting = data.params.type === "confirm" && data.params.message.startsWith("确认删除标签");
@@ -222,6 +224,7 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     };
     await cdp("Page.enable");
     await cdp("Runtime.enable");
+    await cdp("Network.enable");
     await eventually(()=>evaluate('window.legacyAssetLoaded===true && getComputedStyle(document.body).getPropertyValue("--legacy-style-loaded").trim()==="1"'));
     context.diagnostic("Browser starts with long-lived cached legacy JavaScript and CSS on the same origin");
     await cdp("Page.navigate", {url});
@@ -229,6 +232,16 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await waitFor('typeof state!=="undefined" && state.current && !state.busy');
     await evaluate('element("autoDraft").checked=false; element("autoDraft").dispatchEvent(new Event("change"));');
     await check('window.legacyAssetLoaded!==true && getComputedStyle(document.body).getPropertyValue("--legacy-style-loaded").trim()!=="1" && /[?&]v=[a-f0-9]{16}/.test(document.querySelector("script[src]").src) && /[?&]v=[a-f0-9]{16}/.test(document.querySelector("link[rel=stylesheet]").href)', "A normal navigation bypasses cached legacy assets and loads a matching versioned script and stylesheet");
+    await waitFor('Array.from(element("imageList").querySelectorAll("img")).every(image=>image.complete && image.naturalWidth>0)');
+    await evaluate('window.queueRowsBeforeRefresh=Array.from(element("imageList").querySelectorAll(".image-row")); window.queueImagesBeforeRefresh=queueRowsBeforeRefresh.map(row=>row.querySelector("img"));');
+    const initialThumbnailRequests = thumbnailRequests.length;
+    await evaluate('(async()=>{await refreshList(); renderQueue(); await refreshList();})()');
+    await sleep(100);
+    await check('Array.from(element("imageList").querySelectorAll(".image-row")).every((row,index)=>row===queueRowsBeforeRefresh[index] && row.querySelector("img")===queueImagesBeforeRefresh[index])', "Repeated queue refreshes reuse the existing rows and thumbnail nodes");
+    assert.equal(thumbnailRequests.length, initialThumbnailRequests, "Refreshing an unchanged queue does not reload its thumbnails");
+    await click("#refreshButton");
+    await waitFor('!state.busy && element("imageList").querySelector(".image-row")!==queueRowsBeforeRefresh[0]');
+    await check('Array.from(element("imageList").querySelectorAll("img")).every(image=>!queueImagesBeforeRefresh.includes(image))', "Explicit rescanning invalidates reused thumbnails so changed source files can be reread");
     let cursor=await point([320,240]);
     await cdp("Input.dispatchMouseEvent", {type:"mouseMoved", buttons:0, ...cursor});
     await check('element("canvasCrosshair").hidden', "Selection mode does not show rectangle crosshair guides");
@@ -399,6 +412,7 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await waitFor('!element("labelPicker").open');
     await check('state.project.classes.length===3 && state.current.document.shapes.length===3', "Reusing a name does not duplicate class IDs");
     const first = await evaluate("state.current.item.id");
+    await evaluate('window.rowBeforeSave=element("imageList").querySelector(".image-row.selected"); window.thumbnailBeforeSave=rowBeforeSave.querySelector("img");');
     await evaluate('window.testApi=api;api=async(path,method,...args)=>{if(method==="PUT")throw new Error("simulated save failure");return testApi(path,method,...args);};');
     await press("e", "KeyE");
     await waitFor('!state.busy');
@@ -408,6 +422,7 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await waitFor(`state.current.item.id!==${JSON.stringify(first)} && !state.busy`);
     await check(`(async()=>{const saved=await api(projectUrl("/items/${first}"));return saved.status==="reviewed" && saved.document.shapes.length===3;})()`, "E persists annotations as reviewed and advances");
     const second = await evaluate("state.current.item.id");
+    await check('rowBeforeSave.isConnected && rowBeforeSave.querySelector("img")===thumbnailBeforeSave && rowBeforeSave.querySelector("small").textContent.includes("已审核") && rowBeforeSave.querySelector("small").textContent.includes("3 对象")', "Successful E save updates review state and object count without recreating the thumbnail");
     await cdp("Input.dispatchKeyEvent", {type:"keyDown", key:"e", code:"KeyE", autoRepeat:true});
     await check(`state.current.item.id===${JSON.stringify(second)} && state.current.version===0`, "Held E does not repeatedly review images");
     await press("e", "KeyE");
