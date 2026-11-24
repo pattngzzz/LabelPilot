@@ -327,14 +327,49 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
       await evaluate('canvas.dispatchEvent(new KeyboardEvent("keydown",{key:"q",code:"KeyQ",bubbles:true,isComposing:true}));');
       await check('state.polygon.length===3 && state.current.document.shapes.length===1', "Modified, held and composing Q leave the polygon unfinished");
       await press(key, key === "q" ? "KeyQ" : "Enter");
+      await check('element("labelPicker").open && state.pendingShape?.kind==="polygon" && state.polygon.length===0 && state.current.document.shapes.length===1 && state.current.version===0', String(key) + " opens the polygon label picker before adding an object");
+      await press(key, key === "q" ? "KeyQ" : "Enter");
       await check('state.polygon.length===0 && state.current.document.shapes.length===2 && state.current.document.shapes.at(-1).shape_type==="polygon" && state.current.version===0', `${key} finishes the polygon without saving or reviewing`);
       await click("#undoButton");
     }
+    for (const factor of [0.5,1.5]) {
+      await evaluate("fitImage(); zoom(" + factor + ");");
+      await press("p", "KeyP");
+      for (const coordinates of [[100,100],[350,100],[350,300]]) await mouseClick(await point(coordinates));
+      const firstVertex = await point([100,100]);
+      await mouseClick({...firstVertex, x:firstVertex.x+5});
+      await check('element("labelPicker").open && state.pendingShape?.kind==="polygon" && state.pendingShape.points.length===3 && state.polygon.length===0 && state.current.document.shapes.length===1 && state.current.version===0', "Clicking within five screen pixels of the first vertex closes a polygon at zoom factor " + factor);
+      await check('JSON.stringify(state.pendingShape.points.map(position=>position.map(Math.round)))==="[[100,100],[350,100],[350,300]]"', "Closing near the first vertex preserves the original vertices without adding a duplicate");
+      await click('[data-label="class_b"]');
+      await waitFor('!element("labelPicker").open && state.current.document.shapes.length===2');
+      await check('state.current.document.shapes.at(-1).shape_type==="polygon" && state.current.document.shapes.at(-1).label==="class_b"', "Closed polygons use the selected existing label");
+      await click("#undoButton");
+      await check('state.current.document.shapes.length===1', "A confirmed polygon is a single undo operation");
+    }
+    await evaluate("fitImage()");
+    await press("p", "KeyP");
+    for (const coordinates of [[100,100],[350,100],[350,300],[100,100]]) await mouseClick(await point(coordinates));
+    await check('element("labelPicker").open && state.current.document.shapes.length===1', "A closed polygon remains pending until its label is confirmed");
+    await press("Escape", "Escape");
+    await check('!element("labelPicker").open && !state.pendingShape && state.polygon.length===0 && state.current.document.shapes.length===1', "Cancelling the polygon label picker leaves existing objects untouched");
+    await press("p", "KeyP");
+    for (const coordinates of [[100,100],[350,100],[350,300]]) await mouseClick(await point(coordinates));
+    const finalVertex = await point([350,300]);
+    await cdp("Input.dispatchMouseEvent", {type:"mousePressed", button:"left", clickCount:2, ...finalVertex});
+    await cdp("Input.dispatchMouseEvent", {type:"mouseReleased", button:"left", clickCount:2, ...finalVertex});
+    await check('element("labelPicker").open && state.pendingShape?.points.length===3 && state.current.document.shapes.length===1', "Double-click completion opens the picker without duplicating the final vertex");
+    await press("Escape", "Escape");
+    await press("p", "KeyP");
+    for (const coordinates of [[100,100],[200,100],[300,100],[100,100]]) await mouseClick(await point(coordinates));
+    await check('!element("labelPicker").open && state.polygon.length===3 && state.current.document.shapes.length===1', "A zero-area polygon cannot open the label picker or create an object");
+    await press("Escape", "Escape");
     await press("p", "KeyP");
     await mouseClick(await point([100,100]));
     await mouseClick(await point([350,100]));
     await press("q", "KeyQ");
     await check('state.polygon.length===2 && state.current.document.shapes.length===1', "Q cannot finish a polygon with fewer than three vertices");
+    await mouseClick(await point([100,100]));
+    await check('state.polygon.length===2 && !element("labelPicker").open && state.current.document.shapes.length===1', "Clicking the first vertex cannot close a polygon with fewer than three vertices");
     await press("Escape", "Escape");
     await box([350,300], [100,100]);
     await press("Escape", "Escape");
@@ -1183,7 +1218,7 @@ print('Rotation ZIP: all angles, dimensions, exact normalized boxes and train-on
     await evaluate('element("sam3Dialog").close()');
     await click('[data-tool="polygon"]');
     for (const coords of [[35,50],[114,50],[114,116],[35,116]]) await mouseClick(await point(coords));
-    await press("q","KeyQ");
+    await mouseClick(await point([35,50]));
     await waitFor('element("labelPicker").open');
     await press("q","KeyQ");
     await waitFor('state.current.document.shapes.length===2');
@@ -1259,6 +1294,10 @@ print('Rotation ZIP: all angles, dimensions, exact normalized boxes and train-on
       "One contour project can preview either bounding-box or instance-segmentation exports");
 
     await createTask("semantic", "region");
+    await press("p", "KeyP");
+    for (const coordinates of [[35,50],[114,50],[114,116],[35,50]]) await mouseClick(await point(coordinates));
+    await check('element("labelPicker").open && state.pendingShape?.kind==="polygon" && state.current.document.shapes.length===0', "Semantic polygons also choose a label after closing the first vertex");
+    await press("Escape", "Escape");
     await click('[data-tool="brush"]');
     await mouseClick(await point([61,80]));
     await click('[data-tool="erase"]');
@@ -1311,7 +1350,7 @@ print('Rotation ZIP: all angles, dimensions, exact normalized boxes and train-on
     fs.writeFileSync(path.join(home,"ocr-workspace.png"), Buffer.from((await cdp("Page.captureScreenshot", {format:"png"})).data,"base64"));
     await press("p", "KeyP");
     for (const coordinate of [[190,50],[280,55],[275,90],[190,85]]) await mouseClick(await point(coordinate));
-    await press("q", "KeyQ");
+    await mouseClick(await point([190,50]));
     await waitFor('element("labelPicker").open');
     await setReviewValue("pickerOcrReadability", "unreadable");
     await click("#confirmPickedLabel");

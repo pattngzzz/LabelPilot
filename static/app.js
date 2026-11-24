@@ -790,9 +790,7 @@ function finishPolygon() {
   }, 0);
   if (Math.abs(area) < 1e-8) return toast("请让多边形围成一个有面积的区域");
   state.polygon=[];
-  if (taskUi.type() !== "detect") return openLabelPicker(points, points.at(-1), "polygon");
-  addShape(points,"polygon");
-  setTool("select");
+  openLabelPicker(points, points.at(-1), "polygon");
 }
 
 canvas.addEventListener("pointerdown",event => {
@@ -816,7 +814,14 @@ canvas.addEventListener("pointerdown",event => {
   if(efficiency.handleCanvas(point))return;
   if(taskUi.pointerDown(event, point))return;
   if(state.tool==="rectangle"){state.rectangle={start:point,end:point};state.selected=-1;renderObjects();draw();return;}
-  if(state.tool==="polygon"){state.polygon.push(point);draw();return;}
+  if(state.tool==="polygon"){
+    const first=state.polygon[0];
+    if(first && Math.hypot(first[0]-point[0],first[1]-point[1])*state.scale<8){
+      if(state.polygon.length>=3)finishPolygon();
+      return;
+    }
+    state.polygon.push(point);draw();return;
+  }
   canvas.setPointerCapture(event.pointerId);
   const selected=state.current.document.shapes[state.selected];
   if(selected){
