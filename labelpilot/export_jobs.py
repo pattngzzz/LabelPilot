@@ -9,22 +9,30 @@ from contextlib import contextmanager
 
 from .exporting import DatasetFolder, validated_export_plan, write_members
 from .export_acceleration import AugmentationCache, ExportAcceleration, export_workers
-from .incremental_export import record_metadata, safe_path
+from .incremental_export import ExportFileCache, record_metadata, safe_path
 from .model_files import directory
 from .store import Problem, Store, now
 
 
 class ExportSnapshot(Store):
-    def __init__(self, store, project_id):
+    def __init__(self, store, project_id, checkpoint=None):
         self.__dict__.update(store.__dict__)
         self.lock = threading.RLock()
         self.connection = sqlite3.connect(":memory:")
         self.connection.row_factory = sqlite3.Row
         try:
-            with store.lock:
+            while not store.lock.acquire(timeout=0.1):
+                if checkpoint:
+                    checkpoint()
+            try:
+                if checkpoint:
+                    checkpoint()
                 self.projects = {project_id: copy.deepcopy(store.project(project_id))}
                 with store.connect() as connection:
-                    connection.backup(self.connection)
+                    connection.backup(self.connection, pages=256,
+                                      progress=(lambda *args: checkpoint()) if checkpoint else None)
+            finally:
+                store.lock.release()
             self.connection.execute("PRAGMA query_only=ON")
         except Exception:
             self.connection.close()
@@ -42,6 +50,8 @@ class ExportCancelled(Exception):
 class ExportJobs:
     def __init__(self, store):
         self.store = store
+        if not hasattr(store, "export_file_cache"):
+            store.export_file_cache = ExportFileCache()
         self.lock = threading.RLock()
         self.records = {}
         self.worker = None

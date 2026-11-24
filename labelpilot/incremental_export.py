@@ -3,12 +3,44 @@ import hashlib
 import json
 import random
 import stat
-from collections import Counter
+import threading
+from collections import Counter, OrderedDict
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
 from .store import Problem, digest, now
 from .tasks import model_labels
+
+
+class ExportFileCache:
+    def __init__(self, limit=50000):
+        self.limit = limit
+        self.entries = OrderedDict()
+        self.lock = threading.Lock()
+
+    def key(self, path):
+        state = path.stat()
+        return (path.absolute(), state.st_size, state.st_mtime_ns, state.st_ctime_ns, state.st_dev, state.st_ino)
+
+    def digest(self, path, checkpoint=None):
+        path = Path(path)
+        if checkpoint:
+            checkpoint()
+        key = self.key(path)
+        with self.lock:
+            cached = self.entries.get(key)
+            if cached is not None:
+                self.entries.move_to_end(key)
+                return cached
+        result = digest(path, checkpoint=checkpoint)
+        if self.key(path) != key:
+            raise Problem("文件在校验过程中发生变化，请等待文件稳定后刷新预检", 409)
+        with self.lock:
+            self.entries[key] = result
+            self.entries.move_to_end(key)
+            while len(self.entries) > self.limit:
+                self.entries.popitem(last=False)
+        return result
 
 
 def content_hash(document):
@@ -70,7 +102,7 @@ def record_entry(archive, entry, offset, source=None, document=None, source_stat
         entry["annotation_sha256"] = content_hash(document)
 
 
-def load_incremental(project, format_name, options):
+def load_incremental(project, format_name, options, *, checkpoint=None, progress=None, file_cache=None):
     enabled = options.get("incremental", False)
     if type(enabled) is not bool:
         raise Problem("增量导出开关必须为布尔值", 422)
@@ -88,6 +120,9 @@ def load_incremental(project, format_name, options):
         return None
     try:
         state = IncrementalExport(root, manifest_path.read_bytes())
+        state.checkpoint = checkpoint
+        state.progress = progress
+        state.file_cache = file_cache
         manifest = state.manifest
         if (manifest["project"] != project.id or manifest["format"] != format_name
                 or manifest["task_type"] != (options.get("output_task") or project.task_type)
@@ -120,6 +155,14 @@ class IncrementalExport:
         self.checked_directories = set()
         self.augmentation_changed = False
         self.new_classes = []
+        self.checkpoint = None
+        self.progress = None
+        self.file_cache = None
+
+    def digest(self, path):
+        if self.file_cache is not None:
+            return self.file_cache.digest(path, self.checkpoint)
+        return digest(path, checkpoint=self.checkpoint)
 
     def validate_entries(self):
         manifest = self.manifest
@@ -141,7 +184,11 @@ class IncrementalExport:
                             owner["files"] = {member: {} for member in entry_files(owner, manifest)}
                         owner["files"][name] = {}
         ids, images, files = set(), set(), set()
-        for entry in manifest["items"]:
+        for index, entry in enumerate(manifest["items"]):
+            if self.checkpoint:
+                self.checkpoint()
+            if self.progress:
+                self.progress("检查旧数据集结构", index, len(manifest["items"]), entry.get("image", ""))
             item_id, image = entry["id"], entry["image"]
             if (not isinstance(item_id, str) or item_id in ids or image.casefold() in images
                     or entry["split"] not in ("train", "val", "test", "unassigned")
@@ -184,7 +231,7 @@ class IncrementalExport:
             path = safe_path(self.root, name, self.checked_directories)
             if not path.is_file():
                 raise ValueError(f"缺少 {name}")
-            self.stamps[name] = {**file_stamp(path), "sha256": digest(path)}
+            self.stamps[name] = {**file_stamp(path), "sha256": self.digest(path)}
             self.old_files.add(name)
             recorded = manifest.get("metadata_files", {}).get(name)
             if recorded and recorded["sha256"] != self.stamps[name]["sha256"]:
@@ -261,7 +308,7 @@ class IncrementalExport:
         if expected and all(stamp[key] == expected.get(key) for key in stamp):
             self.stamps[name] = expected
             return True
-        actual = digest(path)
+        actual = self.digest(path)
         self.stamps[name] = {**stamp, "sha256": actual}
         return not expected or actual == expected.get("sha256")
 
@@ -277,7 +324,7 @@ class IncrementalExport:
         source = Path(plan.project.item(row["id"])["path"])
         self.source_stamps[source] = file_stamp(source)
         if previous.get("source_stat") != file_stamp(source):
-            if digest(source) != previous["sha256"]:
+            if self.digest(source) != previous["sha256"]:
                 raise Problem(f"{row['photo_id']} 原图已改变，已阻止旧标注套用", 409)
         if plan.assignments[row["id"]] == "train" and self.manifest.get("augmentation") != plan.augmentation:
             return False
@@ -287,6 +334,8 @@ class IncrementalExport:
             reader = type("Reader", (), {"read": lambda reader, name: safe_path(self.root, name).read_bytes()})()
             try:
                 for entry in self.by_source[row["id"]]:
+                    if checkpoint:
+                        checkpoint()
                     expected = output_document(plan, document)
                     if "source_id" in entry:
                         provenance = entry["augmentation"]
@@ -343,7 +392,11 @@ class IncrementalExport:
             raise Problem("增强配置发生变化，需选择包含所有历史原图的范围才能同步；或完整导出到新目录", 422)
         changed = []
         selected_ids = {row["id"] for row in plan.rows}
-        for source_id in set(self.originals) - selected_ids:
+        outside = set(self.originals) - selected_ids
+        total = len(outside) + len(plan.rows)
+        for index, source_id in enumerate(sorted(outside)):
+            if self.progress:
+                self.progress("核验历史图片与增强文件", index, total, self.originals[source_id].get("photo_id", source_id))
             for entry in self.by_source[source_id]:
                 files = {}
                 for name in entry_files(entry, self.manifest):
@@ -354,9 +407,11 @@ class IncrementalExport:
                         raise Problem("范围外历史文件已缺失或损坏，请扩大导出范围以修复，或完整导出到新目录", 409)
                     files[name] = self.stamps[name]
                 entry["files"] = files
-        for row in plan.rows:
+        for index, row in enumerate(plan.rows, len(outside)):
             if checkpoint:
                 checkpoint()
+            if self.progress:
+                self.progress("核验历史图片与增强文件", index, total, row["photo_id"])
             document = row.get("document")
             if document is None:
                 document = store.detail(project.id, row["id"])["document"]
@@ -369,6 +424,8 @@ class IncrementalExport:
                     self.updated += 1
                 else:
                     self.added += 1
+        if self.progress:
+            self.progress("核验历史图片与增强文件", total, total, "")
         counts = ({name: sum(plan.assignments[row["id"]] == name for row in changed) for name in ("train", "val", "test")}
                   if plan.split_config else None)
         return replace(plan, rows=changed, split_counts=counts)

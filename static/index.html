@@ -204,6 +204,9 @@
           <button class="button" type="button" id="refreshExportPreview">刷新</button>
         </div>
         <p id="exportPreviewStatus" class="muted" role="status"></p>
+        <progress id="exportPreviewProgress" max="100" aria-label="当前预检阶段进度" hidden></progress>
+        <p id="exportPreviewDetail" class="muted" hidden></p>
+        <button class="button" type="button" id="cancelExportPreview" hidden>停止预检</button>
         <div id="exportPreviewContent" hidden>
           <dl class="export-preview-metrics">
             <div><dt>纳入图片</dt><dd id="exportImageCount"></dd></div>

@@ -13,7 +13,8 @@ const canvas = element("canvas");
 const context = canvas.getContext("2d");
 const sessionToken = document.querySelector('meta[name="labelpilot-token"]').content;
 const modelBrowser = {mode:"file",target:"modelPath",listing:null,loading:false,sequence:0};
-const exportPreview = {sequence:0, timer:null, plan:null, running:false, selecting:false, job:null};
+const exportPreview = {sequence:0, timer:null, plan:null, running:false, selecting:false, job:null,
+  request:null, starting:Promise.resolve()};
 const exportSplitLabels = {train:"训练", val:"验证", test:"测试"};
 const exportSplitHints = {
   source_group:"任务清单里同一来源组的图片会进入同一个集合。实际比例取决于各组的图片数量。",
@@ -1288,9 +1289,75 @@ function renderExportPreview(data, options) {
   element("exportPreviewContent").hidden = false;
 }
 
+function cancelExportPreviewRequest() {
+  const request = exportPreview.request;
+  exportPreview.request = null;
+  if (request) api(`${request.url}/preview/jobs/${request.id}/cancel`, "POST", {}).catch(() => {});
+}
+
+function showExportPreviewProgress(job) {
+  setExportPreviewStatus(job.stage);
+  const progress = element("exportPreviewProgress");
+  progress.hidden = false;
+  if (job.percent === null) progress.removeAttribute("value");
+  else progress.value = job.percent;
+  element("exportPreviewDetail").hidden = false;
+  element("exportPreviewDetail").textContent = [
+    job.total ? `当前阶段 ${job.completed} / ${job.total}` : "正在准备",
+    `已用 ${job.elapsed_seconds.toFixed(1)} 秒`,
+    job.current_image,
+    "后台预检不锁定标注；首次核验旧数据集较慢，可关闭此窗口继续标注"
+  ].filter(Boolean).join(" · ");
+  element("cancelExportPreview").hidden = false;
+}
+
+function hideExportPreviewProgress() {
+  for (const id of ["exportPreviewProgress", "exportPreviewDetail", "cancelExportPreview"]) element(id).hidden = true;
+}
+
+async function requestExportPreview(url, options, sequence) {
+  const current = () => sequence === exportPreview.sequence && element("exportDialog").open;
+  const launch = exportPreview.starting.catch(() => {}).then(async () => {
+    if (!current()) return null;
+    const job = await api(`${url}/preview/jobs`, "POST", options);
+    if (!current()) {
+      await api(`${url}/preview/jobs/${job.id}/cancel`, "POST", {}).catch(() => {});
+      return null;
+    }
+    return job;
+  });
+  exportPreview.starting = launch.then(() => {}, () => {});
+  let job = await launch;
+  if (!job) return null;
+  const request = {id:job.id, url};
+  if (!current()) {
+    api(`${url}/preview/jobs/${job.id}/cancel`, "POST", {}).catch(() => {});
+    return null;
+  }
+  exportPreview.request = request;
+  try {
+    while (current()) {
+      if (job.status === "completed") return job.result;
+      if (["failed", "cancelled", "cancelling"].includes(job.status)) {
+        throw new Error(job.error || "预检已停止，请点击刷新重新检查。");
+      }
+      showExportPreviewProgress(job);
+      await new Promise(resolve => setTimeout(resolve, 400));
+      if (!current()) return null;
+      job = await api(`${url}/preview/jobs/${job.id}`);
+    }
+    return null;
+  } finally {
+    if (exportPreview.request === request) exportPreview.request = null;
+    if (current()) hideExportPreviewProgress();
+  }
+}
+
 function updateExportPreview() {
   if (exportPreview.running || !element("exportDialog").open) return;
   clearTimeout(exportPreview.timer);
+  cancelExportPreviewRequest();
+  hideExportPreviewProgress();
   const sequence = ++exportPreview.sequence;
   exportPreview.plan = null;
   element("createExport").disabled = true;
@@ -1328,8 +1395,9 @@ function updateExportPreview() {
   setExportPreviewStatus(clean ? "正在读取原图并检查重复和标注异常…" : "正在统计本次导出的标注…");
   exportPreview.timer = setTimeout(async () => {
     try {
-      const data = await api(`${url}/preview`, "POST", options);
+      const data = await requestExportPreview(url, options, sequence);
       if (sequence !== exportPreview.sequence || !element("exportDialog").open) return;
+      if (!data) return;
       renderExportPreview(data, options);
       exportPreview.plan = {url, options, data};
       updateExportButton();
@@ -2130,6 +2198,15 @@ for (const id of ["exportIncremental", "exportFormat", "exportOutputTask", "expo
 });
 listen("augmentationPreset", "change", updateExportPreview);
 listen("refreshExportPreview", "click", updateExportPreview);
+listen("cancelExportPreview", "click", () => {
+  clearTimeout(exportPreview.timer);
+  exportPreview.sequence++;
+  exportPreview.plan = null;
+  cancelExportPreviewRequest();
+  hideExportPreviewProgress();
+  setExportPreviewStatus("预检已停止，点击刷新可重新检查。");
+  updateExportButton();
+});
 listen("exportCleaningExamples", "click", async event => {
   const button = event.target.closest("[data-clean-item]");
   if (!button || state.busy || !await ensureSaved()) return;
@@ -2141,6 +2218,8 @@ element("exportDialog").addEventListener("close", () => {
   clearTimeout(exportPreview.timer);
   exportPreview.sequence++;
   exportPreview.plan = null;
+  cancelExportPreviewRequest();
+  hideExportPreviewProgress();
 });
 listen("createExport","click",exportDataset);
 listen("chooseExportFolder","click",selectExportFolder);

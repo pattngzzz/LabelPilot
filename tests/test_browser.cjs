@@ -78,7 +78,7 @@ from labelpilot.comparison_details import record_frame, write_details
 from labelpilot.evaluation_worker import frozen_frames
 from labelpilot.server import create_app
 from labelpilot.store import atomic_json, read_json
-from labelpilot import export_jobs
+from labelpilot import export_jobs, exporting
 import time
 
 original_export_writer = export_jobs.write_members
@@ -116,6 +116,21 @@ def comparison_fixture(run, stop, module, directory, copies):
 evaluation.has_training_dependencies = lambda: True
 evaluation.run_local_worker = comparison_fixture
 app = create_app()
+app.state.slow_preview = False
+original_export_prepare = exporting.prepare_export
+def slow_preview_fixture(*args, **kwargs):
+    if app.state.slow_preview and kwargs.get("progress"):
+        for index in range(50):
+            kwargs["checkpoint"]()
+            kwargs["progress"]("核验历史图片与增强文件", index, 50, "slow-preview-fixture")
+            time.sleep(.1)
+    return original_export_prepare(*args, **kwargs)
+exporting.prepare_export = slow_preview_fixture
+@app.post("/__preview-delay")
+def preview_delay(payload: dict):
+    app.state.slow_preview = payload["enabled"]
+    return {"enabled": app.state.slow_preview}
+
 def audit_prediction_fixture(project_id, item_id, options, **kwargs):
     current = app.state.store.detail(project_id, item_id)
     shapes = current["document"]["shapes"]
@@ -145,7 +160,7 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
   const errors = [];
   try {
     await eventually(async () => {try {return (await fetch(`${url}/api/health`)).ok;} catch {return false;}});
-    browser = spawn(chrome, ["--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "--window-size=1600,1000", `${url}/__legacy_cache_test`], {windowsHide:true, stdio:"ignore"});
+    browser = spawn(chrome, ["--headless=new", "--disable-gpu", "--disable-component-update", "--disable-background-networking", "--no-first-run", "--no-default-browser-check", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "--window-size=1600,1000", `${url}/__legacy_cache_test`], {windowsHide:true, stdio:"ignore"});
     const activePort = path.join(profile, "DevToolsActivePort");
     await eventually(() => fs.existsSync(activePort));
     const debugPort = fs.readFileSync(activePort, "utf8").split("\n")[0];
@@ -154,6 +169,7 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await new Promise((resolve, reject) => {socket.onopen=resolve; socket.onerror=reject;});
     let sequence = 0;
     const thumbnailRequests = [];
+    const downloadEvents = [];
     let labelFileChooser = null;
     let acceptLabelDeletion = false;
     let lastLabelDeletionPrompt = "";
@@ -173,6 +189,7 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
         data.error ? request.reject(new Error(JSON.stringify(data.error))) : request.resolve(data.result);
       }
       if (data.method === "Runtime.exceptionThrown") errors.push(data.params);
+      if (data.method === "Browser.downloadWillBegin") downloadEvents.push(data.params);
       if (data.method === "Network.requestWillBeSent" && data.params.request.url.includes("thumbnail=true")) thumbnailRequests.push(data.params.request.url);
       if (data.method === "Page.fileChooserOpened") labelFileChooser = data.params;
       if (data.method === "Page.javascriptDialogOpening") {
@@ -518,7 +535,7 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await waitFor('state.items.length===4 && state.current?.item.photo_id==="image_0" && !state.busy');
     const downloads = path.join(home, "downloads");
     fs.mkdirSync(downloads);
-    await cdp("Browser.setDownloadBehavior", {behavior:"allow", downloadPath:downloads});
+    await cdp("Browser.setDownloadBehavior", {behavior:"allow", downloadPath:downloads, eventsEnabled:true});
     await click("#exportButton");
     await waitFor('element("exportDialog").open && element("exportPreviewStatus").textContent.includes("可用分组")');
     await check('element("splitDataset").checked && element("splitTrain").value==="80" && element("splitVal").value==="10" && element("splitTest").value==="10" && element("exportSplitUnit").value==="source_group"', "Projects with capture groups default to grouped 80/10/10 splitting");
@@ -556,6 +573,29 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await waitFor('element("exportPreviewStatus").textContent.includes("可用分组") && element("createExport").disabled');
     await check('exportRequests.length===0', "Too few capture groups block export before creating a ZIP");
     await evaluate('(async()=>{for(const row of state.items){const current=await api(projectUrl("/items/"+row.id));if(current.status!=="reviewed")await api(projectUrl("/items/"+row.id),"PUT",{...current,expected_version:current.version,status:"reviewed",confirmed_empty:true});}})()');
+    await evaluate('api("/__preview-delay","POST",{enabled:true})');
+    await click("#refreshExportPreview");
+    await waitFor('exportPreview.request && !element("exportPreviewProgress").hidden && element("exportPreviewProgress").value>0');
+    await check('!element("cancelExportPreview").hidden && element("createExport").disabled && element("exportPreviewDetail").textContent.includes("当前阶段") && element("exportPreviewDetail").textContent.includes("已用")', "Slow previews display measured stage progress, elapsed time and a stop control");
+    const supersededPreview = await evaluate('exportPreview.request.id');
+    await setExportValue("augmentationPreset", "all");
+    await waitFor('exportPreview.request && exportPreview.request.id!=='+JSON.stringify(supersededPreview));
+    await sleep(250);
+    assert.equal(await evaluate('api(projectUrl("/export/preview/jobs/"+'+JSON.stringify(supersededPreview)+')).then(job=>job.status)'), "cancelled");
+    await click("#cancelExportPreview");
+    await waitFor('element("exportPreviewStatus").textContent.includes("预检已停止") && element("exportPreviewProgress").hidden');
+    await click("#refreshExportPreview");
+    await waitFor('exportPreview.request && !element("exportPreviewProgress").hidden');
+    const closedPreview = await evaluate('exportPreview.request.id');
+    await evaluate('element("exportDialog").close()');
+    const saveDuringPreview = Date.now();
+    await evaluate('(async()=>{const url=itemUrl();const current=await api(url);await api(url,"PUT",{...current,expected_version:current.version,status:"reviewed",confirmed_empty:true});await loadItem(state.current.item.id);})()');
+    assert.ok(Date.now()-saveDuringPreview<3000, "Closing a slow preview leaves annotation saving responsive");
+    await sleep(250);
+    assert.equal(await evaluate('api(projectUrl("/export/preview/jobs/"+'+JSON.stringify(closedPreview)+')).then(job=>job.status)'), "cancelled");
+    await evaluate('api("/__preview-delay","POST",{enabled:false})');
+    await setExportValue("augmentationPreset", "none");
+    await click("#exportButton");
     await click("#refreshExportPreview");
     await waitFor('!element("createExport").disabled && element("exportImageCount").textContent==="4"');
     await check('element("exportEmptyCount").textContent==="3" && element("exportObjectCount").textContent==="3" && element("exportClassRows").textContent.includes("qrade_customQ") && element("exportPreviewIssues").textContent.includes("训练集中没有标注")', "Preview reports confirmed negatives, class counts and missing training classes");
@@ -563,7 +603,7 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
     await evaluate('(async()=>{const route=projectUrl("/items/"+state.items.at(-1).id);const row=await api(route);await api(route,"PUT",{...row,expected_version:row.version,status:"reviewed",confirmed_empty:true});})()');
     await click("#createExport");
     await waitFor('element("exportResult").textContent.includes("数据已变化") && !element("createExport").disabled');
-    assert.equal(fs.readdirSync(downloads).length, 0, "A stale preview never downloads a ZIP");
+    assert.equal(fs.readdirSync(downloads).length, 0, "A stale preview never downloads a ZIP: " + JSON.stringify(downloadEvents));
     await click("#createExport");
     await waitFor('exportPreview.running && element("exportProgress").value>0 && element("exportProgress").value<100');
     await check('!element("exportProgress").hidden && element("exportProgressDetail").textContent.includes("/ 4 张") && element("exportControls").disabled', "The browser displays live measured progress while the export worker is still running");

@@ -160,7 +160,8 @@ def output_project(plan):
     return project
 
 
-def prepare_export(store, project_id, options, *, include_documents=False, checkpoint=None, allow_empty_cleaning=False):
+def prepare_export(store, project_id, options, *, include_documents=False, checkpoint=None, progress=None,
+                   allow_empty_cleaning=False):
     project = store.project(project_id)
     output_task = options.get("output_task")
     if output_task is not None and (project.task_type not in ("detect", "segment") or output_task not in ("detect", "segment")):
@@ -181,12 +182,19 @@ def prepare_export(store, project_id, options, *, include_documents=False, check
         raise Problem("当前导出增强仅适用于目标检测和实例分割", 422)
     if clean and not reviewed_only:
         raise Problem("清洗版数据集仅纳入已人工确认的图片", 422)
-    incremental = load_incremental(project, format_name, options)
+    if checkpoint:
+        checkpoint()
+    if progress:
+        progress("读取导出设置与旧清单", 0, 0, "")
+    incremental = load_incremental(project, format_name, options, checkpoint=checkpoint, progress=progress,
+                                   file_cache=getattr(store, "export_file_cache", None))
     batch = options.get("batch")
     if batch is None:
         batch = ""
     if not isinstance(batch, str):
         raise Problem("批次必须为文本", 422)
+    if progress:
+        progress("读取已保存标注", 0, 0, "")
     listing = store.listing(project_id, batch=batch, limit=1000000,
                             include_documents=(include_documents or bool(incremental)) and not clean)
     rows = [item for item in listing["items"] if item["status"] == "reviewed" or
@@ -197,6 +205,8 @@ def prepare_export(store, project_id, options, *, include_documents=False, check
         raise Problem("请按批次导出，每次不超过 10000 张", 422)
     cleaning = None
     if clean:
+        if progress:
+            progress("清洗原图与标注", 0, 0, "")
         rows, cleaning = clean_selection(store, project, rows, include_documents=include_documents, checkpoint=checkpoint)
         if not rows and not allow_empty_cleaning:
             counts = cleaning_summary(cleaning)["counts"]
@@ -241,20 +251,32 @@ def validate_export_document(store, project, document, width, height, status):
     store.validate(project, document, width, height, status, confirmed_empty)
 
 
-def preview_export(store, project_id, options):
-    with store.lock:
-        plan = prepare_export(store, project_id, options, include_documents=True, allow_empty_cleaning=True)
-        return describe_export(store, plan)
+def preview_export(store, project_id, options, *, checkpoint=None, progress=None):
+    from .export_jobs import ExportSnapshot
+
+    if progress:
+        progress("建立只读标注快照", 0, 0, "")
+    snapshot = ExportSnapshot(store, project_id, checkpoint)
+    try:
+        plan = prepare_export(snapshot, project_id, options, include_documents=True, allow_empty_cleaning=True,
+                              checkpoint=checkpoint, progress=progress)
+        return describe_export(snapshot, plan, checkpoint=checkpoint, progress=progress)
+    finally:
+        snapshot.connection.close()
 
 
-def describe_export(store, plan):
+def describe_export(store, plan, *, checkpoint=None, progress=None):
     subsets = [name for name in SPLIT_NAMES if plan.split_counts[name]] if plan.split_counts else ["unassigned"]
     class_counts = {name: dict.fromkeys(subsets, 0) for name in plan.project.names}
     source_splits = {}
     fingerprints = {}
     objects = confirmed_empty = unreviewed = unreviewed_empty = polygons = missing_sources = 0
     projection_issue = None
-    for row in plan.rows:
+    for index, row in enumerate(plan.rows):
+        if checkpoint:
+            checkpoint()
+        if progress:
+            progress("统计本次导出类别与标注", index, len(plan.rows), row["photo_id"])
         item_id = row["id"]
         subset = plan.assignments[item_id]
         document = row.get("document")
@@ -303,6 +325,8 @@ def describe_export(store, plan):
         else:
             source_splits.setdefault(group, set()).add(subset)
 
+    if progress:
+        progress("统计本次导出类别与标注", len(plan.rows), len(plan.rows), "")
     blocking_issue = None
     if projection_issue:
         blocking_issue = projection_issue

@@ -69,10 +69,12 @@ def source_group(value):
     return None
 
 
-def digest(path):
+def digest(path, *, checkpoint=None):
     hasher = hashlib.sha256()
     with Path(path).open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
+            if checkpoint:
+                checkpoint()
             hasher.update(block)
     return hasher.hexdigest()
 

@@ -22,6 +22,7 @@ from .curation import similar_frames
 from .evaluation import ComparisonJobs
 from .exporting import export_project, preview_export
 from .export_jobs import ExportJobs
+from .export_previews import ExportPreviews
 from .inference import Inference, Jobs
 from . import model_files, native_picker
 from .sam3 import Sam3Assistant
@@ -44,6 +45,7 @@ def create_app(home=None):
     comparisons = ComparisonJobs(store, jobs)
     automation = Automation(store, jobs, training, comparisons)
     exports = ExportJobs(store)
+    export_previews = ExportPreviews(store)
     sam3 = Sam3Assistant(store, inference, jobs)
     assistance = AssistanceJobs(store, jobs, sam3)
 
@@ -57,6 +59,7 @@ def create_app(home=None):
                 if record.get("kind") in ("sam3_contours", "duplicate_cleanup") and record["status"] in ("queued", "running"):
                     jobs.cancel(job_id)
             sam3.shutdown()
+            export_previews.shutdown()
             exports.shutdown()
             automation.shutdown()
             comparisons.shutdown()
@@ -70,6 +73,7 @@ def create_app(home=None):
     app.state.comparisons = comparisons
     app.state.automation = automation
     app.state.exports = exports
+    app.state.export_previews = export_previews
     app.state.sam3 = sam3
     app.state.assistance = assistance
     app.state.token = secrets.token_urlsafe(32)
@@ -467,6 +471,18 @@ def create_app(home=None):
     @app.post("/api/projects/{project_id}/export/preview")
     def export_preview(project_id: str, payload: dict):
         return preview_export(store, project_id, payload)
+
+    @app.post("/api/projects/{project_id}/export/preview/jobs")
+    def start_export_preview(project_id: str, payload: dict):
+        return JSONResponse(export_previews.start(project_id, payload), status_code=202)
+
+    @app.get("/api/projects/{project_id}/export/preview/jobs/{job_id}")
+    def export_preview_progress(project_id: str, job_id: str):
+        return export_previews.get(project_id, job_id)
+
+    @app.post("/api/projects/{project_id}/export/preview/jobs/{job_id}/cancel")
+    def cancel_export_preview(project_id: str, job_id: str):
+        return export_previews.cancel(project_id, job_id)
 
     @app.get("/api/augmentation-presets")
     def export_augmentation_presets():

@@ -1392,6 +1392,213 @@ def test_split_export_can_omit_test_set(reviewed_store):
         assert not any("/test/" in name for name in archive.namelist())
 
 
+def finish_export_preview(jobs, record):
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        current = jobs.get("test", record["id"])
+        if current["status"] in ("completed", "cancelled", "failed"):
+            return current
+        time.sleep(0.01)
+    pytest.fail("background export preview did not finish")
+
+
+def test_background_preview_releases_save_lock_and_pins_snapshot(reviewed_store, monkeypatch):
+    from labelpilot import exporting
+    from labelpilot.export_previews import ExportPreviews
+
+    store = reviewed_store
+    before = preview_export(store, "test", {})
+    paused, release = threading.Event(), threading.Event()
+    prepare = exporting.prepare_export
+
+    def pause(snapshot, *args, **kwargs):
+        if snapshot is not store:
+            paused.set()
+            assert release.wait(5)
+        return prepare(snapshot, *args, **kwargs)
+
+    monkeypatch.setattr(exporting, "prepare_export", pause)
+    jobs = ExportPreviews(store)
+    try:
+        record = jobs.start("test", {})
+        assert paused.wait(5)
+        assert jobs.get("test", record["id"])["stage"] == "建立只读标注快照"
+        assert store.lock.acquire(blocking=False)
+        store.lock.release()
+        saved = payload(store, "human", "reviewed")
+        saved["document"]["shapes"][0]["points"] = [[20, 20], [100, 80]]
+        store.save("test", saved["item"]["id"], saved)
+        store.add_label("test", "created_during_preview")
+        release.set()
+        completed = finish_export_preview(jobs, record)
+        assert completed["status"] == "completed", completed
+        assert completed["result"]["preview_token"] == before["preview_token"]
+        assert completed["percent"] == 100
+        assert "created_during_preview" not in [row["name"] for row in completed["result"]["class_counts"]]
+        with pytest.raises(Problem, match="数据已变化"):
+            export_project(store, "test", {"preview_token": before["preview_token"]})
+    finally:
+        release.set()
+        jobs.shutdown()
+
+
+def test_background_preview_deduplicates_and_keeps_only_latest_pending(reviewed_store, monkeypatch):
+    from labelpilot import export_previews
+
+    entered, release = threading.Event(), threading.Event()
+    visited = []
+
+    def preview(store, project_id, options, *, checkpoint, progress):
+        visited.append(options["batch"])
+        progress("核验历史图片与增强文件", 1, 10, options["batch"])
+        if options["batch"] == "first":
+            entered.set()
+            assert release.wait(5)
+        checkpoint()
+        return {"batch": options["batch"]}
+
+    monkeypatch.setattr(export_previews, "preview_export", preview)
+    jobs = export_previews.ExportPreviews(reviewed_store)
+    try:
+        first = jobs.start("test", {"batch": "first"})
+        assert entered.wait(5)
+        assert jobs.start("test", {"batch": "first"})["id"] == first["id"]
+        progress = jobs.get("test", first["id"])
+        assert (progress["completed"], progress["total"], progress["percent"]) == (1, 10, 10)
+        second = jobs.start("test", {"batch": "discarded"})
+        final = jobs.start("test", {"batch": "latest"})
+        assert jobs.get("test", second["id"])["status"] == "cancelled"
+        assert jobs.get("test", first["id"])["status"] == "cancelling"
+        release.set()
+        assert finish_export_preview(jobs, first)["status"] == "cancelled"
+        completed = finish_export_preview(jobs, final)
+        assert completed["status"] == "completed" and completed["result"] == {"batch": "latest"}
+        assert visited == ["first", "latest"]
+        assert jobs.cancel("test", final["id"])["status"] == "completed"
+    finally:
+        release.set()
+        jobs.shutdown()
+
+
+def test_background_preview_can_cancel_while_waiting_for_snapshot_lock(reviewed_store):
+    from labelpilot.export_previews import ExportPreviews
+
+    jobs = ExportPreviews(reviewed_store)
+    try:
+        with reviewed_store.lock:
+            record = jobs.start("test", {})
+            deadline = time.monotonic() + 2
+            while jobs.get("test", record["id"])["status"] == "queued" and time.monotonic() < deadline:
+                time.sleep(0.01)
+            jobs.cancel("test", record["id"])
+            assert finish_export_preview(jobs, record)["status"] == "cancelled"
+    finally:
+        jobs.shutdown()
+
+
+def test_export_file_cache_is_bounded_invalidates_and_cancels(tmp_path, monkeypatch):
+    from labelpilot import incremental_export
+    from labelpilot.export_previews import PreviewCancelled
+
+    path = tmp_path / "large.bin"
+    path.write_bytes(b"a" * (3 * 1024 * 1024))
+    cache = incremental_export.ExportFileCache(limit=1)
+    checks = 0
+
+    def checkpoint():
+        nonlocal checks
+        checks += 1
+        if checks == 3:
+            raise PreviewCancelled()
+
+    with pytest.raises(PreviewCancelled):
+        cache.digest(path, checkpoint)
+    assert not cache.entries
+    calls = []
+    original = incremental_export.digest
+
+    def counted(path, **kwargs):
+        calls.append(path)
+        return original(path, **kwargs)
+
+    monkeypatch.setattr(incremental_export, "digest", counted)
+    first = cache.digest(path)
+    assert cache.digest(path) == first and len(calls) == 1
+    previous = path.stat()
+    path.write_bytes(b"b" * previous.st_size)
+    os.utime(path, ns=(previous.st_atime_ns, previous.st_mtime_ns + 1000000000))
+    assert cache.digest(path) != first and len(calls) == 2
+    other = tmp_path / "other.bin"
+    other.write_bytes(b"other")
+    cache.digest(other)
+    assert len(cache.entries) == 1
+    path.unlink()
+    with pytest.raises(FileNotFoundError):
+        cache.digest(path)
+
+
+def test_export_file_cache_rejects_files_changed_during_hash(tmp_path, monkeypatch):
+    from labelpilot import incremental_export
+
+    path = tmp_path / "changing.bin"
+    path.write_bytes(b"before")
+    cache = incremental_export.ExportFileCache()
+    original = incremental_export.digest
+
+    def changed(path, **kwargs):
+        result = original(path, **kwargs)
+        path.write_bytes(b"changed")
+        return result
+
+    monkeypatch.setattr(incremental_export, "digest", changed)
+    with pytest.raises(Problem, match="校验过程中发生变化"):
+        cache.digest(path)
+    assert not cache.entries
+
+
+def test_incremental_warm_preview_avoids_rehash_but_checks_annotations(reviewed_store, monkeypatch):
+    from labelpilot import incremental_export
+
+    store, jobs = reviewed_store, ExportJobs(reviewed_store)
+    options = {"destination": str(store.home), "split": {"train": 100, "val": 0, "test": 0},
+               "augmentation": {"preset": "all", "copies": 1, "seed": 42}}
+    try:
+        initial, _ = incremental_run(store, jobs, options)
+        root = Path(initial["result"]["directory"])
+        manifest_path = root / "export_manifest.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        manifest.pop("metadata_files", None)
+        for entry in manifest["items"]:
+            for field in ("files", "source_stat", "annotation_sha256"):
+                entry.pop(field, None)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        options.update(destination=str(root), incremental=True)
+        calls = []
+        original = incremental_export.digest
+
+        def counted(path, **kwargs):
+            calls.append(path)
+            return original(path, **kwargs)
+
+        monkeypatch.setattr(incremental_export, "digest", counted)
+        cold = preview_export(store, "test", options)
+        assert calls and cold["incremental"]["skipped"] == 4
+        calls.clear()
+        warm = preview_export(store, "test", options)
+        assert not calls and warm == cold
+        human = next(entry for entry in manifest["items"] if entry["photo_id"] == "human" and "source_id" not in entry)
+        label = root / human["image"].replace("images/", "labels/", 1)
+        label.with_suffix(".txt").write_text("0 0.1 0.1 0.1 0.1\n", encoding="utf-8")
+        changed = preview_export(store, "test", options)
+        assert changed["incremental"]["updated"] == 1
+        source = Path(store.project("test").item(human["id"])["path"])
+        Image.new("RGB", (240, 120), "red").save(source)
+        with pytest.raises(Problem, match="原图已改变"):
+            preview_export(store, "test", options)
+    finally:
+        jobs.shutdown()
+
+
 def test_export_preview_matches_manifest_and_rejects_changed_revision(reviewed_store):
     store = reviewed_store
     store.add_label("test", "unused")
@@ -2400,6 +2607,28 @@ def test_asset_versions_change_with_frontend_content(dataset, tmp_path, monkeypa
             assert f'/static/style.css?v={new_version}' in updated
             assert f'/static/efficiency.js?v={new_version}' in updated
             version = new_version
+
+
+def test_background_export_preview_http_security_and_errors(dataset):
+    app = create_app(dataset[0])
+    with TestClient(app) as client:
+        token = re.search(r'name="labelpilot-token" content="([^"]+)"', client.get("/").text).group(1)
+        headers = {"X-LabelPilot-Token": token}
+        route = "/api/projects/test/export/preview/jobs"
+        assert client.post(route, json={}).status_code == 403
+        started = client.post(route, json={"reviewed_only": False}, headers=headers)
+        assert started.status_code == 202
+        result = finish_export_preview(app.state.export_previews, started.json())
+        assert result["status"] == "completed" and result["result"]["annotations"] == 2
+        job_route = f"{route}/{result['id']}"
+        assert client.get(job_route).json()["result"] == result["result"]
+        assert client.post(job_route + "/cancel", json={}).status_code == 403
+        assert client.post(job_route + "/cancel", json={}, headers=headers).status_code == 200
+        assert client.get(route + "/unknown").status_code == 404
+        failed = client.post(route, json={"format": "invalid"}, headers=headers)
+        result = finish_export_preview(app.state.export_previews, failed.json())
+        assert result["status"] == "failed" and result["error_status"] == 422
+        assert "导出格式" in result["error"]
 
 
 def test_http_local_security_and_save(dataset):
