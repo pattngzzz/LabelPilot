@@ -898,7 +898,7 @@ canvas.addEventListener("wheel",event=>{event.preventDefault();if(state.busy)ret
 new ResizeObserver(resizeCanvas).observe(element("canvasWrap"));
 
 function modelOptions() {
-  return {confidence:Number(element("confidence").value),iou:Number(element("iou").value),image_size:Number(element("imageSize").value),duplicate_iou:Number(element("duplicateIou").value)};
+  return {confidence:Number(element("confidence").value),iou:Number(element("iou").value),image_size:Number(element("imageSize").value),duplicate_iou:Number(element("duplicateIou").value),text_det_thresh:Number(element("ocrThreshold").value)};
 }
 async function saveModelConfig() {
   const path=element("modelPath").value.trim();
@@ -1057,6 +1057,13 @@ function confirmImageSelection() {
   element("imageBrowserDialog").close();
   field.focus({preventScroll:true});
 }
+async function refreshOcrRuntime() {
+  const status=await api("/api/ocr/runtime");
+  const modelDirectory=status.model_directory||status.model_cache;
+  element("ocrRuntimeStatus").textContent=`${status.message}${status.device ? ` · ${status.device}` : ""}${modelDirectory ? ` · 模型目录：${modelDirectory}` : ""}`;
+  if(status.device)element("ocrDevice").value=status.device;
+  return status;
+}
 function openModelDialog() {
   if(!state.project)return;
   element("modelPath").value=state.project.model_path;
@@ -1064,20 +1071,22 @@ function openModelDialog() {
   const scope = filters().status === "curated" ? "相似筛图后保留的未开始图片" : "未开始图片";
   element("batchScope").textContent=`${filters().batch || "全部批次"}${filters().query ? " · 搜索 "+filters().query : ""} · ${scope}`;
   element("modelDialog").showModal();
+  if(taskUi.type()==="ocr")refreshOcrRuntime().catch(error=>{element("ocrRuntimeStatus").textContent=error.message;});
   pollJobs().catch(error=>toast(error.message,true));
 }
 async function predictCurrent() {
   if(!state.current || state.busy)return;
-  if(!element("modelPath").value.trim()){openModelDialog();return;}
-  await saveModelConfig();
+  const ocr=taskUi.type()==="ocr";
+  if(!ocr && !element("modelPath").value.trim()){openModelDialog();return;}
+  if(!ocr)await saveModelConfig();
   element("modelDialog").close();
   setBusy(true,"模型正在推理；首次加载可能需要片刻…");
   toast("正在运行本地模型，原有标注不会自动替换");
   try{
     state.prediction=await api(itemUrl("/predict"),"POST",modelOptions());
     const prediction=state.prediction;
-    const score=Number(element("confidence").value).toFixed(2);
-    element("predictionSummary").textContent=`发现 ${prediction.shapes.length} 个候选对象 · 阈值 ${score} · ${prediction.provenance.device}。当前画布有 ${state.current.document.shapes.length} 个对象。请选择追加或替换，应用后仍需保存和人工确认。`;
+    const score=Number(ocr?element("ocrThreshold").value:element("confidence").value).toFixed(2);
+    element("predictionSummary").textContent=`发现 ${prediction.shapes.length} 个候选${ocr?"文字区域":"对象"} · ${ocr?"文字检测":"置信度"}阈值 ${score} · ${prediction.provenance.device}。当前画布有 ${state.current.document.shapes.length} 个对象。请选择追加或替换，应用后仍需核对原文、保存和人工确认。`;
     element("predictionDialog").showModal();
   }finally{setBusy(false);}
 }
@@ -1113,7 +1122,7 @@ async function cleanupDuplicates() {
 }
 async function startBatch() {
   if(state.busy)return;
-  await saveModelConfig();
+  if(taskUi.type()!=="ocr")await saveModelConfig();
   if(!await ensureSaved())return;
   const limit=Number(element("batchLimit").value);
   const curated = filters().status === "curated";
@@ -2183,6 +2192,11 @@ listen("cancelModelBrowser","click",()=>element("modelBrowserDialog").close());
 element("modelBrowserDialog").addEventListener("close",()=>{if(element("modelBrowserDialog").open)return;modelBrowser.sequence++;modelBrowser.loading=false;});
 listen("confidence","input",event=>{element("confidenceValue").value=Number(event.target.value).toFixed(2);});
 listen("iou","input",event=>{element("iouValue").value=Number(event.target.value).toFixed(2);});
+listen("ocrThreshold","input",event=>{element("ocrThresholdValue").value=Number(event.target.value).toFixed(2);});
+listen("ocrDevice","change",async event=>{
+  try{const status=await api("/api/ocr/runtime","POST",{device:event.target.value});element("ocrRuntimeStatus").textContent=`${status.message} · ${status.device} · 模型目录：${status.model_directory||status.model_cache}`;}
+  catch(error){toast(error.message,true);refreshOcrRuntime().catch(()=>{});}
+});
 listen("discardPrediction","click",()=>{state.prediction=null;element("predictionDialog").close();});
 listen("appendPrediction","click",()=>applyPrediction(true));listen("replacePrediction","click",()=>applyPrediction(false));
 listen("jobsList","click",async event=>{const button=event.target.closest("[data-cancel-job]");if(button){await api(`/api/jobs/${button.dataset.cancelJob}/cancel`,"POST",{});toast("已请求取消；当前推理结束后停止，不会写入该张结果");}});

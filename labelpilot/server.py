@@ -59,6 +59,7 @@ def create_app(home=None):
                 if record.get("kind") in ("sam3_contours", "duplicate_cleanup") and record["status"] in ("queued", "running"):
                     jobs.cancel(job_id)
             sam3.shutdown()
+            inference.ocr_runtime.close()
             export_previews.shutdown()
             exports.shutdown()
             automation.shutdown()
@@ -124,6 +125,20 @@ def create_app(home=None):
         return {"python": sys.executable, "torch": str(torch.__version__) if torch else None, "cuda": cuda,
                 "device": torch.cuda.get_device_name(0) if cuda else "CPU", "data_directory": str(store.data),
                 "training_available": bool(torch and has_training_dependencies())}
+
+    @app.get("/api/ocr/runtime")
+    def ocr_runtime_status():
+        return inference.ocr_runtime.status()
+
+    @app.post("/api/ocr/runtime")
+    def set_ocr_runtime(payload: dict):
+        with jobs.lock:
+            if any(job["status"] in ("queued", "running") for job in jobs.records.values()) or not inference.lock.acquire(blocking=False):
+                raise Problem("模型任务运行期间不能切换 OCR 设备", 409)
+            try:
+                return inference.ocr_runtime.set_device(payload.get("device"))
+            finally:
+                inference.lock.release()
 
     @app.get("/api/projects")
     def projects():

@@ -1,0 +1,6 @@
+{
+  "python_executable": "PATH_TO_OCR_ENV/python.exe",
+  "model_cache": "ASCII_PATH_TO_OCR_MODEL_CACHE",
+  "model_directory": "PATH_TO_OCR_MODELS",
+  "device": "gpu:0"
+}

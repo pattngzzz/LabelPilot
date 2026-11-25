@@ -48,7 +48,11 @@ const taskUi = (() => {
       segment:"可用检测权重先定位，再由 SAM3 按框生成轮廓；也可直接使用实例分割权重。矩形框可存草稿，补全轮廓后才能审核。",
       semantic:"使用语义分割权重。背景 ID 为 0，前景类别按项目顺序从 1 开始。",
       hand_pose:"使用 21 关键点的手部姿态权重。模板顺序从手腕到小指。",
+      ocr:"使用本地 PaddleOCR 3.2.0（PP-OCRv5 检测 + 识别）生成文字区域和原文建议；每个结果都需核对。",
     }[task];
+    element("predictButton").textContent = task === "ocr" ? "✦ OCR 预标注" : "✦ 模型预标注";
+    element("singlePredict").textContent = task === "ocr" ? "✦ OCR 预标注当前图片" : "✦ 预标注当前图片";
+    element("batchPredict").textContent = task === "ocr" ? "批量 OCR 预标注" : "批量预标注";
     const formats = element("exportFormat");
     element("exportOutputTask").value = task === "segment" ? "segment" : "detect";
     formats.querySelector('[value="yolo"]').textContent = {detect:"YOLO · 按标注用途导出", segment:"YOLO · 按标注用途导出", hand_pose:"YOLO Pose · 21 关键点"}[task] || "YOLO";

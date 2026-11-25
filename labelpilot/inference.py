@@ -11,6 +11,7 @@ from PIL import Image
 from .curation import save_findings
 from .duplicates import duplicate_threshold, filter_duplicates
 from .intake import rare_labels, route_review
+from .ocr_runtime import PaddleOCRRuntime, build_ocr_shapes
 from .store import AUDITABLE, PENDING_REVIEW, Problem, atomic_json, digest, now, read_json
 from .tasks import HAND_COUNT, MAX_MASK_PIXELS, MODEL_TASK, mapped_model_names, mask_shape, model_labels, polygon_area
 
@@ -114,6 +115,7 @@ class Inference:
         self.signature = None
         self.model_digest = None
         self.device = None
+        self.ocr_runtime = PaddleOCRRuntime(store.home)
 
     @contextmanager
     def prediction_slot(self):
@@ -126,6 +128,7 @@ class Inference:
             self.lock.release()
 
     def release_cached_model(self):
+        self.ocr_runtime.close()
         if self.model is not None:
             import torch
             self.model = self.signature = self.model_digest = self.device = None
@@ -136,7 +139,27 @@ class Inference:
         project = self.store.project(project_id)
         task = project.task_type
         if task == "ocr":
-            raise Problem("OCR 当前支持人工标注和导出，尚未接入文字预识别；不能使用 YOLO 代替 OCR", 422)
+            threshold = options.get("text_det_thresh", 0.3)
+            if type(threshold) not in (int, float) or not 0.05 <= threshold <= 0.9:
+                raise Problem("文字检测阈值必须在 0.05 到 0.90 之间", 422)
+            current = self.store.detail(project_id, item_id)
+            item = project.item(item_id)
+            image_path = Path(item["path"]).resolve(strict=True)
+            if not image_path.is_relative_to(project.root):
+                raise Problem("图片路径不在项目目录中", 403)
+            with self.prediction_slot():
+                detections, runtime = self.ocr_runtime.predict(image_path, threshold=threshold)
+                latest = self.store.detail(project_id, item_id)
+                if (latest["version"], latest["image_sha256"]) != (current["version"], current["image_sha256"]):
+                    raise Problem("OCR 推理期间标注或原图发生变化，请重新推理", 409)
+                shapes = build_ocr_shapes(detections, project.names[0], current["width"], current["height"], item_id)
+            provenance = {"engine": "PaddleOCR 3.2.0", "detection_model": "PP-OCRv5_server_det",
+                          "recognition_model": "PP-OCRv5_server_rec", "device": runtime.get("device", "unknown"),
+                          "text_det_thresh": threshold, "image_sha256": current["image_sha256"],
+                          "created_at": now(), "human_reviewed": False,
+                          "candidate_count": len(shapes)}
+            return {"shapes": shapes, "provenance": provenance, "base_version": current["version"],
+                    "image_sha256": current["image_sha256"]}
         path = Path(model_path or project.config.get("model_path", ""))
         if path.suffix.lower() != ".pt" or not path.is_file():
             raise Problem("未配置可信的本地 .pt 模型；不会联网下载权重", 422)
@@ -252,14 +275,16 @@ class Jobs:
 
     def start(self, project_id, options, *, audit=False, routing=False, task_id=None, pinned_model=None):
         project = self.store.project(project_id)
-        if project.task_type == "ocr":
-            raise Problem("OCR 当前支持人工标注和导出，尚未接入批量文字预识别", 422)
         limit = options.get("limit", 100)
         query, batch = options.get("query", ""), options.get("batch", "")
         if type(limit) is not int or not 1 <= limit <= 10000:
             raise Problem("每批数量必须为 1 到 10000", 422)
         if not isinstance(query, str) or not isinstance(batch, str):
             raise Problem("批次和关键词必须为文本", 422)
+        if project.task_type == "ocr":
+            threshold = options.get("text_det_thresh", 0.3)
+            if type(threshold) not in (int, float) or not 0.05 <= threshold <= 0.9:
+                raise Problem("文字检测阈值必须在 0.05 到 0.90 之间", 422)
         if audit:
             if project.task_type != "detect":
                 raise Problem("按框查找标注疑点适用于目标检测项目", 422)
