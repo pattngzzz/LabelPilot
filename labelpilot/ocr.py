@@ -4,7 +4,9 @@ import math
 import re
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageDraw
+
+from .tasks import is_rotated_box, simple_polygon
 
 
 READABILITY = ("readable", "partial", "unreadable")
@@ -13,7 +15,7 @@ VALUE_ROLES = ("process_value", "setpoint", "state", "clock", "unknown", "not_ap
 
 def text_points(shape):
     points = shape["points"]
-    if shape["shape_type"] == "rectangle":
+    if shape["shape_type"] == "rectangle" and not is_rotated_box(shape):
         horizontal, vertical = zip(*points)
         left, right, top, bottom = min(horizontal), max(horizontal), min(vertical), max(vertical)
         return [[left, top], [right, top], [right, bottom], [left, bottom]]
@@ -46,15 +48,8 @@ def validate_ocr_shape(shape, *, reviewed=False):
     if readability != "readable" and value is not None:
         raise ValueError("未完整可读区域不能填写确定数值")
     points = text_points(shape)
-    if len(points) != 4:
-        raise ValueError("OCR 文字区域使用矩形或四点多边形；请按文字边缘依次点击四个角")
-    turns = []
-    for index, current in enumerate(points):
-        following, after = points[(index + 1) % 4], points[(index + 2) % 4]
-        turns.append((following[0] - current[0]) * (after[1] - following[1])
-                     - (following[1] - current[1]) * (after[0] - following[0]))
-    if not (all(turn > 1e-9 for turn in turns) or all(turn < -1e-9 for turn in turns)):
-        raise ValueError("OCR 四点框不能交叉、凹陷或退化；请沿文字边缘顺序标注")
+    if not simple_polygon(points):
+        raise ValueError("OCR 文字区域至少需要三个顶点，不能交叉、重叠或退化；请沿文字边缘顺序标注")
 
 
 def detection_entries(document):
@@ -71,6 +66,11 @@ def recognition_crop(image, points):
     import numpy as np
 
     corners = np.asarray(points, dtype=np.float32)
+    if len(corners) != 4 or not cv2.isContourConvex(corners):
+        corners = cv2.boxPoints(cv2.minAreaRect(corners))
+        mask = Image.new("L", image.size, 0)
+        ImageDraw.Draw(mask).polygon([tuple(point) for point in points], fill=255)
+        image = Image.composite(image, Image.new("RGB", image.size, "white"), mask)
     center = corners.mean(axis=0)
     order = np.argsort(np.arctan2(corners[:, 1] - center[1], corners[:, 0] - center[0]))
     corners = corners[order]
@@ -145,4 +145,5 @@ def finish_ocr_export(archive, records, manifest):
                     "每张原图只分配一次集合，裁剪继承原图集合；建议按来源组划分，避免同源泄漏。\n"
                     "仅完整可读区域生成识别裁剪；部分/不可读区域在检测标签中标 ###，完整原文与属性保存在 annotations。\n"
                     "确认无文字的图片在检测清单中保留 []，不生成识别样本；这不表示读数为零。\n"
-                    "四点区域作透视校正，竖长区域逆时针转正；请抽查文字方向。未执行 OCR 训练或识别质量验证。\n")
+                    "检测标签保留原始多边形顶点；凸四点区域作透视校正，其他多边形按最小外接旋转矩形裁剪并将轮廓外填白。\n"
+                    "竖长区域逆时针转正；请抽查文字方向。未执行 OCR 训练或识别质量验证。\n")

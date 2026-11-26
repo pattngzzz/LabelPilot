@@ -681,7 +681,40 @@ function bounds(shape) {
   return [Math.min(...horizontal),Math.min(...vertical),Math.max(...horizontal),Math.max(...vertical)];
 }
 function rectanglePoints(left,top,right,bottom) { return [[left,top],[right,top],[right,bottom],[left,bottom]]; }
-function shapePoints(shape) { return shape.shape_type === "polygon" ? shape.points : rectanglePoints(...bounds(shape)); }
+function rectangleCorners(points) {
+  if (points.length !== 4) return false;
+  const edges = points.map((point,index) => [points[(index+1)%4][0]-point[0],points[(index+1)%4][1]-point[1]]);
+  const lengths = edges.map(edge => Math.hypot(...edge));
+  if (lengths.some(length => length<1e-8)) return false;
+  return edges.every((edge,index) => {
+    const next = edges[(index+1)%4], opposite = edges[(index+2)%4];
+    return Math.abs(edge[0]*next[0]+edge[1]*next[1])<=1e-7*lengths[index]*lengths[(index+1)%4] &&
+      Math.hypot(edge[0]+opposite[0],edge[1]+opposite[1])<=1e-7*Math.max(lengths[index],lengths[(index+2)%4]);
+  });
+}
+function rectangleShape(shape) {
+  return shape.shape_type === "rectangle" || shape.shape_type === "polygon" && shape.rotation_shape_type !== "polygon" && Number.isFinite(shape.rotation) && rectangleCorners(shape.points);
+}
+function shapePoints(shape) {
+  return shape.shape_type === "polygon" || Number.isFinite(shape.rotation) && shape.points.length===4
+    ? shape.points : rectanglePoints(...bounds(shape));
+}
+function resizedRectangle(shape, handle, point) {
+  const points = shapePoints(shape), origin = points[0];
+  const width = Math.hypot(points[1][0]-origin[0],points[1][1]-origin[1]);
+  const height = Math.hypot(points[3][0]-origin[0],points[3][1]-origin[1]);
+  const horizontal = [(points[1][0]-origin[0])/width,(points[1][1]-origin[1])/width];
+  const vertical = [(points[3][0]-origin[0])/height,(points[3][1]-origin[1])/height];
+  const offset = [point[0]-origin[0],point[1]-origin[1]];
+  const local = [offset[0]*horizontal[0]+offset[1]*horizontal[1],offset[0]*vertical[0]+offset[1]*vertical[1]];
+  let left=0, top=0, right=width, bottom=height;
+  if([0,6,7].includes(handle))left=Math.min(local[0],right-1);
+  if([2,3,4].includes(handle))right=Math.max(local[0],left+1);
+  if([0,1,2].includes(handle))top=Math.min(local[1],bottom-1);
+  if([4,5,6].includes(handle))bottom=Math.max(local[1],top+1);
+  return rectanglePoints(left,top,right,bottom).map(([across,down]) =>
+    [origin[0]+across*horizontal[0]+down*vertical[0],origin[1]+across*horizontal[1]+down*vertical[1]]);
+}
 function rotateSelectedShape(degrees, notify=true) {
   if (!state.current || state.busy || state.drag || state.pendingShape || state.rectangle || state.polygon.length || state.space ||
       !["detect","segment","ocr"].includes(taskUi.type())) return;
@@ -699,16 +732,16 @@ function rotateSelectedShape(degrees, notify=true) {
     return [center[0]+horizontal*cosine-vertical*sine, center[1]+horizontal*sine+vertical*cosine];
   });
   checkpoint();
-  shape.shape_type = "polygon";
+  if (rectangleShape(shape)) shape.shape_type = "rectangle";
+  else shape.rotation_shape_type = "polygon";
   shape.points = points;
   shape.rotation = ((Number.isFinite(shape.rotation) ? shape.rotation : 0)+degrees)%360;
   changed();
 }
 function handles(shape) {
-  if (shape.shape_type === "polygon") return shape.points;
-  if (shape.shape_type !== "rectangle") return [];
-  const [left,top,right,bottom] = bounds(shape);
-  return [[left,top],[(left+right)/2,top],[right,top],[right,(top+bottom)/2],[right,bottom],[(left+right)/2,bottom],[left,bottom],[left,(top+bottom)/2]];
+  if (!rectangleShape(shape)) return shape.shape_type === "polygon" ? shape.points : [];
+  const points = shapePoints(shape);
+  return points.flatMap((point,index) => [point,[(point[0]+points[(index+1)%4][0])/2,(point[1]+points[(index+1)%4][1])/2]]);
 }
 function pathPoints(points,close=true) {
   context.beginPath();
@@ -818,7 +851,6 @@ function addShape(points,kind,details={}) {
 }
 function finishPolygon() {
   if (state.pendingShape) return;
-  if (taskUi.type() === "ocr" && state.polygon.length !== 4) return toast("OCR 请沿文字边缘依次点击四个角，再按 Q / Enter 完成", true);
   if(state.polygon.length<3)return toast("多边形至少需要三个顶点");
   const points=copy(state.polygon);
   if(points.length>3 && Math.hypot(points.at(-1)[0]-points.at(-2)[0],points.at(-1)[1]-points.at(-2)[1])*state.scale<3)points.pop();
@@ -848,7 +880,12 @@ canvas.addEventListener("pointerdown",event => {
     openLabelPicker(rectanglePoints(Math.min(start[0],point[0]),Math.min(start[1],point[1]),Math.max(start[0],point[0]),Math.max(start[1],point[1])),point);
     return;
   }
-  if(actual[0]<0 || actual[1]<0 || actual[0]>state.current.width || actual[1]>state.current.height)return;
+  const selected=state.current.document.shapes[state.selected];
+  const outside=actual[0]<0 || actual[1]<0 || actual[0]>state.current.width || actual[1]>state.current.height;
+  const outsideSelection=outside && state.tool==="select" && selected && Number.isFinite(selected.rotation) &&
+    (pointInside(actual,shapePoints(selected)) || handles(selected).some(position => Math.hypot(position[0]-actual[0],position[1]-actual[1])*state.scale<8));
+  if(outside && !outsideSelection)return;
+  if(outsideSelection)point.splice(0,2,...actual);
   if(efficiency.handleCanvas(point))return;
   if(taskUi.pointerDown(event, point))return;
   if(state.tool==="rectangle"){state.rectangle={start:point,end:point};state.selected=-1;renderObjects();draw();return;}
@@ -861,7 +898,6 @@ canvas.addEventListener("pointerdown",event => {
     state.polygon.push(point);draw();return;
   }
   canvas.setPointerCapture(event.pointerId);
-  const selected=state.current.document.shapes[state.selected];
   if(selected){
     const handle=handles(selected).findIndex(position => Math.hypot(position[0]-point[0],position[1]-point[1])*state.scale<8);
     if(handle>=0){state.drag={type:"resize",handle,start:point,original:copy(selected),before:snapshot()};return;}
@@ -876,7 +912,7 @@ canvas.addEventListener("pointerdown",event => {
 canvas.addEventListener("pointermove",event => {
   updateCrosshair(event);
   if(!state.current)return;
-  const point=imagePoint(event,true);
+  const point=imagePoint(event,!Number.isFinite(state.drag?.original?.rotation));
   element("coordinateText").textContent=`x ${Math.round(point[0])} · y ${Math.round(point[1])}`;
   if(!state.busy && taskUi.pointerMove(event, point))return;
   if(state.rectangle && !state.busy){state.rectangle.end=point;draw();}
@@ -892,15 +928,10 @@ canvas.addEventListener("pointermove",event => {
   }
   if(drag.type==="resize"){
     const shape=state.current.document.shapes[state.selected];
-    if(shape.shape_type==="polygon")shape.points[drag.handle]=point;
-    else{
-      let [left,top,right,bottom]=bounds(drag.original);
-      if([0,6,7].includes(drag.handle))left=Math.min(point[0],right-1);
-      if([2,3,4].includes(drag.handle))right=Math.max(point[0],left+1);
-      if([0,1,2].includes(drag.handle))top=Math.min(point[1],bottom-1);
-      if([4,5,6].includes(drag.handle))bottom=Math.max(point[1],top+1);
-      shape.points=rectanglePoints(left,top,right,bottom);
-    }
+    if(rectangleShape(drag.original)){
+      shape.shape_type="rectangle";
+      shape.points=resizedRectangle(drag.original,drag.handle,point);
+    }else if(shape.shape_type==="polygon")shape.points[drag.handle]=point;
   }
   draw();
 });

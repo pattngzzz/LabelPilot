@@ -142,8 +142,10 @@ class ExportPlan:
 
 def output_document(plan, document):
     document = copy.deepcopy(document)
-    if plan.output_task == "detect":
+    if plan.output_task == "detect" or plan.format_name == "yolo" and not plan.output_task and plan.project.task_type == "detect":
         for shape in document["shapes"]:
+            if plan.output_task != "detect" and shape["shape_type"] != "rectangle":
+                continue
             xs, ys = zip(*shape["points"])
             left, top, right, bottom = min(xs), min(ys), max(xs), max(ys)
             if is_rotated_box(shape):
@@ -460,7 +462,9 @@ def write_verified_image(archive, source, name, expected_digest):
 def labelme_shapes(shapes):
     result = []
     for shape in shapes:
-        if shape["shape_type"] == "rectangle" and len(shape["points"]) == 4:
+        if shape["shape_type"] == "rectangle" and is_rotated_box(shape):
+            shape = {**shape, "shape_type": "polygon"}
+        elif shape["shape_type"] == "rectangle" and len(shape["points"]) == 4:
             xs, ys = zip(*shape["points"])
             shape = {**shape, "points": [[min(xs), min(ys)], [max(xs), max(ys)]]}
         result.append(shape)

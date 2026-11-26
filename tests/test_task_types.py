@@ -80,7 +80,7 @@ def test_ocr_default_class_and_precise_text_survive_revision_and_reload(tmp_path
     {"value_decimal": 0.25}, {"value_decimal": "NaN"}, {"value_decimal": "0x250"},
     {"value_decimal": "1e3"}, {"readability": "partial"}, {"readability": "unreadable"},
     {"shape_type": "polygon", "points": [[5, 8], [65, 28], [65, 8], [5, 28]]},
-    {"shape_type": "polygon", "points": [[5, 8], [65, 8], [5, 28]]},
+    {"shape_type": "polygon", "points": [[5, 8], [65, 8]]},
 ])
 def test_ocr_invalid_review_is_rejected_without_saving(tmp_path, attributes):
     store, project, item = project_with_image(tmp_path, "ocr")
@@ -151,6 +151,58 @@ def test_ocr_slanted_quadrilateral_preserves_points_and_text(tmp_path, points):
         assert exported.read("rec/all.txt").decode().endswith("\t-01.20 °C\n")
 
 
+@pytest.mark.parametrize("points", [
+    [[10, 10], [65, 10], [40, 45]],
+    [[5, 5], [65, 10], [25, 20], [5, 45]],
+    [[10, 10], [55, 8], [70, 25], [55, 48], [10, 40]],
+    [[5, 10], [65, 10], [65, 25], [35, 25], [35, 45], [5, 45]],
+    [[5, 10], [35, 10], [65, 10], [65, 40], [5, 40]],
+    [[40 + 25 * math.cos(index * math.tau / 12), 30 + 20 * math.sin(index * math.tau / 12)] for index in range(12)],
+])
+def test_ocr_multi_vertex_polygon_saves_and_exports_without_losing_vertices(tmp_path, points):
+    store, project, item = project_with_image(tmp_path, "ocr")
+    source = Path(project.item(item)["path"]).read_bytes()
+    shape = ocr_shape("25.0°C", shape_type="polygon", points=points, value_decimal="25.0", unit="°C")
+    reviewed(store, project, item, [shape])
+    assert Store(store.home).detail(project.id, item)["document"]["shapes"] == [shape]
+    for format_name in ("paddleocr", "labelme"):
+        with archive(store, project, format_name) as exported:
+            annotation = next(name for name in exported.namelist() if name.startswith("annotations/"))
+            assert json.loads(exported.read(annotation))["shapes"] == [shape]
+            if format_name == "paddleocr":
+                entries = json.loads(exported.read("det/all.txt").decode().strip().split("\t", 1)[1])
+                assert entries == [{"transcription": "25.0°C", "points": points}]
+                crop_name = next(name for name in exported.namelist() if name.startswith("recognition/"))
+                with exported.open(crop_name) as stream, Image.open(stream) as crop:
+                    assert crop.width >= 2 and crop.height >= 2
+                assert exported.read("rec/all.txt").decode().endswith("\t25.0°C\n")
+    assert Path(project.item(item)["path"]).read_bytes() == source
+
+
+@pytest.mark.parametrize("points", [
+    [[5, 5], [70, 45], [5, 45], [70, 5], [75, 55]],
+    [[5, 5], [65, 5], [65, 45], [5, 5], [5, 45]],
+    [[5, 5], [65, 5], [35, 5], [65, 45], [5, 45]],
+    [[5, 5], [25, 5], [45, 5], [65, 5]],
+])
+def test_ocr_invalid_multi_vertex_polygon_is_rejected_without_saving(tmp_path, points):
+    store, project, item = project_with_image(tmp_path, "ocr")
+    with pytest.raises(Problem, match="交叉|重叠|退化|面积"):
+        reviewed(store, project, item, [ocr_shape(shape_type="polygon", points=points)])
+    assert store.detail(project.id, item)["version"] == 0
+
+
+def test_ocr_concave_polygon_crop_masks_outside_without_changing_source():
+    from labelpilot.ocr import recognition_crop
+
+    source = Image.new("RGB", (80, 60), "red")
+    before = source.tobytes()
+    crop = recognition_crop(source, [[5, 10], [65, 10], [65, 25], [35, 25], [35, 45], [5, 45]])
+    assert crop.getpixel((5, 5)) == (255, 0, 0)
+    assert crop.getpixel((50, 25)) == (255, 255, 255)
+    assert source.tobytes() == before
+
+
 @pytest.mark.parametrize("degrees", [-90, -5, -1, 1, 5, 90])
 def test_ocr_rotated_box_survives_save_reload_and_exports(tmp_path, degrees):
     store, project, item = project_with_image(tmp_path, "ocr")
@@ -159,7 +211,7 @@ def test_ocr_rotated_box_survives_save_reload_and_exports(tmp_path, degrees):
     points = [[40 + horizontal * math.cos(radians) - vertical * math.sin(radians),
                30 + horizontal * math.sin(radians) + vertical * math.cos(radians)]
               for horizontal, vertical in [(-20, -8), (20, -8), (20, 8), (-20, 8)]]
-    shape = ocr_shape("00.250 g", shape_type="polygon", points=points, rotation=degrees, custom_attribute={"keep": True})
+    shape = ocr_shape("00.250 g", shape_type="rectangle", points=points, rotation=degrees, custom_attribute={"keep": True})
     reviewed(store, project, item, [shape])
     assert Store(store.home).detail(project.id, item)["document"]["shapes"] == [shape]
     with archive(store, project, "paddleocr") as exported:
@@ -171,8 +223,44 @@ def test_ocr_rotated_box_survives_save_reload_and_exports(tmp_path, degrees):
             assert 40 <= crop.width <= 41 and 16 <= crop.height <= 17
     with archive(store, project, "labelme") as exported:
         annotation = next(name for name in exported.namelist() if name.startswith("annotations/"))
-        assert json.loads(exported.read(annotation))["shapes"] == [shape]
+        assert json.loads(exported.read(annotation))["shapes"] == [{**shape, "shape_type": "polygon"}]
     assert Path(project.item(item)["path"]).read_bytes() == source
+
+
+@pytest.mark.parametrize("task", ["detect", "ocr"])
+def test_outside_rotated_rectangle_keeps_rectangle_type_and_exact_corners(tmp_path, task):
+    store, project, item = project_with_image(tmp_path, task, ["text"])
+    radians = math.radians(15)
+    points = [[40 + horizontal * math.cos(radians) - vertical * math.sin(radians),
+               30 + horizontal * math.sin(radians) + vertical * math.cos(radians)]
+              for horizontal, vertical in [(-40, -30), (40, -30), (40, 30), (-40, 30)]]
+    shape = ocr_shape(shape_type="rectangle", points=points, rotation=15)
+    reviewed(store, project, item, [shape])
+    assert Store(store.home).detail(project.id, item)["document"]["shapes"] == [shape]
+    if task == "ocr":
+        with archive(store, project, "paddleocr") as exported:
+            entries = json.loads(exported.read("det/all.txt").decode().strip().split("\t", 1)[1])
+            assert entries == [{"transcription": "00.250 g", "points": points}]
+    else:
+        with archive(store, project, "yolo") as exported:
+            name = next(name for name in exported.namelist() if name.startswith("labels/"))
+            assert list(map(float, exported.read(name).split())) == pytest.approx([0, .5, .5, 1, 1])
+    with archive(store, project, "labelme") as exported:
+        annotation = next(name for name in exported.namelist() if name.startswith("annotations/"))
+        assert json.loads(exported.read(annotation))["shapes"] == [{**shape, "shape_type": "polygon"}]
+    assert store.detail(project.id, item)["document"]["shapes"] == [shape]
+
+
+@pytest.mark.parametrize("points,rotation", [
+    ([[5, 5], [65, 8], [65, 40], [5, 40]], 5),
+    ([[5, 5], [65, 40]], 5),
+    ([[5, 5], [65, 5], [65, 40], [5, 40]], "5"),
+])
+def test_rotated_rectangle_cannot_be_saved_as_a_deformed_polygon(tmp_path, points, rotation):
+    store, project, item = project_with_image(tmp_path, "ocr")
+    with pytest.raises(Problem, match="旋转矩形"):
+        reviewed(store, project, item, [ocr_shape(points=points, rotation=rotation)])
+    assert store.detail(project.id, item)["version"] == 0
 
 
 def test_detection_export_of_rotated_box_uses_bounds_only_when_requested(tmp_path):

@@ -1412,13 +1412,13 @@ print('Rotation ZIP: all angles, dimensions, exact normalized boxes and train-on
     await click('[data-tool="select"]');
     await evaluate('window.ocrBeforeRotation=structuredClone(state.current.document.shapes[0]);');
     await press("z", "KeyZ");
-    await check('(()=>{const shape=state.current.document.shapes[0];return shape.shape_type==="polygon" && shape.points.length===4 && shape.points[1][1]<shape.points[0][1] && shape.text_raw===ocrBeforeRotation.text_raw && shape.unit==="g";})()',
+    await check('(()=>{const shape=state.current.document.shapes[0];return shape.shape_type==="rectangle" && handles(shape).length===8 && shape.points.length===4 && shape.points[1][1]<shape.points[0][1] && shape.text_raw===ocrBeforeRotation.text_raw && shape.unit==="g";})()',
       "Z rotates the selected R box left and preserves OCR transcription and attributes");
     await press("z", "KeyZ", {modifiers:2});
     await check('state.current.document.shapes[0].shape_type==="rectangle" && JSON.stringify(state.current.document.shapes[0].points)===JSON.stringify(ocrBeforeRotation.points)',
       "Ctrl+Z undoes rotation and restores the original rectangle");
     await press("Z", "KeyZ", {modifiers:10});
-    await check('state.current.document.shapes[0].shape_type==="polygon"', "Ctrl+Shift+Z redoes rotation");
+    await check('state.current.document.shapes[0].shape_type==="rectangle" && state.current.document.shapes[0].rotation===-1', "Ctrl+Shift+Z redoes rotation without changing the rectangle type");
     await click('[data-shape="0"]');
     await press("X", "KeyX", {modifiers:8});
     await check('(()=>{const points=state.current.document.shapes[0].points;return Math.abs(Math.atan2(points[1][1]-points[0][1],points[1][0]-points[0][0])*180/Math.PI-4)<1e-8 && points.some(([horizontal,vertical])=>horizontal<0 || vertical<0 || horizontal>state.current.width || vertical>state.current.height);})()',
@@ -1433,20 +1433,20 @@ print('Rotation ZIP: all angles, dimensions, exact normalized boxes and train-on
     await waitFor('state.items.some(item=>item.status==="reviewed") && !state.busy');
     await press("a", "KeyA");
     await waitFor('state.current?.status==="reviewed" && !state.busy');
-    await check('state.current.document.shapes[0].text_raw==="00.250 g" && state.current.document.shapes[0].unit==="g" && state.current.document.shapes[0].shape_type==="polygon" && JSON.stringify(state.current.document.shapes[0].points)===JSON.stringify(ocrRotatedPoints)',
+    await check('state.current.document.shapes[0].text_raw==="00.250 g" && state.current.document.shapes[0].unit==="g" && state.current.document.shapes[0].shape_type==="rectangle" && JSON.stringify(state.current.document.shapes[0].points)===JSON.stringify(ocrRotatedPoints)',
       "E reviews OCR annotations and reload preserves their rotation, text, unit and metadata");
     await click('[data-shape="0"]');
     await evaluate('element("toasts").replaceChildren()');
     fs.writeFileSync(path.join(home,"ocr-workspace.png"), Buffer.from((await cdp("Page.captureScreenshot", {format:"png"})).data,"base64"));
     await press("p", "KeyP");
-    for (const coordinate of [[190,50],[280,55],[275,90],[190,85]]) await mouseClick(await point(coordinate));
+    for (const coordinate of [[190,50],[235,48],[280,55],[282,72],[275,90],[190,85]]) await mouseClick(await point(coordinate));
     await mouseClick(await point([190,50]));
     await waitFor('element("labelPicker").open');
     await setReviewValue("pickerOcrReadability", "unreadable");
     await click("#confirmPickedLabel");
     await waitFor('state.current.document.shapes.length===2 && !element("labelPicker").open');
-    await check('state.current.document.shapes[1].shape_type==="polygon" && state.current.document.shapes[1].readability==="unreadable" && state.current.document.shapes[1].text_raw===""',
-      "Four-corner OCR regions can record unreadable text without inventing zero");
+    await check('state.current.document.shapes[1].shape_type==="polygon" && state.current.document.shapes[1].points.length===6 && state.current.document.shapes[1].readability==="unreadable" && state.current.document.shapes[1].text_raw===""',
+      "Six-point OCR polygons close at the first vertex and record unreadable text without inventing zero");
     await click("#saveButton");
     await waitFor('state.current.status==="draft" && !state.dirty && !state.busy');
     await click("#reviewButton");

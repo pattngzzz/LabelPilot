@@ -13,7 +13,7 @@ from pathlib import Path
 from PIL import Image
 
 from .ocr import validate_ocr_shape
-from .tasks import BACKGROUND, HAND_KEYPOINTS, HAND_SKELETON, MAX_MASK_PIXELS, SHAPE_TYPES, is_rotated_box, polygon_area, read_mask, semantic_mask, validate_hand
+from .tasks import BACKGROUND, HAND_KEYPOINTS, HAND_SKELETON, MAX_MASK_PIXELS, SHAPE_TYPES, is_rotated_box, polygon_area, read_mask, rectangle_corners, semantic_mask, validate_hand
 
 
 STATUSES = ("unstarted", "imported", "predicted", "draft", "reviewed", "skipped", "error")
@@ -820,6 +820,8 @@ class Store:
                 raise Problem("标注面积必须大于零", 422)
             if kind == "polygon" and polygon_area(points) < 5e-9:
                 raise Problem("多边形面积必须大于零", 422)
+            if kind == "rectangle" and "rotation" in shape and (not is_rotated_box(shape) or not rectangle_corners(points)):
+                raise Problem("旋转矩形需要四个按顺序排列、相邻边垂直的角点", 422)
             try:
                 if kind == "mask":
                     read_mask(shape)

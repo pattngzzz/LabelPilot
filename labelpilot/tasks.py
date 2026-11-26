@@ -69,7 +69,7 @@ def polygon_area(points):
 
 def is_rotated_box(shape):
     angle, points = shape.get("rotation"), shape.get("points")
-    if (shape.get("shape_type") != "polygon" or type(angle) not in (int, float) or not math.isfinite(angle)
+    if (shape.get("shape_type") not in ("rectangle", "polygon") or type(angle) not in (int, float) or not math.isfinite(angle)
             or not isinstance(points, list) or len(points) != 4):
         return False
     if any(not isinstance(point, list) or len(point) != 2
@@ -79,6 +79,52 @@ def is_rotated_box(shape):
              - (following[1] - current[1]) * (after[0] - following[0])
              for current, following, after in zip(points, points[1:] + points[:1], points[2:] + points[:2])]
     return all(turn > 1e-9 for turn in turns) or all(turn < -1e-9 for turn in turns)
+
+
+def rectangle_corners(points):
+    if len(points) != 4:
+        return False
+    edges = [(following[0] - point[0], following[1] - point[1])
+             for point, following in zip(points, points[1:] + points[:1])]
+    lengths = [math.hypot(*edge) for edge in edges]
+    if min(lengths) < 1e-8:
+        return False
+    for index, edge in enumerate(edges):
+        following, opposite = edges[(index + 1) % 4], edges[(index + 2) % 4]
+        if (abs(edge[0] * following[0] + edge[1] * following[1]) > 1e-7 * lengths[index] * lengths[(index + 1) % 4]
+                or math.hypot(edge[0] + opposite[0], edge[1] + opposite[1]) > 1e-7 * max(lengths[index], lengths[(index + 2) % 4])):
+            return False
+    return True
+
+
+def simple_polygon(points):
+    if len(points) < 3 or len({tuple(point) for point in points}) != len(points) or polygon_area(points) < 5e-9:
+        return False
+
+    def turn(first, second, third):
+        return (second[0] - first[0]) * (third[1] - first[1]) - (second[1] - first[1]) * (third[0] - first[0])
+
+    def on_edge(first, second, point):
+        return (abs(turn(first, second, point)) < 1e-9
+                and min(first[0], second[0]) <= point[0] <= max(first[0], second[0])
+                and min(first[1], second[1]) <= point[1] <= max(first[1], second[1]))
+
+    edges = list(zip(points, points[1:] + points[:1]))
+    for index, (first, second) in enumerate(edges):
+        previous = points[index - 1]
+        if abs(turn(previous, first, second)) < 1e-9 and ((first[0] - previous[0]) * (second[0] - first[0])
+                                                       + (first[1] - previous[1]) * (second[1] - first[1])) < 0:
+            return False
+        for following in range(index + 1, len(edges)):
+            if following == index + 1 or index == 0 and following == len(edges) - 1:
+                continue
+            third, fourth = edges[following]
+            if ((turn(first, second, third) * turn(first, second, fourth) < 0
+                 and turn(third, fourth, first) * turn(third, fourth, second) < 0)
+                    or on_edge(first, second, third) or on_edge(first, second, fourth)
+                    or on_edge(third, fourth, first) or on_edge(third, fourth, second)):
+                return False
+    return True
 
 
 def validate_hand(shape, bounds):

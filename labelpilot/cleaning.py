@@ -3,6 +3,7 @@ import json
 from PIL import Image
 
 from .store import Problem
+from .tasks import is_rotated_box
 
 
 def annotation_key(document, *, ordered=False):
@@ -10,7 +11,7 @@ def annotation_key(document, *, ordered=False):
     for original in document["shapes"]:
         shape = {name: value for name, value in original.items()
                  if name not in ("score", "prediction_id", "prediction_origin")}
-        if shape["shape_type"] == "rectangle":
+        if shape["shape_type"] == "rectangle" and not is_rotated_box(shape):
             xs, ys = zip(*shape["points"])
             shape["points"] = [[min(xs), min(ys)], [max(xs), max(ys)]]
         shape["points"] = [[float(x), float(y)] for x, y in shape["points"]]

@@ -3,7 +3,7 @@
 const taskUi = (() => {
   const names = {detect:"目标检测", segment:"实例分割", semantic:"语义分割", hand_pose:"手部姿态", ocr:"OCR 文字与读数"};
   const instructions = {
-    ocr:"R 框文字 · Z / X 左右旋转选中框 · P 标四角、Q 完成 · E 审核下一张",
+    ocr:"R 矩形 · Z / X 旋转 · P 多边形（至少三点），点首点 / Q 完成 · E 审核下一张",
     detect:"R 两次点击画框 · Z / X 左右旋转选中框 · Esc 取消 · A / D 翻页",
     segment:"R 画定位框 · Z / X 左右旋转选中框 · SAM3 生成轮廓 · P 描轮廓、Q 完成",
     semantic:"P 圈区域 · B 画笔 · X 橡皮 · 按类别生成像素掩膜",

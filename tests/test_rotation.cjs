@@ -20,7 +20,7 @@ function harness(task="ocr", shape={label:"text", shape_type:"rectangle", points
     value_decimal:"00.250", flags:{verified:true}, attributes:{source:"manual"}}) {
   const state = {current:{width:240,height:180,document:{shapes:[structuredClone(shape)]}},
     selected:0, undo:[], redo:[], tool:"select", busy:false, drag:null, pendingShape:null,
-    rectangle:null, polygon:[], space:false, dirty:false};
+    rectangle:null, polygon:[], space:false, dirty:false, scale:1};
   const environment = {state, dialog:false, notifications:[], renders:0};
   let onKeydown;
   const sandbox = {
@@ -36,12 +36,15 @@ function harness(task="ocr", shape={label:"text", shape_type:"rectangle", points
     toast:(message, error) => environment.notifications.push({message,error}),
     setDirty:() => { state.dirty = true; },
     renderObjects:() => { environment.renders++; }, draw:() => {},
+    openLabelPicker:(points, anchor, kind) => { environment.picker = {points,anchor,kind}; },
     setTool:tool => { state.tool = tool; },
     efficiency:{keydown:() => false},
   };
   vm.createContext(sandbox);
   vm.runInContext(section(app, "function snapshot()", "function classInfo("), sandbox);
   vm.runInContext(section(app, "function bounds(", "function pathPoints("), sandbox);
+  vm.runInContext(section(app, "function finishPolygon()", 'canvas.addEventListener("pointerdown"'), sandbox);
+  environment.geometry = sandbox;
   vm.runInContext(section(tools, "  function toolAllowed(", "  function toolChanged("), sandbox);
   vm.runInContext(section(tools, "  function keydown(", "  function opacity("), sandbox);
   sandbox.taskUi = {type:() => task, keydown:sandbox.keydown};
@@ -75,7 +78,7 @@ for (const task of ["detect", "segment", "ocr"]) {
       const original = structuredClone(environment.state.current.document.shapes[0]);
       assert.equal(environment.press(key).prevented, true);
       const rotated = environment.state.current.document.shapes[0];
-      assert.equal(rotated.shape_type, "polygon");
+      assert.equal(rotated.shape_type, "rectangle");
       assert.equal(rotated.points.length, 4);
       close(angle(rotated), degrees);
       close(Math.hypot(rotated.points[1][0]-rotated.points[0][0], rotated.points[1][1]-rotated.points[0][1]), 120);
@@ -111,8 +114,75 @@ test("Rotation works on selected four-point polygons and leaves other objects un
   environment.state.selected = 1;
   environment.press("x");
   assert.deepEqual(environment.state.current.document.shapes[0], original);
+  assert.equal(environment.state.current.document.shapes[1].shape_type, "polygon");
   environment.press("z");
   pointsClose(environment.state.current.document.shapes[1].points, original.points);
+});
+
+test("Rotated rectangles keep eight aligned handles and resize along their own axes", () => {
+  for (let handle=0; handle<8; handle++) {
+    const environment = harness();
+    environment.press("X", {shiftKey:true});
+    const shape = environment.state.current.document.shapes[0];
+    const handles = environment.geometry.handles(shape);
+    assert.equal(handles.length, 8);
+    const target = [handles[handle][0]+12,handles[handle][1]+7];
+    const points = environment.geometry.resizedRectangle(shape,handle,target);
+    assert.equal(environment.geometry.rectangleCorners(points), true);
+    close(angle({points}), 5);
+    pointsClose([points[(Math.floor(handle/2)+2)%4]], [shape.points[(Math.floor(handle/2)+2)%4]]);
+  }
+});
+
+test("Legacy rotated rectangle polygons use rectangle handles and become rectangles on rotation", () => {
+  const environment = harness();
+  environment.press("X", {shiftKey:true});
+  const shape = environment.state.current.document.shapes[0];
+  shape.shape_type = "polygon";
+  assert.equal(environment.geometry.handles(shape).length, 8);
+  const before = structuredClone(shape.points);
+  environment.press("x");
+  assert.equal(shape.shape_type, "rectangle");
+  close(angle(shape), 6);
+  assert.notDeepEqual(shape.points, before);
+});
+
+test("Ordinary polygons retain independent vertex handles rather than rectangle handles", () => {
+  const environment = harness("ocr", {shape_type:"polygon",points:[[40,40],[160,40],[160,80],[40,80]]});
+  const shape = environment.state.current.document.shapes[0];
+  assert.equal(environment.geometry.handles(shape).length, 4);
+  for (const key of ["x", "x", "z", "z"]) {
+    environment.press(key);
+    assert.equal(shape.shape_type, "polygon");
+    assert.equal(environment.geometry.handles(shape).length, 4);
+  }
+  const reloaded = structuredClone(shape);
+  assert.equal(environment.geometry.rectangleShape(reloaded), false);
+  assert.equal(reloaded.rotation_shape_type, "polygon");
+});
+
+test("OCR polygons close with Q or Enter at three, five, six and twelve vertices", () => {
+  for (const count of [3,4,5,6,12]) {
+    for (const key of ["q", "Enter"]) {
+      const environment = harness();
+      const points = Array.from({length:count},(_,index)=>[100+40*Math.cos(index*2*Math.PI/count),80+30*Math.sin(index*2*Math.PI/count)]);
+      environment.state.polygon = points;
+      environment.press(key);
+      assert.equal(environment.picker.kind, "polygon");
+      pointsClose(environment.picker.points, points);
+      assert.equal(environment.state.polygon.length, 0);
+    }
+  }
+});
+
+test("A polygon still needs three non-collinear vertices before opening the label picker", () => {
+  for (const points of [[[1,1],[20,20]],[[1,1],[20,20],[40,40]]]) {
+    const environment = harness();
+    environment.state.polygon = points;
+    environment.press("q");
+    assert.equal(environment.picker, undefined);
+    assert.equal(environment.notifications.length, 1);
+  }
 });
 
 test("Ctrl+Z and Ctrl+Shift+Z still undo and redo the full rotation including shape type", () => {
