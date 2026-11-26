@@ -500,8 +500,8 @@ def create_app(home=None):
         return export_previews.cancel(project_id, job_id)
 
     @app.get("/api/augmentation-presets")
-    def export_augmentation_presets():
-        return augmentation_presets()
+    def export_augmentation_presets(task_type: str = "detect"):
+        return augmentation_presets(task_type)
 
     @app.post("/api/projects/{project_id}/export")
     def export(project_id: str, payload: dict):

@@ -189,9 +189,7 @@ def prepare_export(store, project_id, options, *, include_documents=False, check
         raise Problem("导出开关必须为布尔值", 422)
     if format_name == "paddleocr" and not include_images:
         raise Problem("PaddleOCR 导出需要包含原图，用于配对检测标签并生成识别裁剪", 422)
-    augmentation = plan_augmentation(options)
-    if augmentation and project.task_type not in ("detect", "segment"):
-        raise Problem("当前导出增强仅适用于目标检测和实例分割", 422)
+    augmentation = plan_augmentation(options, project.task_type)
     if clean and not reviewed_only:
         raise Problem("清洗版数据集仅纳入已人工确认的图片", 422)
     if checkpoint:
@@ -750,7 +748,8 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None, progre
             preset = settings["preset"]
             member_offset = len(archive.members) if hasattr(archive, "members") else 0
             variant_id = f"{row['id']}__aug_{preset}_{index}"
-            variant_name = f"images/train/{Path(filename).stem}__aug_{preset}_{index}.jpg"
+            extension = "png" if settings["output"] == "PNG" else "jpg"
+            variant_name = f"images/train/{Path(filename).stem}__aug_{preset}_{index}.{extension}"
             archive.writestr(variant_name, contents)
             if hashlib.sha256(archive.read(variant_name)).hexdigest() != augmented["labelpilot"]["image_sha256"]:
                 raise Problem("增强图片回读指纹不匹配，已中止导出", 422)

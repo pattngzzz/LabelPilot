@@ -24,7 +24,7 @@ const exportSplitHints = {
 
 const imageBrowser = {mode:"folder",target:"newImageRoot",listing:null,selected:new Set(),loading:false,valid:false,sequence:0};
 const projectImages = {files:[],selecting:false};
-const exportAugmentation = {presets:[],maxCopies:3,loaded:false};
+const exportAugmentation = {presets:[],maxCopies:3,loaded:false,task:null,sequence:0};
 let searchTimer;
 let jobTimer;
 let trainingTimer;
@@ -1240,7 +1240,8 @@ function setExportPreviewStatus(message, error=false) {
 }
 
 function exportAugmentationOptions() {
-  const preset = exportAugmentation.presets.find(item => item.id === element("augmentationPreset").value);
+  const preset = exportAugmentation.task === taskUi.type()
+    ? exportAugmentation.presets.find(item => item.id === element("augmentationPreset").value) : undefined;
   for (const id of ["augmentationCopies", "augmentationSeed"]) element(id).disabled = !preset;
   element("augmentationDescription").textContent = preset?.description || "不生成额外图片。";
   const count = preset?.preset_count || 1;
@@ -1268,16 +1269,26 @@ function exportAugmentationOptions() {
 }
 
 async function loadAugmentationCatalog() {
-  if (exportAugmentation.loaded) return;
+  const task = taskUi.type();
+  if (exportAugmentation.loaded && exportAugmentation.task === task) return;
+  const sequence = ++exportAugmentation.sequence;
+  exportAugmentation.loaded = false;
+  exportAugmentation.presets = [];
+  element("augmentationPreset").replaceChildren(new Option("不增强 · 保留原样（默认）", "none"));
+  element("augmentationPreset").disabled = true;
+  if (!["detect", "segment", "ocr"].includes(task)) return;
   try {
-    const catalog = await api("/api/augmentation-presets");
+    const catalog = await api(`/api/augmentation-presets?task_type=${encodeURIComponent(task)}`);
+    if (sequence !== exportAugmentation.sequence || task !== taskUi.type()) return;
     exportAugmentation.presets = catalog.presets;
     exportAugmentation.maxCopies = catalog.max_copies;
     exportAugmentation.loaded = true;
+    exportAugmentation.task = task;
     element("augmentationPreset").append(...catalog.presets.map(item => new Option(item.name, item.id)));
     element("augmentationCopies").max = catalog.max_copies;
     element("augmentationPreset").disabled = false;
   } catch (error) {
+    if (sequence !== exportAugmentation.sequence || task !== taskUi.type()) return;
     element("augmentationDescription").textContent = `增强方案加载失败。${error.message}`;
   }
 }

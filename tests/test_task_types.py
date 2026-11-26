@@ -1,3 +1,5 @@
+import copy
+import hashlib
 import io
 import json
 import math
@@ -391,6 +393,214 @@ def test_ocr_folder_export_inherits_original_split_for_all_crops(tmp_path):
             assert name.startswith(f"recognition/{subset}/") and (output / name).is_file()
             assert text == "00.250 g"
     jobs.shutdown()
+
+
+def test_ocr_augmentation_catalog_is_task_specific(tmp_path):
+    from fastapi.testclient import TestClient
+    from labelpilot.augmentation import OCR_PRESETS, PRESETS
+    from labelpilot.server import create_app
+
+    with TestClient(create_app(tmp_path / "workspace")) as client:
+        for task, presets in (("ocr", OCR_PRESETS), ("detect", PRESETS), ("segment", PRESETS)):
+            response = client.get("/api/augmentation-presets", params={"task_type": task})
+            assert response.status_code == 200
+            catalog = response.json()["presets"]
+            assert {entry["id"] for entry in catalog} == {*presets, "all"}
+            assert catalog[-1]["preset_count"] == len(presets)
+        assert client.get("/api/augmentation-presets", params={"task_type": "semantic"}).status_code == 422
+
+
+@pytest.mark.parametrize("task,preset", [("ocr", "horizontal"), ("ocr", "rotation"), ("ocr", "gentle"),
+                                         ("detect", "ocr_gentle"), ("segment", "ocr_quality")])
+def test_ocr_augmentation_rejects_cross_task_presets(tmp_path, task, preset):
+    store, project, item = project_with_image(tmp_path, task, ["text"])
+    shapes = [polygon("text", 5, 5, 50, 30)] if task == "segment" else [ocr_shape()]
+    reviewed(store, project, item, shapes)
+    with pytest.raises(Problem, match="当前任务"):
+        preview_export(store, project.id, {"format": "paddleocr" if task == "ocr" else "yolo",
+                                         "split": {"train": 100, "val": 0, "test": 0},
+                                         "augmentation": {"preset": preset}})
+
+
+@pytest.mark.parametrize("preset", ["ocr_gentle", "ocr_lighting", "ocr_quality", "all"])
+@pytest.mark.parametrize("format_name", ["paddleocr", "labelme"])
+def test_ocr_augmentation_preserves_shapes_text_crops_and_original_splits(tmp_path, preset, format_name):
+    from labelpilot.ocr import detection_entries, recognition_crop
+
+    store, project, item = project_with_image(tmp_path, "ocr")
+    for index in range(3):
+        Image.new("RGB", (80, 60), (80 + index * 30, 100, 150)).save(project.root / f"frame{index}.png")
+    store.rescan(project.id)
+    project = store.project(project.id)
+    shapes = [ocr_shape(), ocr_shape("25.0°C", shape_type="polygon", value_decimal="25.0", unit="°C",
+                                    points=[[5, 30], [65, 30], [65, 40], [35, 40], [35, 50], [5, 50]]),
+              ocr_shape("1.0%", value_decimal="1.0", unit="%", rotation=15,
+                        points=[[1, -2], [76, 18], [68, 48], [-7, 28]]),
+              ocr_shape("1?3", readability="partial", value_decimal=None),
+              ocr_shape(None, readability="unreadable", value_decimal=None)]
+    snapshots = {}
+    for index, row in enumerate(project.items):
+        reviewed(store, project, row["id"], shapes if index else [], confirmed_empty=index == 0)
+        snapshots[row["id"]] = store.detail(project.id, row["id"])
+    originals = {row["id"]: Path(row["path"]).read_bytes() for row in project.items}
+    options = {"format": format_name, "split": {"train": 50, "val": 25, "test": 25, "seed": 42},
+               "augmentation": {"preset": preset, "copies": 1, "seed": 123}}
+    expected_augmented = 6 if preset == "all" else 2
+    preview = preview_export(store, project.id, options)
+    assert preview["augmented_images"] == expected_augmented
+    result = export_project(store, project.id, options)
+    assert result["integrity_check"]["passed"]
+    with zipfile.ZipFile(store.home / "exports" / result["filename"]) as exported:
+        manifest = json.loads(exported.read("export_manifest.json"))
+        assert manifest["split_counts"] == {"train": 2 + expected_augmented, "val": 1, "test": 1}
+        assert manifest["augmentation"]["output"] == "PNG"
+        assert len(manifest["items"]) == 4 + expected_augmented
+        originals_by_id = {entry["id"]: entry for entry in manifest["items"] if "source_id" not in entry}
+        crop_count = 0
+        for entry in manifest["items"]:
+            source_id = entry.get("source_id", entry["id"])
+            expected = snapshots[source_id]["document"]
+            annotation = "annotations/" + str(Path(entry["image"]).relative_to("images").with_suffix(".json")).replace("\\", "/")
+            actual = json.loads(exported.read(annotation))
+            expected_shapes = copy.deepcopy(expected["shapes"])
+            if format_name == "labelme":
+                for shape in expected_shapes:
+                    if "rotation" in shape:
+                        shape["shape_type"] = "polygon"
+            assert actual["shapes"] == expected_shapes
+            assert (actual["imageWidth"], actual["imageHeight"]) == (80, 60)
+            if "source_id" in entry:
+                assert entry["split"] == originals_by_id[source_id]["split"] == "train"
+                assert entry["image"].endswith(".png") and not entry["human_reviewed"]
+                assert not entry["augmentation"]["operations"]["horizontal_flip"]
+                assert "rotation_degrees" not in entry["augmentation"]["operations"]
+                assert actual["labelpilot"]["status"] == "draft" and not actual["labelpilot"]["human_reviewed"]
+            else:
+                assert exported.read(entry["image"]) == originals[source_id]
+            if format_name == "paddleocr":
+                entries = dict(line.split("\t", 1) for line in exported.read(f"det/{entry['split']}.txt").decode().splitlines())
+                assert json.loads(entries[entry["image"]]) == detection_entries(expected)
+                for index, shape in enumerate(detection_entries(expected), 1):
+                    if shape["transcription"] == "###":
+                        continue
+                    crop_count += 1
+                    crop_name = f"recognition/{entry['split']}/{Path(entry['image']).stem}_{index:04d}.png"
+                    with Image.open(io.BytesIO(exported.read(entry["image"]))) as image:
+                        expected_crop = recognition_crop(image.convert("RGB"), shape["points"])
+                    with Image.open(io.BytesIO(exported.read(crop_name))) as crop:
+                        assert crop.size == expected_crop.size and crop.tobytes() == expected_crop.tobytes()
+        if format_name == "paddleocr":
+            labels = [line for subset in ("train", "val", "test")
+                      for line in exported.read(f"rec/{subset}.txt").decode().splitlines()]
+            assert len(labels) == crop_count
+            assert all(line.split("\t", 1)[1] in ("00.250 g", "25.0°C", "1.0%") for line in labels)
+    for row in project.items:
+        current = store.detail(project.id, row["id"])
+        assert current["version"] == snapshots[row["id"]]["version"]
+        assert current["document"] == snapshots[row["id"]]["document"]
+        assert Path(row["path"]).read_bytes() == originals[row["id"]]
+
+
+@pytest.mark.parametrize("preset", ["ocr_gentle", "ocr_lighting", "ocr_quality"])
+def test_ocr_augmentation_is_reproducible_and_keeps_copy_prefix(tmp_path, preset):
+    from labelpilot.augmentation import augmented_variants, plan_augmentation
+
+    store, project, item = project_with_image(tmp_path, "ocr")
+    reviewed(store, project, item, [ocr_shape()])
+    current = store.detail(project.id, item)
+    source = project.item(item)["path"]
+    options = {"split": {}, "augmentation": {"preset": preset, "copies": 3, "seed": 42}}
+    settings = plan_augmentation(options, "ocr")
+    variants = list(augmented_variants(source, current["document"], item, current["image_sha256"], settings))
+    assert variants == list(augmented_variants(source, current["document"], item, current["image_sha256"], settings))
+    first = next(augmented_variants(source, current["document"], item, current["image_sha256"], {**settings, "copies": 1}))
+    assert variants[0] == first
+    changed = list(augmented_variants(source, current["document"], item, current["image_sha256"], {**settings, "seed": 43}))
+    assert [entry[3] for entry in variants] != [entry[3] for entry in changed]
+
+
+@pytest.mark.parametrize("corruption", ["text", "points", "missing", "attribute"])
+def test_ocr_augmentation_aborts_if_transcription_or_geometry_changes(tmp_path, monkeypatch, corruption):
+    import labelpilot.exporting as exporting
+
+    store, project, item = project_with_image(tmp_path, "ocr")
+    reviewed(store, project, item, [ocr_shape()])
+    generate = exporting.augmented_variants
+    def corrupted(*args):
+        for index, contents, document, provenance in generate(*args):
+            if corruption == "text":
+                document["shapes"][0]["text_raw"] = "WRONG"
+            elif corruption == "points":
+                document["shapes"][0]["points"][0][0] += 1
+            elif corruption == "missing":
+                document["shapes"].pop()
+            else:
+                document["shapes"][0]["unit"] = "WRONG"
+            yield index, contents, document, provenance
+    monkeypatch.setattr(exporting, "augmented_variants", corrupted)
+    with pytest.raises(Problem, match="对象数量|标签、坐标或属性"):
+        export_project(store, project.id, {"format": "paddleocr", "split": {"train": 100, "val": 0, "test": 0},
+                                          "augmentation": {"preset": "all"}})
+    assert not list((store.home / "exports").glob("*.zip*"))
+
+
+def test_ocr_augmentation_cache_and_incremental_updates_preserve_pairing(tmp_path, monkeypatch):
+    import labelpilot.exporting as exporting
+
+    store, project, item = project_with_image(tmp_path, "ocr")
+    reviewed(store, project, item, [ocr_shape(), ocr_shape("ABC", value_decimal=None)])
+    jobs = ExportJobs(store)
+    def run(options):
+        record = jobs.start(project.id, options)
+        jobs.worker.join(timeout=30)
+        record = jobs.get(project.id, record["id"])
+        assert record["status"] == "completed", record
+        assert record["result"]["integrity_check"]["passed"]
+        return record
+    def artifacts(root):
+        return {path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                for directory in ("images", "annotations", "recognition", "det", "rec")
+                for path in (root / directory).rglob("*") if path.is_file()}
+    try:
+        options = {"format": "paddleocr", "destination": str(tmp_path), "workers": 2,
+                   "split": {"train": 100, "val": 0, "test": 0}, "augmentation": {"preset": "all"}}
+        cold = run(options)
+        root = Path(cold["result"]["directory"])
+        original_files = artifacts(root)
+        assert cold["cache_misses"] == 3 and cold["result"]["images"] == 4
+        with monkeypatch.context() as patch:
+            patch.setattr(exporting, "augmented_variants", lambda *args: pytest.fail("Warm cache must not regenerate"))
+            warm = run(options)
+        assert warm["cache_hits"] == 3 and warm["cache_errors"] == 0
+        assert artifacts(Path(warm["result"]["directory"])) == original_files
+        options.update(destination=str(root), incremental=True)
+        assert run(options)["result"]["incremental"]["skipped"] == 1
+        assert artifacts(root) == original_files
+        Image.new("RGB", (80, 60), "white").save(project.root / "new.png")
+        store.rescan(project.id)
+        project = store.project(project.id)
+        added = next(row["id"] for row in project.items if row["id"] != item)
+        reviewed(store, project, added, [], confirmed_empty=True)
+        addition = run(options)["result"]
+        assert addition["images"] == 8 and addition["incremental"]["added"] == 1
+        assert addition["incremental"]["skipped"] == 1
+        reviewed(store, project, item, [ocr_shape("UPDATED", value_decimal=None)])
+        assert run(options)["result"]["incremental"]["updated"] == 1
+        options["augmentation"]["copies"] = 2
+        changed = run(options)["result"]
+        assert changed["images"] == 14 and changed["incremental"]["augmentation_changed"]
+        lines = (root / "rec" / "train.txt").read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 7 and all(line.endswith("\tUPDATED") for line in lines)
+        assert len(list((root / "recognition" / "train").glob("*.png"))) == 7
+        options.pop("augmentation")
+        removed = run(options)["result"]
+        assert removed["images"] == 2 and removed["augmented_images"] == 0
+        assert len(list((root / "recognition" / "train").glob("*.png"))) == 1
+        assert not list((root / "images" / "train").glob("*__aug_*"))
+        assert len((root / "det" / "train.txt").read_text(encoding="utf-8").splitlines()) == 2
+        assert (root / "rec" / "train.txt").read_text(encoding="utf-8").endswith("\tUPDATED\n")
+    finally:
+        jobs.shutdown()
 
 
 @pytest.mark.parametrize("legacy", [False, True])

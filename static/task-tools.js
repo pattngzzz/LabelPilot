@@ -61,8 +61,8 @@ const taskUi = (() => {
       formats.value = Array.from(formats.options).find(option => !option.disabled).value;
     }
     if (task === "ocr") formats.value = "paddleocr";
-    element("augmentationSettings").hidden = !["detect", "segment"].includes(task);
-    if (element("augmentationSettings").hidden) element("augmentationPreset").value = "none";
+    element("augmentationSettings").hidden = !["detect", "segment", "ocr"].includes(task);
+    if (element("augmentationSettings").hidden || exportAugmentation.task !== task) element("augmentationPreset").value = "none";
     element("acceptPrompt").textContent = isMaskTask() ? "采用分割建议" : "采用候选框";
     element("jointSelect").replaceChildren(...(state.project.keypoints || []).map((point, index) =>
       new Option(String(index + 1) + " · " + point.label, index)));

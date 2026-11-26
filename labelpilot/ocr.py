@@ -141,9 +141,14 @@ def finish_ocr_export(archive, records, manifest):
                 raise ValueError("OCR 标签清单回读不一致")
     manifest["ocr"] = {"splits": counts, "ignore_transcription": "###",
                         "recognition_policy": "human_readable_only", "crop_format": "lossless_png"}
+    augmentation_note = ("OCR 导出增强：仅从已审核训练原图生成，验证 / 测试集不增强；原图保留。\n"
+                         "仅做保守外观变化，不镜像、不旋转、不裁切；文字原文、属性和多边形顶点保持不变。\n"
+                         "增强图保存为 PNG，识别裁剪从对应增强图重新生成；部分可读 / 不可读区域仍不生成识别样本。\n"
+                         "增强不等于新增真实场景，增强副本未逐张人工审核；细小文字请抽查清晰度，不合适时使用轻量方案或不增强。\n"
+                         if manifest.get("augmentation") else "")
     archive.writestr("OCR_README.txt", "PaddleOCR 数据集\n以本目录为 data_dir；det/*.txt 用于文字检测，rec/*.txt 用于文字识别。\n"
                     "每张原图只分配一次集合，裁剪继承原图集合；建议按来源组划分，避免同源泄漏。\n"
                     "仅完整可读区域生成识别裁剪；部分/不可读区域在检测标签中标 ###，完整原文与属性保存在 annotations。\n"
                     "确认无文字的图片在检测清单中保留 []，不生成识别样本；这不表示读数为零。\n"
                     "检测标签保留原始多边形顶点；凸四点区域作透视校正，其他多边形按最小外接旋转矩形裁剪并将轮廓外填白。\n"
-                    "竖长区域逆时针转正；请抽查文字方向。未执行 OCR 训练或识别质量验证。\n")
+                    "竖长区域逆时针转正；请抽查文字方向。未执行 OCR 训练或识别质量验证。\n" + augmentation_note)

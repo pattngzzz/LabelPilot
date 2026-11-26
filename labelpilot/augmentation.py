@@ -43,24 +43,58 @@ PRESETS = {
 }
 
 
-def augmentation_presets():
+OCR_PRESETS = {
+    "ocr_gentle": {
+        "name": "OCR 轻量增强（推荐）",
+        "description": "亮度 / 对比度 0.95–1.05，不模糊、不镜像、不旋转、不裁切；PNG 输出，文字原文与顶点完全保留。",
+        "brightness": (0.95, 1.05), "contrast": (0.95, 1.05), "color": (1.0, 1.0),
+    },
+    "ocr_lighting": {
+        "name": "OCR 光照变化",
+        "description": "亮度 0.85–1.15、对比度 0.90–1.10，模拟轻微明暗变化；不改变文字位置，PNG 输出。",
+        "brightness": (0.85, 1.15), "contrast": (0.90, 1.10), "color": (1.0, 1.0),
+    },
+    "ocr_quality": {
+        "name": "OCR 轻度画质扰动",
+        "description": "轻微模糊（0.15–0.35 像素）及 JPEG 质量 92–98 的压缩模拟，再保存 PNG；细小文字请先抽查，不适合时使用轻量方案。",
+        "brightness": (0.97, 1.03), "contrast": (0.97, 1.03), "color": (1.0, 1.0),
+        "blur": (0.15, 0.35), "jpeg_quality": (92, 98),
+    },
+}
+ALL_PRESETS = {**PRESETS, **OCR_PRESETS}
+
+
+def task_presets(task_type):
+    if task_type == "ocr":
+        return OCR_PRESETS
+    if task_type in ("detect", "segment"):
+        return PRESETS
+    raise Problem("当前导出增强仅适用于目标检测、实例分割和 OCR", 422)
+
+
+def augmentation_presets(task_type="detect"):
+    available = task_presets(task_type)
     presets = [{"id": name, "name": preset["name"], "description": preset["description"], "preset_count": 1}
-               for name, preset in PRESETS.items()]
-    presets.append({"id": "all", "name": "全部方案（分别生成）", "preset_count": len(PRESETS),
-                    "description": "轻量通用、光照变化、画质扰动、水平翻转、图片旋转五种方案分别从原图生成，不连续叠加。"
-                                   "含镜像、旋转和模糊：文字、方向有含义或特别小的目标请谨慎，不适合时改选单一方案。"})
+               for name, preset in available.items()]
+    description = ("OCR 轻量、光照变化、轻度画质扰动三种方案分别从原图生成，不连续叠加；不镜像、不旋转、不裁切，PNG 输出。"
+                   "细小文字请抽查增强后是否仍然清晰，无法保证所有原图增强后均适合训练。" if task_type == "ocr" else
+                   "轻量通用、光照变化、画质扰动、水平翻转、图片旋转五种方案分别从原图生成，不连续叠加。"
+                   "含镜像、旋转和模糊：文字、方向有含义或特别小的目标请谨慎，不适合时改选单一方案。")
+    presets.append({"id": "all", "name": "全部 OCR 方案（分别生成）" if task_type == "ocr" else "全部方案（分别生成）",
+                    "preset_count": len(available), "description": description})
     return {"presets": presets, "max_copies": MAX_COPIES}
 
 
-def plan_augmentation(options):
+def plan_augmentation(options, task_type="detect"):
     settings = options.get("augmentation")
     if settings is None:
         return None
     if not isinstance(settings, dict) or set(settings) - {"preset", "copies", "seed"}:
         raise Problem("增强设置必须包含 preset，以及可选的 copies、seed", 422)
+    available = task_presets(task_type)
     preset = settings.get("preset")
-    if not isinstance(preset, str) or preset not in {*PRESETS, "all"}:
-        raise Problem("请选择有效的数据增强方案", 422)
+    if not isinstance(preset, str) or preset not in {*available, "all"}:
+        raise Problem("请选择当前任务支持的数据增强方案；OCR 不支持镜像、直角旋转或检测增强方案", 422)
     copies = settings.get("copies", 1)
     if isinstance(copies, bool) or not isinstance(copies, int) or not 1 <= copies <= MAX_COPIES:
         raise Problem(f"每张训练图片、每种方案额外生成数量必须为 1 到 {MAX_COPIES} 的整数", 422)
@@ -73,11 +107,11 @@ def plan_augmentation(options):
         raise Problem("数据增强必须勾选包含图片，否则增强标注无法配对", 422)
     if not options.get("reviewed_only", True):
         raise Problem("数据增强仅支持已人工确认的标注，请勾选只导出已人工确认", 422)
-    presets = list(PRESETS) if preset == "all" else [preset]
+    presets = list(available) if preset == "all" else [preset]
     return {"preset": preset, "presets": presets, "copies": copies, "variants_per_image": copies * len(presets),
             "seed": seed, "scope": "train_only",
             "keep_originals": True, "algorithm_version": 1, "engine": f"Pillow {pillow_version}",
-            "output": "JPEG", "alpha_background": "white"}
+            "output": "PNG" if task_type == "ocr" else "JPEG", "alpha_background": "white"}
 
 
 def rotation_angles(source_id, source_sha256, settings):
@@ -92,10 +126,11 @@ def validate_augmented_sample(source, augmented, contents, settings, provenance)
         raise Problem(f"增强标注一致性校验失败：{reason}；已中止导出，不会丢弃对象或自动修框", 422)
 
     width, height = source["imageWidth"], source["imageHeight"]
-    horizontal = PRESETS[settings["preset"]].get("horizontal_flip", False)
+    preset = ALL_PRESETS[settings["preset"]]
+    horizontal = preset.get("horizontal_flip", False)
     operations = provenance.get("operations", {})
     angle = operations.get("rotation_degrees", 0)
-    if PRESETS[settings["preset"]].get("rotation"):
+    if preset.get("rotation"):
         variant = provenance.get("variant")
         if isinstance(variant, bool) or not isinstance(variant, int) or not 1 <= variant <= settings["copies"]:
             reject("旋转副本编号无效")
@@ -114,6 +149,8 @@ def validate_augmented_sample(source, augmented, contents, settings, provenance)
             image.load()
             if image.size != size or image.getexif().get(274, 1) != 1:
                 reject("增强图片尺寸或方向与标注不一致")
+            if settings["output"] == "PNG" and image.format != "PNG":
+                reject("OCR 增强图片必须为 PNG")
     except (OSError, ValueError) as error:
         raise Problem("增强图片无法完整解码，已中止导出", 422) from error
     if augmented.get("labelpilot", {}).get("image_sha256") != hashlib.sha256(contents).hexdigest():
@@ -155,7 +192,7 @@ def augmentation_image(path):
 
 
 def augmented_variants(path, document, source_id, source_sha256, settings):
-    preset = PRESETS[settings["preset"]]
+    preset = ALL_PRESETS[settings["preset"]]
     angles = rotation_angles(source_id, source_sha256, settings) if preset.get("rotation") else None
     original = path if isinstance(path, Image.Image) else augmentation_image(path)
     for index in range(1, settings["copies"] + 1):
@@ -164,7 +201,7 @@ def augmented_variants(path, document, source_id, source_sha256, settings):
         operations = {key: round(generator.uniform(*preset[key]), 6) for key in ("brightness", "contrast", "color")}
         operations.update(horizontal_flip=preset.get("horizontal_flip", False),
                           blur_radius=round(generator.uniform(*preset.get("blur", (0, 0))), 6),
-                          jpeg_quality=generator.randint(*preset.get("jpeg_quality", (95, 95))))
+                          jpeg_quality=generator.randint(*preset.get("jpeg_quality", (100, 100) if settings["output"] == "PNG" else (95, 95))))
         image = ImageEnhance.Brightness(original).enhance(operations["brightness"])
         image = ImageEnhance.Contrast(image).enhance(operations["contrast"])
         image = ImageEnhance.Color(image).enhance(operations["color"])
@@ -192,8 +229,17 @@ def augmented_variants(path, document, source_id, source_sha256, settings):
             augmented["imageWidth"], augmented["imageHeight"] = image.size
         if operations["blur_radius"]:
             image = image.filter(ImageFilter.GaussianBlur(operations["blur_radius"]))
+        if settings["output"] == "PNG" and "jpeg_quality" in preset:
+            with io.BytesIO() as compressed:
+                image.save(compressed, format="JPEG", quality=operations["jpeg_quality"], subsampling=0)
+                compressed.seek(0)
+                with Image.open(compressed) as decoded:
+                    image = decoded.convert("RGB")
         with io.BytesIO() as buffer:
-            image.save(buffer, format="JPEG", quality=operations["jpeg_quality"], subsampling=0)
+            if settings["output"] == "PNG":
+                image.save(buffer, format="PNG")
+            else:
+                image.save(buffer, format="JPEG", quality=operations["jpeg_quality"], subsampling=0)
             contents = buffer.getvalue()
         provenance = {"source_id": source_id, "source_sha256": source_sha256,
                       "preset": settings["preset"], "variant": index, "operations": operations,
