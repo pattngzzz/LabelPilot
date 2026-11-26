@@ -13,7 +13,7 @@ from pathlib import Path
 from PIL import Image
 
 from .ocr import validate_ocr_shape
-from .tasks import BACKGROUND, HAND_KEYPOINTS, HAND_SKELETON, MAX_MASK_PIXELS, SHAPE_TYPES, polygon_area, read_mask, semantic_mask, validate_hand
+from .tasks import BACKGROUND, HAND_KEYPOINTS, HAND_SKELETON, MAX_MASK_PIXELS, SHAPE_TYPES, is_rotated_box, polygon_area, read_mask, semantic_mask, validate_hand
 
 
 STATUSES = ("unstarted", "imported", "predicted", "draft", "reviewed", "skipped", "error")
@@ -799,12 +799,13 @@ class Store:
                     or (kind == "polygon" and len(points) < 3)
                     or (kind == "brush" and not 1 <= len(points) <= 4096)):
                 raise Problem("标注点数量无效", 422)
+            allow_outside = task in ("detect", "segment", "ocr") and is_rotated_box(shape)
             for point in points:
                 if not isinstance(point, list) or len(point) != 2:
                     raise Problem("坐标必须是 [x, y]", 422)
                 if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in point):
                     raise Problem("坐标必须是有限数值", 422)
-                if not 0 <= point[0] <= width or not 0 <= point[1] <= height:
+                if not allow_outside and (not 0 <= point[0] <= width or not 0 <= point[1] <= height):
                     raise Problem("标注超出原图边界；不会静默裁切", 422)
             if kind == "brush":
                 radius = shape.get("radius")

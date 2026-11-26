@@ -67,6 +67,20 @@ def polygon_area(points):
                    for (x, y), following in zip(points, points[1:] + points[:1]))) / 2
 
 
+def is_rotated_box(shape):
+    angle, points = shape.get("rotation"), shape.get("points")
+    if (shape.get("shape_type") != "polygon" or type(angle) not in (int, float) or not math.isfinite(angle)
+            or not isinstance(points, list) or len(points) != 4):
+        return False
+    if any(not isinstance(point, list) or len(point) != 2
+           or any(type(value) not in (int, float) or not math.isfinite(value) for value in point) for point in points):
+        return False
+    turns = [(following[0] - current[0]) * (after[1] - following[1])
+             - (following[1] - current[1]) * (after[0] - following[0])
+             for current, following, after in zip(points, points[1:] + points[:1], points[2:] + points[:2])]
+    return all(turn > 1e-9 for turn in turns) or all(turn < -1e-9 for turn in turns)
+
+
 def validate_hand(shape, bounds):
     keypoints = shape.get("keypoints")
     if not isinstance(keypoints, list) or len(keypoints) != HAND_COUNT:

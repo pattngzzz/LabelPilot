@@ -7,6 +7,7 @@ import random
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, __version__ as pillow_version
 
 from .store import Problem
+from .tasks import is_rotated_box
 
 
 MAX_COPIES = 3
@@ -134,9 +135,10 @@ def validate_augmented_sample(source, augmented, contents, settings, provenance)
             expected["points"] = [[height - point[1], point[0]] for point in original["points"]]
         if actual != expected:
             reject(f"第 {index} 个对象的标签、坐标或属性不匹配")
+        allow_outside = is_rotated_box(original)
         for point in actual["points"]:
             if (any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in point)
-                    or not 0 <= point[0] <= size[0] or not 0 <= point[1] <= size[1]):
+                    or not allow_outside and (not 0 <= point[0] <= size[0] or not 0 <= point[1] <= size[1])):
                 reject(f"第 {index} 个对象坐标无效或越界")
     return len(shapes)
 

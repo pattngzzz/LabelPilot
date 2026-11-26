@@ -682,6 +682,28 @@ function bounds(shape) {
 }
 function rectanglePoints(left,top,right,bottom) { return [[left,top],[right,top],[right,bottom],[left,bottom]]; }
 function shapePoints(shape) { return shape.shape_type === "polygon" ? shape.points : rectanglePoints(...bounds(shape)); }
+function rotateSelectedShape(degrees, notify=true) {
+  if (!state.current || state.busy || state.drag || state.pendingShape || state.rectangle || state.polygon.length || state.space ||
+      !["detect","segment","ocr"].includes(taskUi.type())) return;
+  const shape = state.current.document.shapes[state.selected];
+  if (!shape || !(shape.shape_type === "rectangle" || shape.shape_type === "polygon" && shape.points.length === 4)) {
+    if (notify) toast("请先选中矩形或四角框，再按 Z / X 旋转");
+    return;
+  }
+  const original = shapePoints(shape);
+  const center = original.reduce((sum, point) => [sum[0]+point[0]/4, sum[1]+point[1]/4], [0,0]);
+  const radians = degrees * Math.PI / 180;
+  const cosine = Math.cos(radians), sine = Math.sin(radians);
+  const points = original.map(point => {
+    const horizontal = point[0]-center[0], vertical = point[1]-center[1];
+    return [center[0]+horizontal*cosine-vertical*sine, center[1]+horizontal*sine+vertical*cosine];
+  });
+  checkpoint();
+  shape.shape_type = "polygon";
+  shape.points = points;
+  shape.rotation = ((Number.isFinite(shape.rotation) ? shape.rotation : 0)+degrees)%360;
+  changed();
+}
 function handles(shape) {
   if (shape.shape_type === "polygon") return shape.points;
   if (shape.shape_type !== "rectangle") return [];
@@ -863,8 +885,9 @@ canvas.addEventListener("pointermove",event => {
   if(drag.type==="pan"){state.panX=drag.pan[0]+event.clientX-drag.client[0];state.panY=drag.pan[1]+event.clientY-drag.client[1];}
   if(drag.type==="move"){
     const originalBounds=bounds(drag.original);
-    const horizontal=Math.max(-originalBounds[0],Math.min(state.current.width-originalBounds[2],point[0]-drag.start[0]));
-    const vertical=Math.max(-originalBounds[1],Math.min(state.current.height-originalBounds[3],point[1]-drag.start[1]));
+    const rotated=Number.isFinite(drag.original.rotation);
+    const horizontal=rotated ? point[0]-drag.start[0] : Math.max(-originalBounds[0],Math.min(state.current.width-originalBounds[2],point[0]-drag.start[0]));
+    const vertical=rotated ? point[1]-drag.start[1] : Math.max(-originalBounds[1],Math.min(state.current.height-originalBounds[3],point[1]-drag.start[1]));
     state.current.document.shapes[state.selected].points=drag.original.points.map(position=>[position[0]+horizontal,position[1]+vertical]);
   }
   if(drag.type==="resize"){
@@ -2364,6 +2387,11 @@ document.addEventListener("keydown",event=>{
   if((event.ctrlKey || event.metaKey) && key==="z"){event.preventDefault();undo(event.shiftKey);return;}
   if(event.ctrlKey || event.metaKey || event.altKey)return;
   if(taskUi.keydown(key) || efficiency.keydown(event,key)){event.preventDefault();return;}
+  if(key==="z" || key==="x"){
+    event.preventDefault();
+    rotateSelectedShape((key==="z" ? -1 : 1)*(event.shiftKey ? 5 : 1), !event.repeat);
+    return;
+  }
   if(event.repeat && ["a","d","e","q"].includes(key))return;
   if(key==="v")setTool("select");if(key==="r")setTool("rectangle");if(key==="p")setTool("polygon");if(key==="h")setTool("pan");if(key==="f")fitImage();
   if(key==="delete" || key==="backspace"){event.preventDefault();deleteShape();}

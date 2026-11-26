@@ -1389,7 +1389,7 @@ print('Rotation ZIP: all angles, dimensions, exact normalized boxes and train-on
     await createTask("ocr", "");
     await check('state.project.classes[0].name==="text" && element("projectTask").textContent==="OCR 文字与读数" && element("predictButton").hidden && element("trainingButton").hidden',
       "OCR defaults to the text class and does not expose unsupported YOLO inference or training");
-    await box([35,50], [180,85]);
+    await box([10,10], [625,465]);
     await check('!element("ocrPickerFields").hidden && document.activeElement.id==="pickerOcrText" && element("pickerOcrPreview").width>0',
       "Drawing a text region opens transcription with a local enlarged preview");
     await cdp("Emulation.setDeviceMetricsOverride", {width:420,height:850,deviceScaleFactor:1,mobile:false});
@@ -1410,12 +1410,31 @@ print('Rotation ZIP: all angles, dimensions, exact normalized boxes and train-on
     await check('state.current.document.shapes[0].text_raw==="00.250 g" && state.current.document.shapes[0].value_decimal==="00.250" && element("objectList").textContent.includes("00.250 g")',
       "Original text and precision-preserving decimal values are separate editable fields");
     await click('[data-tool="select"]');
+    await evaluate('window.ocrBeforeRotation=structuredClone(state.current.document.shapes[0]);');
+    await press("z", "KeyZ");
+    await check('(()=>{const shape=state.current.document.shapes[0];return shape.shape_type==="polygon" && shape.points.length===4 && shape.points[1][1]<shape.points[0][1] && shape.text_raw===ocrBeforeRotation.text_raw && shape.unit==="g";})()',
+      "Z rotates the selected R box left and preserves OCR transcription and attributes");
+    await press("z", "KeyZ", {modifiers:2});
+    await check('state.current.document.shapes[0].shape_type==="rectangle" && JSON.stringify(state.current.document.shapes[0].points)===JSON.stringify(ocrBeforeRotation.points)',
+      "Ctrl+Z undoes rotation and restores the original rectangle");
+    await press("Z", "KeyZ", {modifiers:10});
+    await check('state.current.document.shapes[0].shape_type==="polygon"', "Ctrl+Shift+Z redoes rotation");
+    await click('[data-shape="0"]');
+    await press("X", "KeyX", {modifiers:8});
+    await check('(()=>{const points=state.current.document.shapes[0].points;return Math.abs(Math.atan2(points[1][1]-points[0][1],points[1][0]-points[0][0])*180/Math.PI-4)<1e-8 && points.some(([horizontal,vertical])=>horizontal<0 || vertical<0 || horizontal>state.current.width || vertical>state.current.height);})()',
+      "Shift+X rotates the selected four-corner box right by five degrees, even beyond the image boundary");
+    await evaluate('window.ocrRotatedPoints=structuredClone(state.current.document.shapes[0].points);');
+    await click("#shapeOcrText");
+    await press("x", "KeyX");
+    await check('JSON.stringify(state.current.document.shapes[0].points)===JSON.stringify(ocrRotatedPoints)',
+      "Typing X in OCR transcription never rotates the selected annotation");
+    await click('[data-tool="select"]');
     await press("e", "KeyE");
     await waitFor('state.items.some(item=>item.status==="reviewed") && !state.busy');
     await press("a", "KeyA");
     await waitFor('state.current?.status==="reviewed" && !state.busy');
-    await check('state.current.document.shapes[0].text_raw==="00.250 g" && state.current.document.shapes[0].unit==="g"',
-      "E reviews OCR annotations and reload preserves their text, unit and metadata");
+    await check('state.current.document.shapes[0].text_raw==="00.250 g" && state.current.document.shapes[0].unit==="g" && state.current.document.shapes[0].shape_type==="polygon" && JSON.stringify(state.current.document.shapes[0].points)===JSON.stringify(ocrRotatedPoints)',
+      "E reviews OCR annotations and reload preserves their rotation, text, unit and metadata");
     await click('[data-shape="0"]');
     await evaluate('element("toasts").replaceChildren()');
     fs.writeFileSync(path.join(home,"ocr-workspace.png"), Buffer.from((await cdp("Page.captureScreenshot", {format:"png"})).data,"base64"));

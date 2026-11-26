@@ -20,7 +20,7 @@ from .export_acceleration import cache_key
 from .incremental_export import file_stamp, load_incremental, record_entry
 from .cleaning import clean_selection
 from .store import Problem, Project, digest, now, read_annotation_snapshot, source_group
-from .tasks import EXPORT_FORMATS, HAND_COUNT, HAND_KEYPOINTS, HAND_SKELETON, model_labels, polygon_area, semantic_mask
+from .tasks import EXPORT_FORMATS, HAND_COUNT, HAND_KEYPOINTS, HAND_SKELETON, is_rotated_box, model_labels, polygon_area, semantic_mask
 
 
 SPLIT_NAMES = ("train", "val", "test")
@@ -145,11 +145,21 @@ def output_document(plan, document):
     if plan.output_task == "detect":
         for shape in document["shapes"]:
             xs, ys = zip(*shape["points"])
-            shape.update(shape_type="rectangle", points=[[min(xs), min(ys)], [max(xs), max(ys)]])
+            left, top, right, bottom = min(xs), min(ys), max(xs), max(ys)
+            if is_rotated_box(shape):
+                left, top = max(0, left), max(0, top)
+                right, bottom = min(document["imageWidth"], right), min(document["imageHeight"], bottom)
+                if right <= left or bottom <= top:
+                    raise Problem("旋转框完全位于原图之外，无法导出检测框；请调整位置或选择 Labelme 的轮廓用途保留四角", 422)
+                shape.pop("rotation", None)
+            shape.update(shape_type="rectangle", points=[[left, top], [right, bottom]])
             shape.pop("contour_source", None)
     elif plan.output_task == "segment" or plan.project.task_type == "segment" and plan.format_name == "yolo":
         if any(shape["shape_type"] != "polygon" for shape in document["shapes"]):
             raise Problem("实例分割导出仍有未生成轮廓的检测框；请补全轮廓后导出，不会静默丢弃对象", 422)
+    if plan.format_name == "yolo" and any(not 0 <= horizontal <= document["imageWidth"] or not 0 <= vertical <= document["imageHeight"]
+                                        for shape in document["shapes"] for horizontal, vertical in shape["points"]):
+        raise Problem("YOLO 分割不能导出越界顶点；请调整框或选择 Labelme / COCO 保留完整四角。保存不受影响", 422)
     return document
 
 

@@ -1,5 +1,6 @@
 import io
 import json
+import math
 import time
 import zipfile
 from pathlib import Path
@@ -148,6 +149,107 @@ def test_ocr_slanted_quadrilateral_preserves_points_and_text(tmp_path, points):
         entries = json.loads(exported.read("det/all.txt").decode().strip().split("\t", 1)[1])
         assert entries == [{"transcription": "-01.20 °C", "points": points}]
         assert exported.read("rec/all.txt").decode().endswith("\t-01.20 °C\n")
+
+
+@pytest.mark.parametrize("degrees", [-90, -5, -1, 1, 5, 90])
+def test_ocr_rotated_box_survives_save_reload_and_exports(tmp_path, degrees):
+    store, project, item = project_with_image(tmp_path, "ocr")
+    source = Path(project.item(item)["path"]).read_bytes()
+    radians = math.radians(degrees)
+    points = [[40 + horizontal * math.cos(radians) - vertical * math.sin(radians),
+               30 + horizontal * math.sin(radians) + vertical * math.cos(radians)]
+              for horizontal, vertical in [(-20, -8), (20, -8), (20, 8), (-20, 8)]]
+    shape = ocr_shape("00.250 g", shape_type="polygon", points=points, rotation=degrees, custom_attribute={"keep": True})
+    reviewed(store, project, item, [shape])
+    assert Store(store.home).detail(project.id, item)["document"]["shapes"] == [shape]
+    with archive(store, project, "paddleocr") as exported:
+        entries = json.loads(exported.read("det/all.txt").decode().strip().split("\t", 1)[1])
+        assert entries == [{"transcription": "00.250 g", "points": points}]
+        assert exported.read("rec/all.txt").decode().endswith("\t00.250 g\n")
+        crop_name = next(name for name in exported.namelist() if name.startswith("recognition/"))
+        with exported.open(crop_name) as stream, Image.open(stream) as crop:
+            assert 40 <= crop.width <= 41 and 16 <= crop.height <= 17
+    with archive(store, project, "labelme") as exported:
+        annotation = next(name for name in exported.namelist() if name.startswith("annotations/"))
+        assert json.loads(exported.read(annotation))["shapes"] == [shape]
+    assert Path(project.item(item)["path"]).read_bytes() == source
+
+
+def test_detection_export_of_rotated_box_uses_bounds_only_when_requested(tmp_path):
+    store, project, item = project_with_image(tmp_path, "detect", ["part"])
+    points = [[30, 10], [60, 30], [50, 45], [20, 25]]
+    shape = {"label": "part", "shape_type": "polygon", "points": points}
+    reviewed(store, project, item, [shape])
+    result = export_project(store, project.id, {"format": "yolo", "output_task": "detect"})
+    with zipfile.ZipFile(store.home / "exports" / result["filename"]) as exported:
+        name = next(name for name in exported.namelist() if name.startswith("labels/"))
+        values = list(map(float, exported.read(name).split()))
+        assert values == pytest.approx([0, .5, 27.5 / 60, .5, 35 / 60])
+    assert store.detail(project.id, item)["document"]["shapes"] == [shape]
+
+
+@pytest.mark.parametrize("task", ["detect", "segment", "ocr"])
+def test_outside_rotated_box_saves_and_preserves_full_corners(tmp_path, task):
+    store, project, item = project_with_image(tmp_path, task, ["text"])
+    points = [[-5, 8], [75, -4], [84, 48], [4, 60]]
+    shape = ocr_shape(shape_type="polygon", points=points, rotation=-5)
+    reviewed(store, project, item, [shape])
+    assert Store(store.home).detail(project.id, item)["document"]["shapes"] == [shape]
+    with archive(store, project, "labelme") as exported:
+        annotation = next(name for name in exported.namelist() if name.startswith("annotations/"))
+        assert json.loads(exported.read(annotation))["shapes"] == [shape]
+    if task == "ocr":
+        with archive(store, project, "paddleocr") as exported:
+            entries = json.loads(exported.read("det/all.txt").decode().strip().split("\t", 1)[1])
+            assert entries == [{"transcription": "00.250 g", "points": points}]
+            assert exported.read("rec/all.txt").decode().endswith("\t00.250 g\n")
+    else:
+        result = export_project(store, project.id, {"format": "yolo", "output_task": "detect"})
+        with zipfile.ZipFile(store.home / "exports" / result["filename"]) as exported:
+            name = next(name for name in exported.namelist() if name.startswith("labels/"))
+            assert list(map(float, exported.read(name).split())) == pytest.approx([0, .5, .5, 1, 1])
+        with pytest.raises(Problem, match="越界顶点"):
+            export_project(store, project.id, {"format": "yolo", "output_task": "segment"})
+    assert store.detail(project.id, item)["document"]["shapes"] == [shape]
+
+
+@pytest.mark.parametrize("rotation", [None, True, "5", float("nan"), float("inf")])
+def test_unmarked_or_invalid_rotated_box_still_rejects_outside_coordinates(tmp_path, rotation):
+    store, project, item = project_with_image(tmp_path, "ocr")
+    shape = ocr_shape(shape_type="polygon", points=[[-5, 8], [75, -4], [84, 48], [4, 60]], rotation=rotation)
+    with pytest.raises(Problem, match="超出原图边界"):
+        reviewed(store, project, item, [shape])
+    assert store.detail(project.id, item)["version"] == 0
+
+
+@pytest.mark.parametrize("task,points", [
+    ("semantic", [[-5, 8], [75, -4], [84, 48], [4, 60]]),
+    ("detect", [[-5, 8], [75, -4], [30, 25], [4, 60]]),
+    ("detect", [[-5, 8], [75, -4], [84, 48], [4, 60], [0, 20]]),
+])
+def test_rotation_boundary_exception_does_not_apply_to_masks_or_general_contours(tmp_path, task, points):
+    store, project, item = project_with_image(tmp_path, task, ["text"])
+    with pytest.raises(Problem, match="超出原图边界"):
+        reviewed(store, project, item, [ocr_shape(shape_type="polygon", points=points, rotation=5)])
+    assert store.detail(project.id, item)["version"] == 0
+
+
+@pytest.mark.parametrize("preset", ["gentle", "horizontal", "rotation"])
+def test_outside_rotated_box_augmentation_preserves_transformed_corners(tmp_path, preset):
+    from labelpilot.augmentation import augmented_variants, plan_augmentation, validate_augmented_sample
+
+    store, project, item = project_with_image(tmp_path, "detect", ["text"])
+    points = [[-5, 8], [75, -4], [84, 48], [4, 60]]
+    reviewed(store, project, item, [ocr_shape(shape_type="polygon", points=points, rotation=-5)])
+    current = store.detail(project.id, item)
+    settings = plan_augmentation({"split": {}, "augmentation": {"preset": preset, "copies": 1}})
+    for _, contents, augmented, provenance in augmented_variants(
+            Path(project.item(item)["path"]), current["document"], item, current["image_sha256"], settings):
+        assert validate_augmented_sample(current["document"], augmented, contents, settings, provenance) == 1
+        augmented["shapes"][0]["points"][0][0] += 1
+        with pytest.raises(Problem, match="标签、坐标或属性不匹配"):
+            validate_augmented_sample(current["document"], augmented, contents, settings, provenance)
+    assert store.detail(project.id, item)["document"]["shapes"][0]["points"] == points
 
 
 def test_ocr_empty_text_is_not_auto_populated_with_zero(tmp_path):
