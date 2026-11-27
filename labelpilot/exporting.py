@@ -189,7 +189,6 @@ def prepare_export(store, project_id, options, *, include_documents=False, check
         raise Problem("导出开关必须为布尔值", 422)
     if format_name == "paddleocr" and not include_images:
         raise Problem("PaddleOCR 导出需要包含原图，用于配对检测标签并生成识别裁剪", 422)
-    augmentation = plan_augmentation(options, project.task_type)
     if clean and not reviewed_only:
         raise Problem("清洗版数据集仅纳入已人工确认的图片", 422)
     if checkpoint:
@@ -198,6 +197,15 @@ def prepare_export(store, project_id, options, *, include_documents=False, check
         progress("读取导出设置与旧清单", 0, 0, "")
     incremental = load_incremental(project, format_name, options, checkpoint=checkpoint, progress=progress,
                                    file_cache=getattr(store, "export_file_cache", None))
+    if incremental and incremental.multi_project:
+        split = incremental.manifest["split_config"]
+        previous_augmentation = incremental.manifest.get("augmentation")
+        options = {**options, "split": {key: split[key] for key in (*SPLIT_NAMES, "seed", "unit")} if split else None,
+                   "augmentation": {key: previous_augmentation[key] for key in ("preset", "copies", "seed")}
+                   if previous_augmentation else None}
+    augmentation = plan_augmentation(options, project.task_type)
+    if incremental and incremental.multi_project and augmentation != incremental.manifest.get("augmentation"):
+        raise Problem("目标增强算法或图像引擎版本不同，不能跨项目重建；请完整导出到新目录", 422)
     batch = options.get("batch")
     if batch is None:
         batch = ""
@@ -221,6 +229,8 @@ def prepare_export(store, project_id, options, *, include_documents=False, check
         if not rows and not allow_empty_cleaning:
             counts = cleaning_summary(cleaning)["counts"]
             raise Problem(f"清洗后没有可用图片。图片不可用 {counts['unreadable']} 张，标注异常 {counts['annotation']} 张，冲突副本 {counts['conflict']} 张", 422)
+    if incremental and incremental.multi_project:
+        rows = incremental.bind_sources(store, project, rows, checkpoint)
     assignments, split_config, split_counts = plan_splits(rows, options, incremental) if rows else ({}, None, None)
     plan = ExportPlan(project, format_name, batch, reviewed_only, include_images, rows,
                       listing["filtered"] - len(rows), assignments, split_config, split_counts, cleaning, augmentation, output_task)
@@ -246,12 +256,13 @@ def cleaning_summary(excluded):
 
 def export_fingerprint(plan, sources):
     item_versions = [
-        (row["id"], row["photo_id"], row.get("version", 0), row["status"], row["source_group"],
+        (row["id"], row.get("export_id"), row["photo_id"], row.get("version", 0), row["status"], row["source_group"],
          row["image_sha256"], plan.assignments[row["id"]], sources.get(row["id"])) for row in plan.rows
     ]
     snapshot = (plan.project.id, plan.project.names, plan.format_name, plan.batch, plan.reviewed_only,
                 plan.include_images, plan.excluded, plan.split_config, plan.cleaning, plan.augmentation, plan.output_task,
-                plan.incremental.baseline_hash if plan.incremental else None, item_versions)
+                plan.incremental.baseline_hash if plan.incremental else None,
+                plan.incremental.references if plan.incremental else None, item_versions)
     return hashlib.sha256(json.dumps(snapshot, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
@@ -706,15 +717,20 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None, progre
         if checkpoint:
             checkpoint()
         item_id = row["id"]
+        export_id = plan.incremental.export_id(row) if plan.incremental else item_id
         member_offset = len(archive.members) if hasattr(archive, "members") else 0
         item = project.item(row["id"])
         safe_photo_id = re.sub(r"[^\w.-]", "_", row["photo_id"])
-        filename = f"{safe_photo_id}_{row['id'][:8]}{Path(item['path']).suffix.lower()}"
+        filename = f"{safe_photo_id}_{export_id[:16] if export_id != item_id else item_id[:8]}{Path(item['path']).suffix.lower()}"
         subset = plan.assignments[item_id]
         suffix = f"/{subset}" if split_config else ""
         image_name = f"images{suffix}/{filename}"
-        manifest["items"].append({"photo_id": row["photo_id"], "id": item_id, "status": current["status"],
+        if plan.incremental and export_id in plan.incremental.originals:
+            image_name = plan.incremental.originals[export_id]["image"]
+            filename = PurePosixPath(image_name).name
+        manifest["items"].append({"photo_id": row["photo_id"], "id": export_id, "status": current["status"],
                                    "revision": current["version"], "sha256": current["image_sha256"],
+                                   "source_project": plan.project.id, "source_item": item_id,
                                    "source_group": item["source_group"], "image": image_name, "split": subset})
         group = split_group(row, unit)
         if group is not None:
@@ -747,7 +763,7 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None, progre
                 checkpoint()
             preset = settings["preset"]
             member_offset = len(archive.members) if hasattr(archive, "members") else 0
-            variant_id = f"{row['id']}__aug_{preset}_{index}"
+            variant_id = f"{export_id}__aug_{preset}_{index}"
             extension = "png" if settings["output"] == "PNG" else "jpg"
             variant_name = f"images/train/{Path(filename).stem}__aug_{preset}_{index}.{extension}"
             archive.writestr(variant_name, contents)
@@ -756,7 +772,8 @@ def write_members(store, plan, archive, fingerprints, *, checkpoint=None, progre
             manifest["items"].append({"photo_id": row["photo_id"], "id": variant_id, "status": "augmented",
                                       "revision": 0, "sha256": augmented["labelpilot"]["image_sha256"],
                                       "source_group": item["source_group"], "image": variant_name,
-                                      "split": "train", "source_id": row["id"],
+                                      "split": "train", "source_id": export_id,
+                                      "source_project": plan.project.id, "source_item": item_id,
                                       "source_revision": current["version"], "human_reviewed": False,
                                       "annotation_count": shape_count, "augmentation": provenance})
             expected_document = copy.deepcopy(augmented)

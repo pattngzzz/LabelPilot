@@ -1338,6 +1338,8 @@ function renderExportPreview(data, options) {
     const change = data.incremental;
     notes.push('增量：新增 ' + change.added + ' 张 / 修改 ' + change.updated + ' 张 / 跳过 ' + change.skipped + ' 张');
     notes.push(change.split_policy);
+    if (change.multi_project) notes.push('多项目合并：同图复用 ' + change.deduplicated + ' 张，保留所有来源记录');
+    if (change.settings_preserved) notes.push('沿用目标数据集的划分和增强配置，不采用当前窗口的对应设置');
     if (change.new_classes?.length) notes.push('类别表将追加：' + change.new_classes.join('、'));
     if (change.augmentation_changed) notes.push('增强配置与旧数据集不同：已有训练图将按新配置重建，并移除失效增强副本');
   } else if (options.incremental) notes.push('所选位置没有已有数据集，将建立首次完整导出');
@@ -1478,8 +1480,11 @@ function updateExportPreview() {
   element("exportSplitHint").textContent = exportSplitHints[element("exportSplitUnit").value];
   const summary = element("exportSplitSummary");
   const clean = element("cleanDataset").checked;
-  element("reviewedOnly").disabled = clean;
-  if (clean) element("reviewedOnly").checked = true;
+  const mergeProjects = element("exportMergeProjects");
+  mergeProjects.disabled = clean || !element("exportIncremental").checked || element("exportFormat").value !== "paddleocr";
+  if (mergeProjects.disabled) mergeProjects.checked = false;
+  element("reviewedOnly").disabled = clean || mergeProjects.checked;
+  if (clean || mergeProjects.checked) element("reviewedOnly").checked = true;
   element("createExport").textContent = clean ? "导出清洗版到文件夹" : "导出到文件夹";
   let split;
   try {
@@ -1498,7 +1503,7 @@ function updateExportPreview() {
   catch (error) { setExportPreviewStatus(error.message, true); return; }
 
   const options = {format:element("exportFormat").value, batch:element("exportBatch").value,
-    ...(element("exportIncremental").checked ? {incremental:true, destination:element("exportDestination").value} : {}),
+    ...(element("exportIncremental").checked ? {incremental:true, merge_projects:mergeProjects.checked, destination:element("exportDestination").value} : {}),
     ...(["detect","segment"].includes(taskUi.type()) ? {output_task:element("exportOutputTask").value} : {}),
     reviewed_only:element("reviewedOnly").checked, include_images:element("includeImages").checked, clean, split, augmentation};
   const url = projectUrl("/export");
@@ -2151,6 +2156,7 @@ async function exportDataset() {
   if (!element("exportDialog").open || !plan || plan.data.blocking_issue || exportPreview.running || exportPreview.selecting) return;
   const destination = element("exportDestination").value;
   if (!destination) return toast("请先选择导出文件夹");
+  if (plan.data.incremental?.cross_project && !window.confirm("将把当前项目的已审核数据合并到另一个项目的数据集，保留原数据与来源记录。同图同标注去重，同图标注冲突会中止；沿用目标划分和增强配置。确定继续？")) return;
   if (plan.data.incremental?.augmentation_changed && !window.confirm("增强配置与已有数据集不同，将重建已有训练数据的增强副本，并移除不再需要的旧副本。确定按当前增强配置更新？")) return;
   if (plan.data.unreviewed && !window.confirm(`这次导出包含 ${plan.data.unreviewed} 张待审核图片。确定导出？`)) return;
   setExportBusy(true);
@@ -2305,7 +2311,7 @@ listen("jobsList","click",async event=>{const button=event.target.closest("[data
 for (const id of ["railExport", "exportButton"]) listen(id, "click", () => openExportDialog());
 listen("cleanButton", "click", () => openExportDialog(true));
 listen("cleanupDuplicates", "click", cleanupDuplicates);
-for (const id of ["exportIncremental", "exportFormat", "exportOutputTask", "exportBatch", "reviewedOnly", "includeImages", "cleanDataset", "splitDataset",
+for (const id of ["exportIncremental", "exportMergeProjects", "exportFormat", "exportOutputTask", "exportBatch", "reviewedOnly", "includeImages", "cleanDataset", "splitDataset",
   "exportSplitUnit", "splitTrain", "splitVal", "splitTest", "splitSeed", "augmentationPreset", "augmentationCopies", "augmentationSeed"]) listen(id, "input", () => {
   element("exportResult").textContent = "";
   element("exportProgress").hidden = true;

@@ -168,6 +168,8 @@
         <p class="muted">增量模式请直接选择已有数据集文件夹。保持旧类别编号和集合归属；比例和种子仅用于新增图片。未找到数据集时新建独立目录，不自动删除历史数据。</p>
         <label>导出格式<select id="exportFormat"><option value="yolo" data-tasks="detect segment hand_pose">YOLO</option><option value="labelme" data-tasks="detect segment ocr">Labelme / X-AnyLabeling</option><option value="coco" data-tasks="detect segment hand_pose">COCO</option><option value="mask" data-tasks="semantic" hidden>PNG 类别掩膜</option><option value="paddleocr" data-tasks="ocr" hidden>PaddleOCR · 检测＋识别裁剪</option></select></label>
         <label data-tasks="detect segment">标注用途<select id="exportOutputTask"><option value="detect">目标检测（轮廓转外接框）</option><option value="segment">实例分割（保留对象轮廓）</option></select></label><label>批次<select id="exportBatch"><option value="">全部批次</option></select></label>
+        <label class="check"><input type="checkbox" id="exportMergeProjects" disabled>允许跨项目合并（仅已审核 PaddleOCR）</label>
+        <p class="muted">跨项目时保留目标类别编号、划分及增强设置；同图同标注只保留一份并记录来源，同图标注冲突则中止，不覆盖历史数据。</p>
         <label class="check"><input type="checkbox" id="reviewedOnly" checked>仅纳入已人工确认的标注</label>
         <label class="check"><input type="checkbox" id="includeImages" checked>包含原图副本</label>
         <label class="check"><input type="checkbox" id="cleanDataset">清洗后导出</label>

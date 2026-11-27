@@ -47,6 +47,18 @@ def content_hash(document):
     return hashlib.sha256(json.dumps(document, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
+def annotation_content_hash(document):
+    ignored = {"score", "prediction_origin", "prediction_id", "text_recognition_confidence"}
+    return content_hash({"imageWidth": document["imageWidth"], "imageHeight": document["imageHeight"],
+                         "shapes": [{key: value for key, value in shape.items() if key not in ignored}
+                                    for shape in document["shapes"]]})
+
+
+def source_references(entry, project_id):
+    return copy.deepcopy(entry.get("sources") or [{"project": entry.get("source_project", project_id),
+        "item": entry.get("source_item", entry["id"]), "revision": entry["revision"]}])
+
+
 def file_stamp(path):
     state = path.stat()
     return {"size": state.st_size, "mtime_ns": state.st_mtime_ns}
@@ -108,6 +120,9 @@ def load_incremental(project, format_name, options, *, checkpoint=None, progress
         raise Problem("增量导出开关必须为布尔值", 422)
     if not enabled:
         return None
+    merge_projects = options.get("merge_projects", False)
+    if type(merge_projects) is not bool:
+        raise Problem("跨项目合并开关必须为布尔值", 422)
     from .model_files import directory
 
     root = directory(options.get("destination"))
@@ -124,10 +139,17 @@ def load_incremental(project, format_name, options, *, checkpoint=None, progress
         state.progress = progress
         state.file_cache = file_cache
         manifest = state.manifest
-        if (manifest["project"] != project.id or manifest["format"] != format_name
+        if (manifest["project"] != project.id and not merge_projects or manifest["format"] != format_name
                 or manifest["task_type"] != (options.get("output_task") or project.task_type)
                 or manifest["include_images"] != options.get("include_images", True)):
             raise Problem("目标数据集的项目、格式、标注用途或包含原图设置不一致，请保持一致或完整导出到新目录", 422)
+        state.cross_project = manifest["project"] != project.id
+        state.multi_project = state.cross_project or len(manifest.get("source_projects", [])) > 1
+        if state.multi_project and (format_name != "paddleocr" or project.task_type != "ocr"
+                or manifest.get("source_task_type", manifest["task_type"]) != "ocr"
+                or not options.get("reviewed_only", True) or not manifest.get("reviewed_only")
+                or any(entry["status"] != "reviewed" for entry in manifest["items"] if "source_id" not in entry)):
+            raise Problem("跨项目合并仅支持已人工审核、包含原图的 PaddleOCR 数据集", 422)
         classes = manifest["classes"]
         if (not isinstance(classes, list) or not classes or len(set(classes)) != len(classes)
                 or any(not isinstance(name, str) or not name.strip() for name in classes)):
@@ -158,6 +180,93 @@ class IncrementalExport:
         self.checkpoint = None
         self.progress = None
         self.file_cache = None
+        self.cross_project = False
+        self.multi_project = False
+        self.references = {}
+        self.deduplicated_rows = set()
+        self.deduplicated = 0
+
+    def export_id(self, row):
+        return row.get("export_id", row["id"])
+
+    def bind_sources(self, store, project, rows, checkpoint):
+        from .exporting import split_group, validate_export_document
+
+        identities, hashes = {}, {}
+        for item_id, entry in self.originals.items():
+            references = source_references(entry, self.manifest["project"])
+            self.references[item_id] = references
+            for reference in references:
+                identity = (reference["project"], reference["item"])
+                if identity in identities and identities[identity] != item_id:
+                    raise Problem("旧清单的来源身份重复，不能安全跨项目合并", 422)
+                identities[identity] = item_id
+            hashes.setdefault(entry["sha256"], []).append(item_id)
+        pending, incoming_signatures, selected = {}, {}, []
+        unit = (self.manifest.get("split_config") or {}).get("unit", "image")
+        for row in rows:
+            if checkpoint:
+                checkpoint()
+            document = row["document"]
+            validate_export_document(store, project, document, document["imageWidth"], document["imageHeight"], row["status"])
+            source = Path(project.item(row["id"])["path"])
+            stamp = file_stamp(source)
+            image_hash = self.digest(source)
+            if file_stamp(source) != stamp or image_hash != document.get("labelpilot", {}).get("image_sha256"):
+                raise Problem(f"{row['photo_id']} 原图已改变，请重新审核后导出", 409)
+            self.source_stamps[source] = stamp
+            signature = annotation_content_hash(document)
+            identity = (project.id, row["id"])
+            item_id = identities.get(identity)
+            matches = hashes.get(image_hash, [])
+            if len(matches) > 1:
+                raise Problem(f"{row['photo_id']} 在旧数据集中已有多个同图样本，不能安全跨项目去重", 409)
+            previous = self.originals.get(item_id)
+            if previous and previous["sha256"] != image_hash:
+                raise Problem(f"{row['photo_id']} 的来源图片内容已改变，拒绝覆盖历史数据", 409)
+            if item_id is None and matches:
+                item_id = matches[0]
+                previous = self.originals[item_id]
+            if previous:
+                annotation = next(name for name in entry_files(previous, self.manifest) if name.startswith("annotations/"))
+                if not self.check_file(annotation, previous.get("files", {}).get(annotation)):
+                    raise Problem(f"历史标注文件缺失或损坏：{annotation}；请先修复原数据集", 409)
+                stored = json.loads(safe_path(self.root, annotation).read_bytes())
+                if item_id in incoming_signatures and incoming_signatures[item_id] != signature:
+                    raise Problem(f"同图标注冲突：{row['photo_id']} 与本批其他来源的标注不同", 409)
+                incoming_signatures[item_id] = signature
+                same_annotation = annotation_content_hash(stored) == signature
+                primary = (previous.get("source_project", self.manifest["project"]), previous.get("source_item", previous["id"]))
+                shared = len(self.references[item_id]) > 1
+                if not same_annotation and (identity != primary or shared):
+                    raise Problem(f"同图标注冲突：{row['photo_id']} 的原文、坐标或属性与已导出版本不同；未覆盖历史标注，请先统一标注或导出到新目录", 409)
+                if unit != "image" and split_group(row, unit) != previous.get("split_group"):
+                    raise Problem(f"同图来源分组不一致：{row['photo_id']}；请统一来源组后合并", 409)
+                if identity != primary:
+                    self.deduplicated_rows.add(row["id"])
+                    self.deduplicated += 1
+            elif image_hash in pending:
+                item_id, previous_signature, group = pending[image_hash]
+                if previous_signature != signature:
+                    raise Problem(f"同图标注冲突：{row['photo_id']} 与本批其他图片内容相同但标注不同", 409)
+                if unit != "image" and split_group(row, unit) != group:
+                    raise Problem(f"同图来源分组不一致：{row['photo_id']}；请统一来源组后合并", 409)
+                self.skipped += 1
+                self.deduplicated += 1
+                self.references[item_id].append({"project": project.id, "item": row["id"], "revision": row.get("version", 0)})
+                continue
+            else:
+                item_id = hashlib.sha256(f"{project.id}:{row['id']}".encode()).hexdigest()
+                if item_id in self.originals or item_id in self.references:
+                    raise Problem("跨项目来源编号冲突，已停止合并", 409)
+                self.references[item_id] = []
+                pending[image_hash] = (item_id, signature, split_group(row, unit))
+            reference = {"project": project.id, "item": row["id"], "revision": row.get("version", 0)}
+            references = self.references[item_id]
+            references[:] = [entry for entry in references if (entry["project"], entry["item"]) != identity]
+            references.append(reference)
+            selected.append({**row, "export_id": item_id})
+        return selected
 
     def digest(self, path):
         if self.file_cache is not None:
@@ -203,6 +312,16 @@ class IncrementalExport:
             self.by_source.setdefault(source_id, []).append(entry)
             if "source_id" not in entry:
                 self.originals[item_id] = entry
+                references = source_references(entry, manifest["project"])
+                identities = set()
+                for reference in references:
+                    identity = (reference["project"], reference["item"])
+                    if (any(not isinstance(value, str) or not value for value in identity)
+                            or type(reference["revision"]) is not int or reference["revision"] < 0 or identity in identities):
+                        raise ValueError("无效或重复的来源记录")
+                    identities.add(identity)
+                if (entry.get("source_project", manifest["project"]), entry.get("source_item", item_id)) not in identities:
+                    raise ValueError("来源记录缺少原始标注身份")
             for name in entry_files(entry, manifest):
                 safe_path(self.root, name, self.checked_directories)
                 image_path, member = PurePosixPath(image), PurePosixPath(name)
@@ -274,7 +393,7 @@ class IncrementalExport:
                 groups[group] = entry["split"]
         assignments, pending = {}, {}
         for row in rows:
-            previous = self.originals.get(row["id"])
+            previous = self.originals.get(self.export_id(row))
             group = split_group(row, unit)
             if unit != "image" and group is None:
                 raise Problem("增量图片缺少来源组，请补齐来源信息", 422)
@@ -290,7 +409,7 @@ class IncrementalExport:
         ordered = sorted(pending)
         random.Random(seed).shuffle(ordered)
         ordered.sort(key=lambda group: len(pending[group]), reverse=True)
-        total = len(self.originals) + sum(row["id"] not in self.originals for row in rows)
+        total = len(self.originals) + sum(self.export_id(row) not in self.originals for row in rows)
         for group in ordered:
             subset = max(active, key=lambda name: total * ratios[name] / 100 - counts[name])
             for item_id in pending[group]:
@@ -315,7 +434,7 @@ class IncrementalExport:
     def reusable(self, plan, row, document, checkpoint):
         from .exporting import output_document, output_project, verify_export_annotation
 
-        previous = self.originals.get(row["id"])
+        previous = self.originals.get(self.export_id(row))
         if not previous or (previous["revision"], previous["status"]) != (row.get("version", 0), row["status"]):
             return False
         signature = content_hash(output_document(plan, document))
@@ -333,7 +452,7 @@ class IncrementalExport:
                 return False
             reader = type("Reader", (), {"read": lambda reader, name: safe_path(self.root, name).read_bytes()})()
             try:
-                for entry in self.by_source[row["id"]]:
+                for entry in self.by_source[self.export_id(row)]:
                     if checkpoint:
                         checkpoint()
                     expected = output_document(plan, document)
@@ -363,7 +482,7 @@ class IncrementalExport:
                                              entry["image"], entry["split"], plan.split_config, {}, 0, 0)
             except (Problem, OSError, ValueError):
                 return False
-        for entry in self.by_source[row["id"]]:
+        for entry in self.by_source[self.export_id(row)]:
             files = {}
             for name in entry_files(entry, self.manifest):
                 if checkpoint:
@@ -386,12 +505,14 @@ class IncrementalExport:
             raise Problem("合并历史类别后超过语义掩膜类别上限，请完整导出到新目录", 422)
         project = copy.copy(plan.project)
         project.names = names
+        if self.multi_project:
+            project.export_sources = [config for config in store.configs if config["id"] == self.manifest["project"]]
         plan = replace(plan, project=project, incremental=self)
         if (self.manifest.get("augmentation") != plan.augmentation
-                and set(self.originals) - {row["id"] for row in plan.rows}):
+                and set(self.originals) - {self.export_id(row) for row in plan.rows}):
             raise Problem("增强配置发生变化，需选择包含所有历史原图的范围才能同步；或完整导出到新目录", 422)
         changed = []
-        selected_ids = {row["id"] for row in plan.rows}
+        selected_ids = {self.export_id(row) for row in plan.rows if row["id"] not in self.deduplicated_rows}
         outside = set(self.originals) - selected_ids
         total = len(outside) + len(plan.rows)
         for index, source_id in enumerate(sorted(outside)):
@@ -415,12 +536,12 @@ class IncrementalExport:
             document = row.get("document")
             if document is None:
                 document = store.detail(project.id, row["id"])["document"]
-            if self.reusable(plan, row, document, checkpoint):
+            if row["id"] in self.deduplicated_rows or self.reusable(plan, row, document, checkpoint):
                 self.skipped += 1
             else:
-                self.changed.add(row["id"])
+                self.changed.add(self.export_id(row))
                 changed.append(row)
-                if row["id"] in self.originals:
+                if self.export_id(row) in self.originals:
                     self.updated += 1
                 else:
                     self.added += 1
@@ -432,6 +553,8 @@ class IncrementalExport:
 
     def summary(self):
         return {"directory": str(self.root), "added": self.added, "updated": self.updated, "skipped": self.skipped,
+                "cross_project": self.cross_project, "multi_project": self.multi_project, "deduplicated": self.deduplicated,
+                "target_project": self.manifest["project"], "settings_preserved": self.multi_project,
                 "augmentation_changed": self.augmentation_changed, "new_classes": self.new_classes,
                 "existing_originals": len(self.originals), "existing_assignments": "preserved",
                 "split_policy": "比例和种子仅用于新增图片，旧图保持集合归属；不自动删除范围外历史数据"}
@@ -441,6 +564,20 @@ class IncrementalExport:
 
         retained = [entry for entry in self.manifest["items"] if entry.get("source_id", entry["id"]) not in self.changed]
         manifest["items"] = retained + manifest["items"]
+        if self.multi_project:
+            manifest["project"] = self.manifest["project"]
+            sources = {entry["id"]: entry for entry in self.manifest.get("source_projects", [])}
+            for config in plan.project.config, *plan.project.export_sources:
+                sources[config["id"]] = {"id": config["id"], "name": config["name"], "image_root": config["image_root"]}
+            sources.setdefault(manifest["project"], {"id": manifest["project"], "name": manifest["project"]})
+            manifest["source_projects"] = list(sources.values())
+            for entry in manifest["items"]:
+                source_id = entry.get("source_id", entry["id"])
+                original = self.originals.get(source_id, entry)
+                entry.setdefault("source_project", original.get("source_project", self.manifest["project"]))
+                entry.setdefault("source_item", original.get("source_item", source_id))
+                if "source_id" not in entry:
+                    entry["sources"] = self.references[entry["id"]]
         images, files = set(), set()
         for entry in manifest["items"]:
             image = entry["image"].casefold()
