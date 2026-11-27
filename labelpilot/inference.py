@@ -153,8 +153,9 @@ class Inference:
                 if (latest["version"], latest["image_sha256"]) != (current["version"], current["image_sha256"]):
                     raise Problem("OCR 推理期间标注或原图发生变化，请重新推理", 409)
                 shapes = build_ocr_shapes(detections, project.names[0], current["width"], current["height"], item_id)
-            provenance = {"engine": "PaddleOCR 3.2.0", "detection_model": "PP-OCRv5_server_det",
-                          "recognition_model": "PP-OCRv5_server_rec", "device": runtime.get("device", "unknown"),
+            provenance = {"engine": "PaddleOCR 3.2.0", "detection_model": runtime.get("detection_model", "PP-OCRv5_server_det"),
+                          "recognition_model": runtime.get("recognition_model", "PP-OCRv5_server_rec"),
+                          "models": runtime.get("models", {}), "device": runtime.get("device", "unknown"),
                           "text_det_thresh": threshold, "image_sha256": current["image_sha256"],
                           "created_at": now(), "human_reviewed": False,
                           "candidate_count": len(shapes)}

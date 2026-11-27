@@ -412,6 +412,9 @@ dialog.automation-dialog { width: min(1090px, calc(100vw - 24px)); }
 .task-hint { padding: 8px 11px; color: var(--accent-text); border-left: 2px solid var(--accent-border); background: var(--accent-soft); font-size: 12px; }
 .label-export { display: flex; gap: 6px; }
 .ocr-preview { display: block; width: 100%; height: 110px; object-fit: contain; background: #080d14; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 9px; }
+.ocr-model-configuration { border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin: 12px 0; }
+.ocr-model-configuration .button-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 14px; }
+.ocr-model-configuration p { overflow-wrap: anywhere; }
 #ocrPickerFields, #ocrShapeFields { display: grid; gap: 9px; }
 #ocrPickerFields label, #ocrShapeFields label { display: grid; gap: 5px; }
 #ocrPickerFields details[open], #ocrShapeFields details[open] { display: grid; gap: 7px; }

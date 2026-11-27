@@ -133,12 +133,21 @@ def create_app(home=None):
     @app.post("/api/ocr/runtime")
     def set_ocr_runtime(payload: dict):
         with jobs.lock:
-            if any(job["status"] in ("queued", "running") for job in jobs.records.values()) or not inference.lock.acquire(blocking=False):
-                raise Problem("模型任务运行期间不能切换 OCR 设备", 409)
+            if (any(job["status"] in ("queued", "running") for job in jobs.records.values())
+                    or inference.exclusive.is_set() or not inference.lock.acquire(blocking=False)):
+                raise Problem("模型任务运行期间不能切换 OCR 模型或设备，请等待或取消任务", 409)
             try:
-                return inference.ocr_runtime.set_device(payload.get("device"))
+                return inference.ocr_runtime.configure(payload)
             finally:
                 inference.lock.release()
+
+    @app.post("/api/ocr/models/select")
+    def select_ocr_models(payload: dict):
+        modes = {"file": "ocr_model_file", "folder": "ocr_model_folder"}
+        mode = payload.get("mode")
+        if not isinstance(mode, str) or mode not in modes:
+            raise Problem("请选择 OCR 推理模型文件或文件夹", 422)
+        return native_picker.select_images(modes[mode], payload.get("path"))
 
     @app.get("/api/projects")
     def projects():

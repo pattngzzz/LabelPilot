@@ -1111,11 +1111,12 @@ function confirmImageSelection() {
   element("imageBrowserDialog").close();
   field.focus({preventScroll:true});
 }
-async function refreshOcrRuntime() {
-  const status=await api("/api/ocr/runtime");
+async function refreshOcrRuntime(status=null) {
+  status=status || await api("/api/ocr/runtime");
   const modelDirectory=status.model_directory||status.model_cache;
   element("ocrRuntimeStatus").textContent=`${status.message}${status.device ? ` · ${status.device}` : ""}${modelDirectory ? ` · 模型目录：${modelDirectory}` : ""}`;
   if(status.device)element("ocrDevice").value=status.device;
+  ocrUi.populateModels(status);
   return status;
 }
 function openModelDialog() {
@@ -1131,6 +1132,7 @@ function openModelDialog() {
 async function predictCurrent() {
   if(!state.current || state.busy)return;
   const ocr=taskUi.type()==="ocr";
+  if(ocr && !ocrUi.ensureModelsSaved())return;
   if(!ocr && !element("modelPath").value.trim()){openModelDialog();return;}
   if(!ocr)await saveModelConfig();
   element("modelDialog").close();
@@ -1176,6 +1178,7 @@ async function cleanupDuplicates() {
 }
 async function startBatch() {
   if(state.busy)return;
+  if(taskUi.type()==="ocr" && !ocrUi.ensureModelsSaved())return;
   if(taskUi.type()!=="ocr")await saveModelConfig();
   if(!await ensureSaved())return;
   const limit=Number(element("batchLimit").value);

@@ -1,4 +1,5 @@
 import json
+import hashlib
 import math
 import os
 import queue
@@ -9,7 +10,8 @@ import uuid
 from pathlib import Path
 
 from .ocr import validate_ocr_shape
-from .store import Problem, atomic_json
+from .paddleocr_models import DEFAULT_MODELS, MODEL_ROLES, model_files, model_signature
+from .store import Problem, atomic_json, digest
 
 
 DETECTION_MODEL = "PP-OCRv5_server_det"
@@ -75,7 +77,7 @@ class PaddleOCRRuntime:
         self.lock = threading.Lock()
         self.process = self.responses = self.signature = self.log_handle = None
 
-    def _configuration(self):
+    def _read_configuration(self):
         try:
             value = json.loads(self.config_path.read_text(encoding="utf-8"))
         except FileNotFoundError as exc:
@@ -84,6 +86,10 @@ class PaddleOCRRuntime:
             raise Problem("本地 PaddleOCR 配置无法读取", 503) from exc
         if not isinstance(value, dict):
             raise Problem("本地 PaddleOCR 配置格式无效", 503)
+        return value
+
+    def _configuration(self, value=None, *, validate_models=True):
+        value = self._read_configuration() if value is None else value
         path_values = (value.get("python_executable"), value.get("model_cache"), value.get("model_directory"))
         if any(not isinstance(path, str) or not path.strip() for path in path_values):
             raise Problem("本地 PaddleOCR 配置路径或设备无效", 503)
@@ -95,36 +101,85 @@ class PaddleOCRRuntime:
         if (not python.is_absolute() or not cache.is_absolute() or not model_directory.is_absolute()
                 or device not in ("gpu:0", "cpu")):
             raise Problem("本地 PaddleOCR 配置路径或设备无效", 503)
-        return python.resolve(), cache.resolve(), model_directory.resolve(), device
+        models = {}
+        for role, key in MODEL_ROLES.items():
+            selected = value.get(key)
+            if validate_models and selected is not None and selected != "":
+                try:
+                    models[role] = str(model_files(selected)[0].parent)
+                except (ValueError, OSError) as exc:
+                    raise Problem(f"本地 OCR {role} 模型配置无效：{exc}", 503) from exc
+        return python.resolve(), cache.resolve(), model_directory.resolve(), device, models
 
     def status(self):
         try:
-            python, cache, model_directory, device = self._configuration()
+            configuration = self._read_configuration()
+            python, cache, model_directory, device, models = self._configuration(configuration)
         except Problem as exc:
             return {"configured": False, "runtime_available": False, "models_downloaded": False,
                     "device": None, "model_cache": None, "message": exc.message}
         available = python.is_file() and self.worker_path.is_file()
-        downloaded = (cache / ".models_ready").is_file()
+        downloaded = all(role in models or (cache / "official_models" / name / "inference.pdiparams").is_file()
+                         or (model_directory / "official_models" / name / "inference.pdiparams").is_file()
+                         for role, name in DEFAULT_MODELS.items())
         message = "本地OCR运行环境可用" if available else "未找到独立OCR Python环境"
         if available and not downloaded:
             message = "已配置；首次预标注将下载模型到本机目录"
+        if models:
+            message = "已配置自选 OCR 模型；首次预标注将检查实际加载兼容性" if available else message
         return {"configured": True, "runtime_available": available, "models_downloaded": downloaded,
                 "worker_running": bool(self.process and self.process.poll() is None), "device": device,
                 "model_cache": str(cache), "model_directory": str(model_directory),
-                "detection_model": DETECTION_MODEL,
-                "recognition_model": RECOGNITION_MODEL, "message": message}
+                "detection_model": configuration.get("text_detection_model_name", DETECTION_MODEL) if "detection" in models else DETECTION_MODEL,
+                "recognition_model": configuration.get("text_recognition_model_name", RECOGNITION_MODEL) if "recognition" in models else RECOGNITION_MODEL,
+                **{key: models.get(role) for role, key in MODEL_ROLES.items()}, "message": message}
 
     def set_device(self, device):
-        if device not in ("gpu:0", "cpu"):
+        return self.configure({"device": device})
+
+    def _inspect_models(self, python, models):
+        try:
+            result = subprocess.run([str(python), "-X", "utf8", str(self.worker_path), "--inspect-models"],
+                                    input=json.dumps(models, ensure_ascii=True), capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=60,
+                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            response = json.loads(result.stdout)
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            raise Problem("无法校验 OCR 模型，请检查独立 OCR 环境与推理目录", 422) from exc
+        if not isinstance(response, dict):
+            raise Problem("OCR 模型校验进程返回了无效响应", 422)
+        if result.returncode or not response.get("ok"):
+            raise Problem(f"OCR 模型校验失败：{response.get('error', '独立环境不可用')}", 422)
+        return response["models"]
+
+    def configure(self, payload):
+        if not isinstance(payload, dict) or not payload or set(payload) - {"device", *MODEL_ROLES.values()}:
+            raise Problem("请选择 OCR 设备或检测 / 识别模型目录", 422)
+        if "device" in payload and payload["device"] not in ("gpu:0", "cpu"):
             raise Problem("OCR 运行设备仅支持 GPU 或 CPU", 422)
         with self.lock:
-            try:
-                value = json.loads(self.config_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as exc:
-                raise Problem("本地 OCR 配置不存在或无法读取", 503) from exc
-            value["device"] = device
-            atomic_json(self.config_path, value)
-            self._stop_worker()
+            value = self._read_configuration()
+            python, _, _, _, _ = self._configuration(value, validate_models=False)
+            updated = dict(value)
+            for key, selected in payload.items():
+                if key == "device":
+                    updated[key] = selected
+                elif selected is None or selected == "":
+                    updated.pop(key, None)
+                    updated.pop(key.replace("_dir", "_name"), None)
+                else:
+                    try:
+                        updated[key] = str(model_files(selected)[0].parent)
+                    except (ValueError, OSError) as exc:
+                        raise Problem(str(exc), 422) from exc
+            models = {role: updated[key] for role, key in MODEL_ROLES.items() if updated.get(key)}
+            if set(payload) & set(MODEL_ROLES.values()) and models:
+                inspected = self._inspect_models(python, models)
+                for role, spec in inspected.items():
+                    updated[MODEL_ROLES[role].replace("_dir", "_name")] = spec["name"]
+            if updated != value:
+                atomic_json(self.config_path, updated)
+                self._stop_worker()
         return self.status()
 
     def _read_responses(self, process, responses):
@@ -175,21 +230,45 @@ class PaddleOCRRuntime:
             except OSError:
                 shutil.copy2(source_file, target_file)
 
-    def _start_worker(self, python, cache, model_directory, device):
+    def _start_worker(self, python, cache, model_directory, device, models):
         if not python.is_file():
             raise Problem("找不到独立 PaddleOCR Python 环境", 503)
         if not self.worker_path.is_file():
             raise Problem("LabelPilot 的 PaddleOCR worker 文件缺失", 503)
+        signature = self._signature(python, cache, model_directory, device, models)
         cache.mkdir(parents=True, exist_ok=True)
-        for model_name in (DETECTION_MODEL, RECOGNITION_MODEL):
+        for role, model_name in DEFAULT_MODELS.items():
+            if role in models:
+                continue
             self._link_model_files(model_directory / "official_models" / model_name,
                                    cache / "official_models" / model_name)
+        inspected = self._inspect_models(python, models) if models else {}
+        staged = {}
+        for role, spec in inspected.items():
+            version = hashlib.sha256(json.dumps(spec["sha256"], sort_keys=True).encode()).hexdigest()
+            destination = cache / "custom_models" / f"{role}_{version}"
+            destination.mkdir(parents=True, exist_ok=True)
+            for source in model_files(spec["directory"]):
+                target = destination / source.name
+                if not target.is_file() or digest(target) != spec["sha256"][source.name]:
+                    temporary = target.with_name(f"{target.name}.{uuid.uuid4().hex}.part")
+                    try:
+                        shutil.copy2(source, temporary)
+                        if digest(temporary) != spec["sha256"][source.name]:
+                            raise Problem("复制期间 OCR 权重发生变化，请重试", 409)
+                        temporary.replace(target)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+            staged[role] = {**spec, "directory": str(destination), "source_directory": spec["directory"]}
+        if self._signature(python, cache, model_directory, device, models) != signature:
+            raise Problem("准备期间 OCR 权重发生变化，请重试", 409)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.log_handle = self.log_path.open("ab")
         environment = os.environ.copy()
         environment["PADDLE_PDX_CACHE_HOME"] = str(cache)
         environment["PYTHONUTF8"] = "1"
         environment["LABELPILOT_OCR_DEVICE"] = device
+        environment["LABELPILOT_OCR_MODELS"] = json.dumps(staged, ensure_ascii=True)
         try:
             process = subprocess.Popen(
                 [str(python), "-X", "utf8", "-u", str(self.worker_path)], cwd=str(self.home),
@@ -203,16 +282,21 @@ class PaddleOCRRuntime:
             raise Problem(f"无法启动 PaddleOCR 独立进程：{exc}", 503) from exc
         self.process = process
         self.responses = queue.Queue()
-        self.signature = (str(python), str(cache), str(model_directory), device)
+        self.signature = signature
         threading.Thread(target=self._read_responses, args=(process, self.responses), daemon=True).start()
+
+    @staticmethod
+    def _signature(python, cache, model_directory, device, models):
+        return (str(python), str(cache), str(model_directory), device,
+                tuple((role, model_signature(path)) for role, path in sorted(models.items())))
 
     def predict(self, image_path, *, threshold=0.3):
         with self.lock:
-            python, cache, model_directory, device = self._configuration()
-            signature = (str(python), str(cache), str(model_directory), device)
+            python, cache, model_directory, device, models = self._configuration()
+            signature = self._signature(python, cache, model_directory, device, models)
             if self.process is None or self.process.poll() is not None or self.signature != signature:
                 self._stop_worker()
-                self._start_worker(python, cache, model_directory, device)
+                self._start_worker(python, cache, model_directory, device, models)
             request_id = uuid.uuid4().hex
             request = {"id": request_id, "command": "predict", "image_path": str(Path(image_path).resolve()),
                        "text_det_thresh": threshold}
@@ -240,7 +324,9 @@ class PaddleOCRRuntime:
                     raise Problem(f"PaddleOCR 推理失败：{response.get('error', '未知错误')}", 503)
                 if response.get("models_ready"):
                     (cache / ".models_ready").touch()
-                    for model_name in (DETECTION_MODEL, RECOGNITION_MODEL):
+                    for role, model_name in DEFAULT_MODELS.items():
+                        if role in models:
+                            continue
                         self._link_model_files(cache / "official_models" / model_name,
                                                model_directory / "official_models" / model_name)
                 return response.get("detections", []), response.get("runtime", {})

@@ -2,5 +2,7 @@
   "python_executable": "PATH_TO_OCR_ENV/python.exe",
   "model_cache": "ASCII_PATH_TO_OCR_MODEL_CACHE",
   "model_directory": "PATH_TO_OCR_MODELS",
-  "device": "gpu:0"
+  "device": "gpu:0",
+  "text_detection_model_dir": null,
+  "text_recognition_model_dir": null
 }
