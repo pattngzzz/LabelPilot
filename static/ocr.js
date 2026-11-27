@@ -6,16 +6,22 @@ const ocrUi = (() => {
   const defaults = {text_raw:"", readability:"readable", value_role:"unknown", value_decimal:null,
     unit:null, field_name:null, channel:null, parent_id:null};
   const active = () => taskUi.type() === "ocr";
-  let modelsDirty = false, modelsBusy = false;
+  let modelsDirty = false, modelsBusy = false, modelSelectionAvailable = null;
 
   function modelControls() {
     element("ocrModelConfiguration").querySelectorAll("button").forEach(node => { node.disabled = modelsBusy || state.busy; });
+    for (const id of ["ocrDetectionModel", "ocrRecognitionModel"]) element(id).disabled = modelsBusy || state.busy;
     element("ocrSaveModels").disabled = modelsBusy || state.busy || !modelsDirty;
     for (const id of ["singlePredict", "batchPredict"]) element(id).disabled = state.busy || (active() && (modelsBusy || modelsDirty));
     element("ocrDevice").disabled = modelsBusy || modelsDirty || state.busy;
   }
 
   function populateModels(status) {
+    modelSelectionAvailable = status.model_selection_available === true;
+    if (!modelSelectionAvailable) {
+      element("ocrModelMessage").textContent = "当前后端仍是旧版本，请重启工具后刷新网页；仅刷新网页不会更新后端选模功能。";
+      return;
+    }
     if (modelsDirty || modelsBusy) return;
     element("ocrDetectionModel").value = status.text_detection_model_dir || "";
     element("ocrRecognitionModel").value = status.text_recognition_model_dir || "";
@@ -29,33 +35,28 @@ const ocrUi = (() => {
     return false;
   }
 
-  async function chooseModel(role, mode) {
-    if (modelsBusy) return;
-    modelsBusy = true;
+  function modelsChanged() {
+    modelsDirty = true;
+    element("ocrModelMessage").textContent = "模型路径尚未保存；点击保存后用于后续 OCR 预标注。";
     modelControls();
-    try {
-      const input = element(role === "detection" ? "ocrDetectionModel" : "ocrRecognitionModel");
-      const result = await api("/api/ocr/models/select", "POST", {mode, path:input.value || null});
-      if (!result.cancelled) {
-        input.value = result.path;
-        modelsDirty = true;
-        element("ocrModelMessage").textContent = "模型选择尚未保存；保存后用于后续 OCR 预标注。";
-      }
-    } finally {
-      modelsBusy = false;
-      modelControls();
-    }
+  }
+
+  async function chooseModel(role, mode) {
+    if (modelsBusy || state.busy) return;
+    if (modelSelectionAvailable === false) throw new Error("请先重启工具后刷新网页，再选择 OCR 模型");
+    await openModelBrowser(mode, role === "detection" ? "ocrDetectionModel" : "ocrRecognitionModel");
   }
 
   async function saveModels() {
     if (modelsBusy) return;
+    if (modelSelectionAvailable === false) throw new Error("后端仍是旧版本，请重启工具后刷新网页再保存 OCR 模型");
     modelsBusy = true;
     modelControls();
     element("ocrModelMessage").textContent = "正在校验模型文件与检测 / 识别类型…";
     try {
       const status = await api("/api/ocr/runtime", "POST", {
-        text_detection_model_dir:element("ocrDetectionModel").value || null,
-        text_recognition_model_dir:element("ocrRecognitionModel").value || null,
+        text_detection_model_dir:element("ocrDetectionModel").value.trim() || null,
+        text_recognition_model_dir:element("ocrRecognitionModel").value.trim() || null,
       });
       modelsDirty = false;
       modelsBusy = false;
@@ -152,13 +153,14 @@ const ocrUi = (() => {
     models.hidden = true;
     models.innerHTML = '<h3>OCR 预标注模型</h3>' +
       [["detection", "Detection", "文字检测", "PP-OCRv5_server_det"], ["recognition", "Recognition", "文字识别", "PP-OCRv5_server_rec"]].map(([role, id, title, fallback]) =>
-        `<label>${title}模型<input id="ocr${id}Model" readonly placeholder="默认 ${fallback}" aria-label="${title}模型目录"></label>` +
+        `<label>${title}模型<input id="ocr${id}Model" placeholder="默认 ${fallback}；可粘贴文件或文件夹地址" aria-label="${title}模型路径"></label>` +
         `<div class="button-row"><button class="button" data-ocr-model-role="${role}" data-ocr-model-mode="folder">选择文件夹…</button>` +
         `<button class="button" data-ocr-model-role="${role}" data-ocr-model-mode="file">选择模型文件…</button></div>`).join("") +
-      '<p class="muted">选择本机 PaddleOCR 导出的推理目录，或其中的 inference.json / .pdmodel / .pdiparams / .yml。目录需含完整推理文件；不支持 YOLO .pt 或训练 .pdparams。留空使用默认模型，可只更换检测或识别。</p>' +
+      '<p class="muted">与 YOLO 共用本机文件浏览器，也可直接粘贴模型文件或文件夹地址（支持带引号的路径）。选择 PaddleOCR 推理目录，或其中的 inference.json / .pdmodel / .pdiparams / .yml；不支持 YOLO .pt 或训练 .pdparams。留空使用默认模型。</p>' +
       '<div class="button-row"><button id="ocrSaveModels" class="button primary" disabled>保存 OCR 模型配置</button><button id="ocrDefaultModels" class="button">恢复默认模型</button><button id="ocrRevertModels" class="button">撤销选择</button></div>' +
       '<p id="ocrModelMessage" class="muted" role="status"></p><p class="muted">配置由本工具所有 OCR 项目共享，仅影响后续预标注，不修改已有人工标注。保存只校验文件；实际加载兼容性以首次预标注结果为准。</p>';
     element("ocrRuntimeStatus").after(models);
+    for (const id of ["ocrDetectionModel", "ocrRecognitionModel"]) listen(id, "input", modelsChanged);
     models.querySelectorAll("[data-ocr-model-role]").forEach(button => button.addEventListener("click", () => {
       chooseModel(button.dataset.ocrModelRole, button.dataset.ocrModelMode).catch(error => toast(error.message, true));
     }));

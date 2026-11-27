@@ -10,7 +10,6 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from labelpilot import native_picker
 from labelpilot.inference import Inference, Jobs
 from labelpilot.ocr_runtime import PaddleOCRRuntime
 from labelpilot.paddleocr_models import inspect_model, model_signature
@@ -232,44 +231,39 @@ def test_model_change_during_preparation_blocks_worker_start(tmp_path, monkeypat
     assert runtime.process is None
 
 
-@pytest.mark.parametrize("mode,choose_file", [("ocr_model_folder", False), ("ocr_model_file", True)])
-def test_native_ocr_picker_normalizes_directory_and_handles_cancel(tmp_path, monkeypatch, mode, choose_file):
+@pytest.mark.parametrize("filename", [None, "inference.yml", "inference.json", "inference.pdiparams", "inference.pdmodel"])
+@pytest.mark.parametrize("quotes", ["", '"', "'"])
+def test_pasted_ocr_file_or_directory_path_normalizes_on_save(tmp_path, filename, quotes):
+    runtime = make_runtime(tmp_path)
     recognition = make_model(tmp_path)
-    selected = [str(recognition / "inference.pdiparams" if choose_file else recognition)]
-    calls = []
+    if filename == "inference.pdmodel":
+        (recognition / filename).write_bytes(b"legacy graph")
+    chosen = recognition / filename if filename else recognition
+    selected = f"  {quotes}{chosen}{quotes}  "
+    status = runtime.configure({"text_recognition_model_dir": selected})
+    assert status["text_recognition_model_dir"] == str(recognition)
+    assert status["model_selection_available"] is True
 
-    def run(command, **options):
-        calls.append(json.loads(options["input"]))
-        return native_picker.subprocess.CompletedProcess(command, 0, json.dumps(selected), "")
 
-    monkeypatch.setattr(native_picker.subprocess, "run", run)
-    assert native_picker.select_images(mode) == {"cancelled": False, "path": str(recognition)}
-    assert calls[0]["mode"] == mode
-    selected.clear()
-    assert native_picker.select_images(mode) == {"cancelled": True}
-    selected.append(str(tmp_path / "best.pt"))
+def test_unsupported_checkpoint_path_does_not_change_configuration(tmp_path):
+    runtime = make_runtime(tmp_path)
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"not an OCR inference model")
+    before = runtime.config_path.read_bytes()
     with pytest.raises(Problem):
-        native_picker.select_images(mode)
-    assert not native_picker.PICKER_LOCK.locked()
+        runtime.configure({"text_recognition_model_dir": str(checkpoint)})
+    assert runtime.config_path.read_bytes() == before
 
 
 def test_ocr_model_routes_require_session_and_idle_runtime(tmp_path, monkeypatch):
     runtime = make_runtime(tmp_path)
     app = create_app(runtime.home)
     recognition = make_model(tmp_path)
-    pick = Mock(return_value={"cancelled": False, "path": str(recognition)})
-    monkeypatch.setattr(native_picker, "select_images", pick)
     with TestClient(app) as client:
         headers = {"X-LabelPilot-Token": app.state.token}
         payload = {"text_recognition_model_dir": str(recognition)}
         assert client.post("/api/ocr/runtime", json=payload).status_code == 403
-        assert client.post("/api/ocr/models/select", json={"mode": "folder"}).status_code == 403
-        assert client.post("/api/ocr/models/select", json={"mode": "folder"},
-                           headers={**headers, "Origin": "https://evil.example"}).status_code == 403
-        pick.assert_not_called()
-        assert client.post("/api/ocr/models/select", json={"mode": "file"}, headers=headers).json()["path"] == str(recognition)
-        pick.assert_called_once_with("ocr_model_file", None)
-        assert client.post("/api/ocr/models/select", json={"mode": "bad"}, headers=headers).status_code == 422
+        assert client.get("/api/ocr/runtime").json()["model_selection_available"] is True
         assert client.post("/api/ocr/runtime", json=payload, headers=headers).status_code == 200
         before = runtime.config_path.read_bytes()
         for busy in ("job", "lock", "exclusive"):
@@ -288,6 +282,41 @@ def test_ocr_model_routes_require_session_and_idle_runtime(tmp_path, monkeypatch
                 if busy == "lock":
                     app.state.inference.lock.release()
                 app.state.inference.exclusive.clear()
+
+
+def test_ocr_browsing_uses_shared_model_endpoint_and_never_loads_weights(tmp_path, monkeypatch):
+    store, project_id = make_ocr_project(tmp_path)
+    app = create_app(store.home)
+    recognition = make_model(tmp_path / "中文模型目录")
+    (recognition / "best.pt").write_bytes(b"YOLO model")
+    (recognition / "inference.pdmodel").write_bytes(b"legacy graph")
+    (recognition / "training.pdparams").write_bytes(b"training checkpoint")
+    (recognition / "nested").mkdir()
+    inspect = Mock(side_effect=AssertionError("Browsing must not inspect or load a model"))
+    monkeypatch.setattr(app.state.inference.ocr_runtime, "_inspect_models", inspect)
+    before = store.registry_path.read_bytes()
+    address = f"/api/projects/{project_id}/model/browse"
+    with TestClient(app) as client:
+        headers = {"X-LabelPilot-Token": app.state.token}
+        request = {"path": str(recognition), "kind": "ocr"}
+        assert client.post(address, json=request).status_code == 403
+        assert client.post(address, json=request, headers={**headers, "Origin": "https://evil.example"}).status_code == 403
+        result = client.post(address, json=request, headers=headers).json()
+        assert result["path"] == str(recognition)
+        assert {row["name"] for row in result["files"]} == {
+            "inference.json", "inference.yml", "inference.pdiparams", "inference.pdmodel"}
+        assert [row["name"] for row in result["directories"]] == ["nested"]
+        request["path"] = f'"{recognition / "inference.json"}"'
+        result = client.post(address, json=request, headers=headers).json()
+        assert result["path"] == str(recognition)
+        default = client.post(address, json={"kind": "ocr"}, headers=headers)
+        assert default.status_code == 200
+        for path in (str(tmp_path / "missing"), "bad\x00path", "relative", str(recognition / "best.pt"), []):
+            assert client.post(address, json={"path": path, "kind": "ocr"}, headers=headers).status_code == 422
+        yolo = client.post(address, json={"path": str(recognition)}, headers=headers).json()
+        assert [row["name"] for row in yolo["files"]] == ["best.pt"]
+    inspect.assert_not_called()
+    assert store.registry_path.read_bytes() == before
 
 
 def test_custom_model_identity_is_recorded_in_reviewable_prediction(tmp_path, monkeypatch):

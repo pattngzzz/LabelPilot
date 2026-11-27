@@ -117,7 +117,7 @@ class PaddleOCRRuntime:
             python, cache, model_directory, device, models = self._configuration(configuration)
         except Problem as exc:
             return {"configured": False, "runtime_available": False, "models_downloaded": False,
-                    "device": None, "model_cache": None, "message": exc.message}
+                    "device": None, "model_cache": None, "model_selection_available": True, "message": exc.message}
         available = python.is_file() and self.worker_path.is_file()
         downloaded = all(role in models or (cache / "official_models" / name / "inference.pdiparams").is_file()
                          or (model_directory / "official_models" / name / "inference.pdiparams").is_file()
@@ -128,6 +128,7 @@ class PaddleOCRRuntime:
         if models:
             message = "已配置自选 OCR 模型；首次预标注将检查实际加载兼容性" if available else message
         return {"configured": True, "runtime_available": available, "models_downloaded": downloaded,
+                "model_selection_available": True,
                 "worker_running": bool(self.process and self.process.poll() is None), "device": device,
                 "model_cache": str(cache), "model_directory": str(model_directory),
                 "detection_model": configuration.get("text_detection_model_name", DETECTION_MODEL) if "detection" in models else DETECTION_MODEL,

@@ -151,7 +151,7 @@ ONNX 模型目录必须包含 `sam3_image_encoder.onnx`、`sam3_language_encoder
 
 OCR 项目支持本地 PaddleOCR 文字检测与识别预标注，以及人工校对和 PaddleOCR 格式导出；OCR 模型训练仍需使用导出的数据另行完成。目标检测权重不能直接作为文字识别权重使用。
 
-在“模型预标注 → OCR 预标注模型”中，可分别点击“选择文件夹…”或“选择模型文件…”打开本机系统选择窗口，选择检测 / 识别推理模型后点击“保存 OCR 模型配置”。支持只更换其中一个模型；留空使用默认 `PP-OCRv5_server_det` / `PP-OCRv5_server_rec`，也可点击“恢复默认模型”后保存。未保存的选择会阻止发起 OCR 预标注，选择窗口取消不改变配置。
+在“模型预标注 → OCR 预标注模型”中，可分别点击“选择文件夹…”或“选择模型文件…”打开与 YOLO 共用的本机文件浏览器，也可直接粘贴模型文件或文件夹的绝对地址（支持资源管理器复制的带引号路径），然后点击“保存 OCR 模型配置”。支持只更换其中一个模型；留空使用默认 `PP-OCRv5_server_det` / `PP-OCRv5_server_rec`，也可点击“恢复默认模型”后保存。未保存的选择会阻止发起 OCR 预标注，选择窗口取消不改变配置。更新工具后需重启后端并刷新网页，不能只刷新网页。
 
 自选模型必须为 PaddleOCR 导出的推理目录，包含非空 `inference.yml`、`inference.pdiparams` 以及 `inference.json` 或 `inference.pdmodel`；选择其中一个文件时自动使用所在目录。工具从 `inference.yml` 的 `Global.model_name` 识别模型，检测 `_det` 与识别 `_rec` 不能混用；训练检查点 `.pdparams`、YOLO `.pt` 不能直接加载。能否实际运行取决于已安装 PaddleOCR / PaddleX 对该架构的支持，保存校验不等于加载成功，首次预标注会验证实际兼容性，失败不会静默回退默认模型。
 

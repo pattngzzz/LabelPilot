@@ -24,7 +24,7 @@ from .exporting import export_project, preview_export
 from .export_jobs import ExportJobs
 from .export_previews import ExportPreviews
 from .inference import Inference, Jobs
-from . import model_files, native_picker
+from . import model_files, native_picker, paddleocr_models
 from .sam3 import Sam3Assistant
 from .suggestions import AssistanceJobs, load_contours, predict_contours, save_contours
 from .store import IMAGE_SUFFIXES, Problem, Store
@@ -141,14 +141,6 @@ def create_app(home=None):
             finally:
                 inference.lock.release()
 
-    @app.post("/api/ocr/models/select")
-    def select_ocr_models(payload: dict):
-        modes = {"file": "ocr_model_file", "folder": "ocr_model_folder"}
-        mode = payload.get("mode")
-        if not isinstance(mode, str) or mode not in modes:
-            raise Problem("请选择 OCR 推理模型文件或文件夹", 422)
-        return native_picker.select_images(modes[mode], payload.get("path"))
-
     @app.get("/api/projects")
     def projects():
         return {"projects": [project.summary() for project in store.projects.values()], "errors": store.project_errors}
@@ -204,6 +196,19 @@ def create_app(home=None):
     def browse_model(project_id: str, payload: dict):
         project = store.project(project_id)
         path = payload.get("path")
+        if payload.get("kind") == "ocr":
+            if project.task_type != "ocr":
+                raise Problem("OCR 模型仅用于 OCR 项目", 422)
+            if path is None:
+                status = inference.ocr_runtime.status()
+                path = status.get("model_directory") or status.get("model_cache") or str(home)
+                if not Path(path).is_dir():
+                    path = str(Path.home())
+            try:
+                directory = paddleocr_models.model_directory(path)
+            except (ValueError, OSError) as exc:
+                raise Problem(str(exc), 422) from exc
+            return model_files.browse(str(directory), names=paddleocr_models.INFERENCE_FILES)
         if path is None:
             configured = Path(project.config.get("model_path") or home)
             path = str(configured.parent if configured.suffix.lower() == ".pt" else configured)

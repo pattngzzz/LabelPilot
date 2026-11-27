@@ -12,7 +12,7 @@ const state = {projects:[],project:null,items:[],filtered:0,offset:0,pageSize:60
 const canvas = element("canvas");
 const context = canvas.getContext("2d");
 const sessionToken = document.querySelector('meta[name="labelpilot-token"]').content;
-const modelBrowser = {mode:"file",target:"modelPath",listing:null,loading:false,sequence:0};
+const modelBrowser = {mode:"file",target:"modelPath",kind:"yolo",listing:null,loading:false,sequence:0};
 const exportPreview = {sequence:0, timer:null, plan:null, running:false, selecting:false, job:null,
   request:null, starting:Promise.resolve()};
 const exportSplitLabels = {train:"训练", val:"验证", test:"测试"};
@@ -969,14 +969,15 @@ function modelSelectionChanged() {
 }
 function renderModelBrowser() {
   const listing=modelBrowser.listing;
+  const ocr=modelBrowser.kind==="ocr";
   if(!listing)return;
   element("modelBrowserPath").value=listing.path;
   element("modelBrowserPath").title=listing.path;
   element("modelBrowserDrive").innerHTML='<option value="">磁盘位置</option>'+listing.roots.map(path=>`<option value="${escapeHtml(path)}">${escapeHtml(path)}</option>`).join("");
   element("modelBrowserCount").textContent=`${listing.search ? "含子文件夹 · " : ""}${listing.directories.length} 个文件夹 · ${listing.files.length} 个模型`;
   const folders=listing.directories.map(item=>`<button type="button" class="model-file-row folder" data-model-directory="${escapeHtml(item.path)}" title="${escapeHtml(item.path)}"><b>▸</b><span>${escapeHtml(item.name)}</span><small>打开文件夹</small></button>`).join("");
-  const files=listing.files.map(item=>`<button type="button" class="model-file-row" data-model-file="${escapeHtml(item.path)}" title="${escapeHtml(item.path)}"><b>.pt</b><span>${escapeHtml(item.name)}</span><small>${(item.size/1024/1024).toFixed(1)} MB · 选择</small></button>`).join("");
-  element("modelBrowserList").innerHTML=folders+files || `<p class="empty-list">${listing.search ? "未找到 .pt 模型，请选择其他文件夹。" : "此处没有子文件夹或 .pt 模型。"}</p>`;
+  const files=listing.files.map(item=>`<button type="button" class="model-file-row" data-model-file="${escapeHtml(item.path)}" title="${escapeHtml(item.path)}"><b>${ocr ? escapeHtml(item.name.slice(item.name.lastIndexOf("."))) : ".pt"}</b><span>${escapeHtml(item.name)}</span><small>${(item.size/1024/1024).toFixed(1)} MB · 选择</small></button>`).join("");
+  element("modelBrowserList").innerHTML=folders+files || `<p class="empty-list">${ocr ? "此处没有子文件夹或 OCR 推理文件，请选择其他文件夹。" : listing.search ? "未找到 .pt 模型，请选择其他文件夹。" : "此处没有子文件夹或 .pt 模型。"}</p>`;
   element("modelBrowserError").textContent=listing.partial ? "结果可能不完整（访问权限、扫描时间或数量上限）；请选择更具体的文件夹继续查找。" : "";
 }
 function setModelBrowserLoading(value) {
@@ -993,7 +994,7 @@ async function loadModelDirectory(path, search=false) {
   element("modelBrowserError").textContent="";
   element("modelBrowserCount").textContent=search ? "正在查找 .pt 模型（包含子文件夹）…" : "正在读取本机文件夹…";
   try {
-    const listing=await api(projectUrl(search ? "/model/search" : "/model/browse"),"POST",{path});
+    const listing=await api(projectUrl(search ? "/model/search" : "/model/browse"),"POST",{path,...(modelBrowser.kind==="ocr" ? {kind:"ocr"} : {})});
     if(sequence!==modelBrowser.sequence || !element("modelBrowserDialog").open || state.project.id!==projectId)return;
     modelBrowser.listing=listing;
     renderModelBrowser();
@@ -1007,21 +1008,24 @@ async function openModelBrowser(mode, target="modelPath") {
   if(!state.project || state.busy)return;
   modelBrowser.mode=mode;
   modelBrowser.target=target;
+  modelBrowser.kind=["ocrDetectionModel","ocrRecognitionModel"].includes(target) ? "ocr" : "yolo";
+  const ocr=modelBrowser.kind==="ocr";
   modelBrowser.listing=null;
   element("modelBrowserList").innerHTML="";
   element("modelBrowserDrive").innerHTML='<option value="">磁盘位置</option>';
   element("modelBrowserPath").value="";
-  element("modelBrowserTitle").textContent=mode==="folder" ? "选择模型文件夹" : "选择本机模型文件";
-  element("modelBrowserHelp").textContent=mode==="folder" ? "打开目标文件夹，点击下方“选择此文件夹并查找模型”，再从结果中明确选择一个 .pt 文件。" : "点击文件夹进入，点击 .pt 文件选择；仅读取路径，不上传或加载文件。";
+  element("modelBrowserTitle").textContent=ocr ? "选择本机 OCR 模型" : mode==="folder" ? "选择模型文件夹" : "选择本机模型文件";
+  element("modelBrowserHelp").textContent=ocr ? "与 YOLO 使用同一文件浏览器。点击文件夹进入，选择 inference 推理文件或当前模型文件夹；也可粘贴文件 / 文件夹地址后点击前往。" : mode==="folder" ? "打开目标文件夹，点击下方“选择此文件夹并查找模型”，再从结果中明确选择一个 .pt 文件。" : "点击文件夹进入，点击 .pt 文件选择；仅读取路径，不上传或加载文件。";
+  element("searchModelFolder").textContent=ocr ? "选择此模型文件夹" : "选择此文件夹并查找模型";
   element("searchModelFolder").hidden=mode!=="folder";
   element("modelBrowserDialog").showModal();
-  await loadModelDirectory(null);
+  await loadModelDirectory(ocr ? element(target).value.trim() || null : null);
 }
 function chooseModelFile(path) {
   if(modelBrowser.loading)return;
   const field=element(modelBrowser.target);
   field.value=path;
-  if(modelBrowser.target==="modelPath")modelSelectionChanged();
+  field.dispatchEvent(new Event("input",{bubbles:true}));
   element("modelBrowserDialog").close();
   field.focus({preventScroll:true});
 }
@@ -2248,7 +2252,7 @@ listen("modelPath","input",modelSelectionChanged);
 element("modelBrowserPathForm").addEventListener("submit",event=>{event.preventDefault();if(!modelBrowser.loading)loadModelDirectory(element("modelBrowserPath").value.trim());});
 listen("modelBrowserDrive","change",event=>{if(event.target.value)return loadModelDirectory(event.target.value);});
 listen("modelBrowserUp","click",()=>loadModelDirectory(modelBrowser.listing.parent));
-listen("searchModelFolder","click",()=>loadModelDirectory(modelBrowser.listing.path,true));
+listen("searchModelFolder","click",()=>modelBrowser.kind==="ocr" ? chooseModelFile(modelBrowser.listing.path) : loadModelDirectory(modelBrowser.listing.path,true));
 listen("modelBrowserList","click",event=>{
   if(modelBrowser.loading)return;
   const folder=event.target.closest("[data-model-directory]");
