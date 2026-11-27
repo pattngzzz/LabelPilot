@@ -100,8 +100,9 @@ async function initialize() {
   for (const failure of response.errors) toast(`${failure.name}：${failure.error}`, true);
   element("projectSelect").innerHTML = state.projects.map(project => `<option value="${escapeHtml(project.id)}">${escapeHtml(project.name)}</option>`).join("");
   if (!state.projects.length) {
-    showCanvasMessage("接入你的第一个数据集", "新建项目后，选择标注任务和本机图片");
-    element("projectDialog").showModal();
+    clearProject();
+    if (response.archived_count) await projectManagement.open(true);
+    else element("projectDialog").showModal();
     return;
   }
   const previous = localStorage.getItem("labelpilot-project");
@@ -147,6 +148,32 @@ async function selectProject(projectId) {
   clearInterval(jobTimer);
   jobTimer = setInterval(() => pollJobs().catch(() => {}), 3000);
   await pollJobs();
+}
+
+function clearProject() {
+  clearInterval(jobTimer);
+  ++state.loadSequence;
+  ++state.listSequence;
+  Object.assign(state, {project:null, current:null, image:null, items:[], selected:-1, undo:[], redo:[], dirty:false,
+    drag:null, rectangle:null, polygon:[], pendingShape:null, prediction:null, filtered:0, offset:0});
+  efficiency.resetProject();
+  for (const id of ["imageList", "classList", "shapeClass"]) element(id).replaceChildren();
+  for (const id of ["filteredCount", "totalCount", "predictedCount", "reviewedCount"]) element(id).textContent = "0";
+  element("imageTitle").textContent = "选择项目开始标注";
+  element("imageMeta").textContent = element("sourceNote").textContent = "";
+  element("projectSubtitle").textContent = "没有正在使用的项目；可新建项目或在项目管理中复原";
+  element("projectTask").hidden = element("reuseAnnotationButton").hidden = true;
+  element("progressText").textContent = "0%";
+  element("reviewProgress").style.width = "0%";
+  element("progressCaption").textContent = "归档项目的原图和标注全部保留";
+  element("pageInfo").textContent = "0 / 0";
+  element("activeClassText").textContent = "请先选择项目";
+  setDirty(false);
+  setStatus("");
+  setBusy(false);
+  renderObjects();
+  draw();
+  showCanvasMessage("没有正在使用的项目", "点击项目管理查看已归档项目，或新建项目导入图片");
 }
 
 async function refreshList() {
@@ -263,6 +290,7 @@ async function loadItem(itemId, remembered=null) {
     fitImage();
     efficiency.itemChanged();
     workspaceResume.loaded(remembered);
+    await projectManagement.loaded();
   } catch (error) {
     showCanvasMessage("图片载入失败",error.message);
     throw error;
@@ -296,6 +324,7 @@ async function saveCurrent(status="draft") {
     setDirty(false);
     workspaceResume.savedManually();
     setStatus(response.status);
+    projectManagement.updateSourceNote();
     draw();
     toast(status === "reviewed" ? "已人工确认并保存" : status === "skipped" ? "已跳过；标注仍保留" : "草稿已保存，原始标注未改动");
     await refreshList();
@@ -2144,6 +2173,7 @@ async function createProject() {
   try{
     const project=await api("/api/projects","POST",{name:element("newProjectName").value.trim(),image_root:element("newImageRoot").value.trim(),
       task_type:taskUi.projectTask(),
+      reuse_annotations:element("newReuseAnnotations").checked,
       ...(projectImages.files.length ? {image_files:projectImages.files} : {}),
       annotation_root:element("newAnnotationRoot").value.trim(),preannotation_root:element("newPreannotationRoot").value.trim(),
       classes:element("newClasses").value.split(/\r?\n/).map(name=>name.trim()).filter(Boolean),class_map_path:element("newClassMap").value.trim(),
@@ -2467,4 +2497,5 @@ efficiency.render();
 workspaceResume.install();
 automationUi.install();
 taskUi.install();
+projectManagement.install();
 initialize().catch(error=>{toast(error.message,true);showCanvasMessage("工作区启动失败",error.message);});

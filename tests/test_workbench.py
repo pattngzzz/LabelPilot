@@ -2583,7 +2583,7 @@ def test_asset_versions_change_with_frontend_content(dataset, tmp_path, monkeypa
     assets = tmp_path / "frontend"
     assets.mkdir()
     for name in ("index.html", "efficiency.js", "resume.js", "automation.js", "task-tools.js", "ocr.js",
-                 "sam3.js", "app.js", "style.css", "realityloop.png"):
+                 "sam3.js", "app.js", "projects.js", "style.css", "realityloop.png"):
         (assets / name).write_bytes((server.ASSETS / name).read_bytes())
     monkeypatch.setattr(server, "ASSETS", assets)
     with TestClient(create_app(dataset[0])) as client:

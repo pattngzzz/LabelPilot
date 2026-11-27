@@ -187,6 +187,7 @@ class Automation:
                 raise Problem("盲测验收适用于目标检测项目", 422)
             get_blindset(self.store, project_id, recipe["release"]["blindset"])
         with self.lock:
+            self.store.project(project_id)
             if any(row["project"] == project_id and row["kind"] == kind and row["status"] in IN_PROGRESS
                    for row in self.records.values()):
                 raise Problem("这个工作流已有任务在运行", 409)
@@ -265,6 +266,8 @@ class Automation:
         with self.lock:
             projects = list(self.settings)
         for project_id in projects:
+            if project_id not in self.store.projects:
+                continue
             try:
                 if self.halt.is_set():
                     return

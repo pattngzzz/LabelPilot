@@ -11,6 +11,7 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .annotation_tools import inherit_next, interpolate_frames, prompt_box
@@ -80,6 +81,18 @@ def create_app(home=None):
     app.state.token = secrets.token_urlsafe(32)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"])
 
+    @asynccontextmanager
+    async def project_access(project_id):
+        if project_id is None:
+            yield
+            return
+        lease = store.management.access(project_id)
+        await run_in_threadpool(lease.__enter__)
+        try:
+            yield
+        finally:
+            await run_in_threadpool(lease.__exit__, None, None, None)
+
     @app.middleware("http")
     async def protect_local(request: Request, call_next):
         origin = request.headers.get("origin")
@@ -90,7 +103,12 @@ def create_app(home=None):
                 return JSONResponse({"detail": "本地会话已过期，请刷新页面"}, status_code=403)
             if int(request.headers.get("content-length", "0")) > 20 * 1024 * 1024:
                 return JSONResponse({"detail": "请求过大"}, status_code=413)
-        response = await call_next(request)
+        project_request = re.match(r"^/api/projects/([^/]+)(?:/|$)", request.url.path)
+        try:
+            async with project_access(project_request[1] if project_request else None):
+                response = await call_next(request)
+        except Problem as exc:
+            response = JSONResponse({"detail": exc.message}, status_code=exc.status)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
@@ -106,7 +124,7 @@ def create_app(home=None):
     def index():
         version = hashlib.sha256(b"".join((ASSETS / name).read_bytes() for name in
                                          ("index.html", "efficiency.js", "resume.js", "automation.js", "task-tools.js", "ocr.js",
-                                          "app.js", "sam3.js", "style.css", "realityloop.png"))).hexdigest()[:16]
+                                          "app.js", "projects.js", "sam3.js", "style.css", "realityloop.png"))).hexdigest()[:16]
         return (ASSETS / "index.html").read_text(encoding="utf-8").replace(
             "__SESSION_TOKEN__", app.state.token).replace("__ASSET_VERSION__", version)
 
@@ -143,7 +161,49 @@ def create_app(home=None):
 
     @app.get("/api/projects")
     def projects():
-        return {"projects": [project.summary() for project in store.projects.values()], "errors": store.project_errors}
+        with store.lock:
+            return {"projects": [project.summary() for project in store.projects.values()], "errors": store.project_errors,
+                    "archived_count": sum(row["state"] == "archived" for row in store.management.states().values())}
+
+    @app.get("/api/project-management")
+    def managed_projects():
+        return store.management.listing()
+
+    def manage_project(project_id, action, payload):
+        with automation.lock, exports.lock, export_previews.lock:
+            for manager in (automation, exports, export_previews):
+                if any(row["project"] == project_id and row["status"] in ("queued", "running", "waiting", "preparing", "cancelling")
+                       for row in manager.records.values()):
+                    raise Problem("项目仍有后台任务，请等待完成或取消后再管理项目", 409)
+            jobs.reserve_model_slot()
+            try:
+                if action == "archive":
+                    return store.management.archive(project_id)
+                if action == "restore":
+                    return store.management.restore(project_id)
+                return store.management.delete(project_id, payload.get("confirmation"))
+            finally:
+                jobs.release_model_slot()
+
+    @app.post("/api/project-management/{project_id}/archive")
+    def archive_project(project_id: str):
+        return manage_project(project_id, "archive", {})
+
+    @app.post("/api/project-management/{project_id}/restore")
+    def restore_project(project_id: str):
+        return manage_project(project_id, "restore", {})
+
+    @app.post("/api/project-management/{project_id}/delete")
+    def delete_project(project_id: str, payload: dict):
+        return manage_project(project_id, "delete", payload)
+
+    @app.get("/api/projects/{project_id}/items/{item_id}/reuse")
+    def reuse_candidates(project_id: str, item_id: str):
+        return store.management.candidates(project_id, store.detail(project_id, item_id))
+
+    @app.post("/api/projects/{project_id}/items/{item_id}/reuse")
+    def reuse_annotation(project_id: str, item_id: str, payload: dict):
+        return store.management.reuse(project_id, item_id, payload)
 
     @app.post("/api/projects")
     def register(payload: dict):
@@ -258,7 +318,10 @@ def create_app(home=None):
 
     @app.get("/api/projects/{project_id}/items/{item_id}")
     def detail(project_id: str, item_id: str):
-        return store.detail(project_id, item_id)
+        current = store.detail(project_id, item_id)
+        if store.project(project_id).config.get("reuse_annotations", True):
+            current["reuse_candidates"] = store.management.candidates(project_id, current)
+        return current
 
     @app.put("/api/projects/{project_id}/items/{item_id}")
     def save(project_id: str, item_id: str, payload: dict):

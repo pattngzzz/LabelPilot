@@ -425,6 +425,15 @@ body[data-task="ocr"] .label-picker { width: min(440px, calc(100vw - 24px)); max
 .class-delete { flex-shrink: 0; width: 26px; height: 28px; margin-right: 4px; color: var(--red); }
 .class-delete:hover { background: #f8717118; }
 
+.project-management-dialog { width: min(900px, 94vw); }
+.managed-project { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 0; border-bottom: 1px solid var(--border, #303445); }
+.managed-project > div:first-child { min-width: 0; }
+.managed-project strong { margin-right: 12px; overflow-wrap: anywhere; }
+.managed-project p { margin: 8px 0 0; }
+.managed-path { overflow-wrap: anywhere; }
+.managed-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.managed-project .managed-actions { flex-shrink: 0; }
+
 @media (max-width: 780px) {
   .brand img { display: block; }
   .task-chip { font-size: 10px; padding: 3px 6px; }

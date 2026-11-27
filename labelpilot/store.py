@@ -281,6 +281,7 @@ class Project:
                 "model_path": self.config.get("model_path", ""), "total": len(self.items),
                 "batches": sorted({item["batch"] for item in self.items}),
                 "has_source_groups": any(item["source_group"] != "unassigned" for item in self.items),
+                "reuse_annotations": self.config.get("reuse_annotations", True),
                 "warnings": self.warnings}
         if self.task_type == "hand_pose":
             result["keypoints"] = [{"name": name, "label": label} for name, label in HAND_KEYPOINTS]
@@ -334,12 +335,18 @@ class Store:
                 );
             """)
         self.configs = read_json(self.registry_path) if self.registry_path.exists() else []
+        from .project_management import ProjectManagement
+        self.management = ProjectManagement(self)
+        lifecycle = self.management.states()
+        self.configs = [config for config in self.configs if lifecycle.get(config["id"], {}).get("state") != "deleted"]
         self.project_errors = []
         for config in self.configs:
+            if lifecycle.get(config["id"], {}).get("state") == "archived":
+                continue
             try:
                 self.projects[config["id"]] = self.build_project(config)
             except (Problem, OSError, ValueError, KeyError) as exc:
-                self.project_errors.append({"name": config.get("name"), "error": str(getattr(exc, "message", exc))})
+                self.project_errors.append({"id": config.get("id"), "name": config.get("name"), "error": str(getattr(exc, "message", exc))})
 
     @contextmanager
     def connect(self):
@@ -400,6 +407,8 @@ class Store:
 
     def register(self, config):
         config = copy.deepcopy(config)
+        if type(config.get("reuse_annotations", True)) is not bool:
+            raise Problem("标注复用开关必须为布尔值", 422)
         config["id"] = uuid.uuid4().hex[:12]
         if config.get("task_type") == "hand_pose" and not (config.get("classes") or config.get("class_map_path")):
             config["classes"] = ["hand"]
@@ -869,7 +878,7 @@ class Store:
                                   "human_reviewed": status == "reviewed",
                                   "prediction": provenance}
         incoming_meta = payload.get("document", {}).get("labelpilot", {})
-        for key in ("sam3_suggestions", "duplicate_cleanup"):
+        for key in ("sam3_suggestions", "duplicate_cleanup", "annotation_reuse"):
             if key in incoming_meta:
                 document["labelpilot"][key] = copy.deepcopy(incoming_meta[key])
         if project.task_type == "semantic":
@@ -901,6 +910,7 @@ class Store:
                     values = (project_id, item_id, result["version"], result["status"], encoded, result["updated"])
                     connection.execute("INSERT OR REPLACE INTO annotations VALUES (?, ?, ?, ?, ?, ?)", values)
                     connection.execute("INSERT INTO revisions VALUES (?, ?, ?, ?, ?, ?)", values)
+                    self.management.sync_reviewed(connection, self.project(project_id).config, item_id, result)
         return [result for _, _, result in prepared]
 
     def history(self, project_id, item_id):

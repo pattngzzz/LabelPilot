@@ -13,6 +13,7 @@
   <script src="/static/automation.js?v=__ASSET_VERSION__" defer></script>
   <script src="/static/task-tools.js?v=__ASSET_VERSION__" defer></script>
   <script src="/static/ocr.js?v=__ASSET_VERSION__" defer></script>
+  <script src="/static/projects.js?v=__ASSET_VERSION__" defer></script>
   <script src="/static/app.js?v=__ASSET_VERSION__" defer></script>
   <script src="/static/sam3.js?v=__ASSET_VERSION__" defer></script>
 </head>
@@ -33,6 +34,7 @@
       <span class="divider"></span>
       <select id="projectSelect" aria-label="当前项目"></select>
       <button class="button" id="newProjectButton" title="选择标注任务和本机图片">＋ 新建项目</button>
+      <button class="button" id="projectManagementButton">项目管理</button>
       <div class="topbar-right">
         <span class="privacy"><i></i> 本地工作区</span>
         <button class="button" id="cleanButton">一键清洗</button>
@@ -117,6 +119,7 @@
         </div>
         <div class="canvas-wrap" id="canvasWrap"><canvas id="canvas" tabindex="0" aria-label="标注画布"></canvas><div id="canvasCrosshair" class="canvas-crosshair" hidden aria-hidden="true"></div><div class="canvas-message" id="canvasMessage"><span class="empty-symbol">⌖</span><h3>让模型先做第一步</h3><p>选择图片，预标注后再精修确认</p></div><div class="canvas-hint" id="canvasHint">R 两次点击画框 · Esc 取消 · A / D 翻页 · Tab 大画布</div></div>
         <div class="image-context"><span id="sourceNote">源图片只读，所有修改保存在独立工作区</span>
+          <button class="button" type="button" id="reuseAnnotationButton" hidden>选择同图标注</button>
           <div class="draft-status"><label class="check"><input id="autoDraft" type="checkbox">自动存草稿</label><span id="autoSaveStatus" role="status"></span>
           <button class="button" id="downloadLocalDraft" type="button" hidden>下载本机草稿</button></div><span id="coordinateText">—</span></div>
         <div class="editor-footer"><button class="button" id="previousImage" title="上一张；修改自动保存为草稿 (A)">← 上一张 <kbd>A</kbd></button><button class="button" id="nextImage" title="下一张；修改自动保存为草稿，不标记已审核 (D)">下一张 → <kbd>D</kbd></button><button class="button quiet" id="skipButton">跳过</button><div class="toolbar-space"></div><button class="button" id="saveButton">保存草稿 <kbd>⌃ S</kbd></button><button class="button primary" id="reviewButton" title="保存并标记已审核，然后下一张 (E)">确认并下一张 <kbd>E</kbd></button></div>
@@ -546,6 +549,8 @@
       <p id="newImageSelection" class="model-selection-status" role="status">文件夹模式：读取目录及子目录内的图片；文件模式：仅导入明确选中的图片。</p>
       <button type="button" class="button" id="useEntireImageFolder" hidden>改为整个文件夹（含子目录）</button>
       <div class="form-row"><label>原生 Labelme 标注目录（选填）<input id="newAnnotationRoot"></label><label>模型预标注目录（选填）<input id="newPreannotationRoot"></label></div>
+      <label class="check"><input id="newReuseAnnotations" type="checkbox" checked>自动复用同图已审核标注（任务和标签须兼容）</label>
+      <p class="muted">打开图片时查找内容完全一致的历史图片；唯一兼容来源自动复制为待复核草稿，多个来源由你选择。不会覆盖已有标注，已归档或已删除项目保留的已审核标注也可复用。</p>
       <p class="muted" id="newOcrHint" hidden>OCR：每行文字或每个数值单元单独标注。类别留空默认 text；原文在框选后填写，不要把每个读数建为新类别。无需配置 YOLO 模型。</p>
       <label>有序类别（每行一个，顺序即 ID）<textarea id="newClasses" rows="4" placeholder="class_a&#10;class_b"></textarea></label>
       <label>或类别映射文件（优先）<input id="newClassMap" placeholder="class_map.json 的 names 字典，或 classes.txt"></label>
